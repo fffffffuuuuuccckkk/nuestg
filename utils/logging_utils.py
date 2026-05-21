@@ -22,6 +22,9 @@ class AverageMeterDict:
     def mean(self) -> Dict[str, float]:
         return {key: self.sums[key] / max(self.counts.get(key, 0), 1) for key in self.sums}
 
+    def average(self) -> Dict[str, float]:
+        return self.mean()
+
     def reset(self) -> None:
         self.sums.clear()
         self.counts.clear()
@@ -51,10 +54,10 @@ def format_logs(logs: Dict[str, object], keys: Optional[Iterable[str]] = None) -
     return " ".join(f"{key}={scalar_logs[key]:.6f}" for key in ordered_keys if key in scalar_logs)
 
 
-def append_csv_log(path: str | Path, row: Dict[str, object], fieldnames: Iterable[str]) -> None:
+def append_csv_log(path: str | Path, row: Dict[str, object], fieldnames: Optional[Iterable[str]] = None) -> None:
     csv_path = Path(path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = list(fieldnames)
+    fieldnames = list(fieldnames) if fieldnames is not None else list(row.keys())
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")

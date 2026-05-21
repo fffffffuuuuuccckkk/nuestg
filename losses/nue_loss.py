@@ -98,7 +98,9 @@ class NUESTGLoss(nn.Module):
         "rho_max",
         "rho_entropy",
         "delta_gain_mean",
+        "delta_gain_std",
         "delta_gain_pos_ratio",
+        "s_gain_mean",
         "potential_gain_mean",
         "swap_delta_mean",
         "env_mu_abs_mean",
@@ -205,6 +207,12 @@ class NUESTGLoss(nn.Module):
 
         delta_gain = inv_elem - potential_elem
         s_gain = torch.sigmoid((delta_gain - self.cfg.gate_eta) / max(self.cfg.gate_tau, 1e-6)).detach()
+        delta_gain_detached = delta_gain.detach()
+        delta_gain_mean = masked_mean(delta_gain_detached, elem_mask)
+        delta_gain_std = torch.sqrt(
+            masked_mean((delta_gain_detached - delta_gain_mean).pow(2), elem_mask).clamp_min(0.0)
+        )
+        s_gain_mean = masked_mean(s_gain, elem_mask)
 
         gate_loss_raw = self._bce_gate_loss(rho, s_gain, elem_mask)
         env_mu = output["env_mu"]
@@ -315,9 +323,11 @@ class NUESTGLoss(nn.Module):
             "rho_min": rho.detach().min(),
             "rho_max": rho.detach().max(),
             "rho_entropy": rho_entropy.detach().mean(),
-            "delta_gain_mean": masked_mean(delta_gain.detach(), elem_mask),
-            "delta_gain_pos_ratio": masked_mean((delta_gain.detach() > 0).float(), elem_mask),
-            "potential_gain_mean": masked_mean(delta_gain.detach(), elem_mask),
+            "delta_gain_mean": delta_gain_mean,
+            "delta_gain_std": delta_gain_std,
+            "delta_gain_pos_ratio": masked_mean((delta_gain_detached > 0).float(), elem_mask),
+            "s_gain_mean": s_gain_mean,
+            "potential_gain_mean": delta_gain_mean,
             "swap_delta_mean": swap_delta_mean.detach(),
             "env_mu_abs_mean": env_mu.detach().abs().mean(),
             "env_std_mean": torch.exp(0.5 * env_logvar.detach()).mean(),

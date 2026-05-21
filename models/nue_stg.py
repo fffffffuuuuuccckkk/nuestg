@@ -216,7 +216,15 @@ class NUESTG(nn.Module):
         env: torch.Tensor,
         y_inv: Optional[torch.Tensor] = None,
         detach_inv: bool = False,
+        force_gate_value: Optional[float] = None,
     ) -> Dict[str, torch.Tensor]:
+        if z_inv.dim() != 3:
+            raise AssertionError(f"z_inv must be [B, N, D], got {tuple(z_inv.shape)}")
+        if env.dim() != 3:
+            raise AssertionError(f"env must be [B, N, D_env], got {tuple(env.shape)}")
+        if z_inv.shape[:2] != env.shape[:2]:
+            raise AssertionError(f"z_inv/env batch-node shape mismatch: {tuple(z_inv.shape)} vs {tuple(env.shape)}")
+
         if detach_inv:
             z_decode = z_inv.detach()
             y_base = self.invariant_predict(z_decode) if y_inv is None else y_inv.detach()
@@ -229,7 +237,12 @@ class NUESTG(nn.Module):
         r_env = self.env_head(decode_input)
         r_env = r_env.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
 
-        if self.force_gate_value is None:
+        expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)
+        if tuple(y_base.shape) != expected_pred_shape:
+            raise AssertionError(f"y_inv must be {expected_pred_shape}, got {tuple(y_base.shape)}")
+
+        gate_value = self.force_gate_value if force_gate_value is None else force_gate_value
+        if gate_value is None:
             gate_logits = self.gate_net(decode_input) / max(float(self.gate_temperature), 1e-6)
             if self.gate_horizon_aware:
                 rho = torch.sigmoid(gate_logits).view(batch_size, num_nodes, self.output_len, 1).permute(0, 2, 1, 3)
@@ -239,20 +252,20 @@ class NUESTG(nn.Module):
         else:
             rho = torch.full(
                 (batch_size, self.output_len, num_nodes, 1),
-                float(self.force_gate_value),
+                float(gate_value),
                 dtype=r_env.dtype,
                 device=r_env.device,
             )
 
-        prediction_potential = y_base + r_env
+        y_potential = y_base + r_env
         prediction = y_base + rho * r_env
         prediction = self._apply_prediction_activation(prediction)
-        prediction_potential = self._apply_prediction_activation(prediction_potential)
+        y_potential = self._apply_prediction_activation(y_potential)
         return {
             "r_env": r_env,
             "rho": rho,
             "prediction": prediction,
-            "prediction_potential": prediction_potential,
+            "y_potential": y_potential,
         }
 
     def forward(self, inputs: torch.Tensor, **kwargs) -> Dict[str, Optional[torch.Tensor]]:
@@ -276,13 +289,26 @@ class NUESTG(nn.Module):
         prediction = decoded["prediction"]
         rho = decoded["rho"]
         r_env = decoded["r_env"]
-        y_potential = decoded["prediction_potential"]
+        y_potential = decoded["y_potential"]
 
-        if not (env.dim() == 3 and env.shape[:2] == (batch_size, num_nodes)):
-            raise AssertionError(f"env must be [B, N, D_env], got {tuple(env.shape)}")
+        expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)
         expected_gate_shape = (batch_size, self.output_len, num_nodes, 1)
-        if tuple(rho.shape) != expected_gate_shape:
-            raise AssertionError(f"rho must be {expected_gate_shape}, got {tuple(rho.shape)}")
+        expected_z_shape = (batch_size, num_nodes, self.hidden_dim)
+        expected_env_shape = (batch_size, num_nodes, self.env_dim)
+        shape_checks = {
+            "prediction": (prediction, expected_pred_shape),
+            "y_inv": (y_inv, expected_pred_shape),
+            "y_potential": (y_potential, expected_pred_shape),
+            "r_env": (r_env, expected_pred_shape),
+            "rho": (rho, expected_gate_shape),
+            "z_inv": (z_inv, expected_z_shape),
+            "env_mu": (env_mu, expected_env_shape),
+            "env_logvar": (env_logvar, expected_env_shape),
+            "env": (env, expected_env_shape),
+        }
+        for name, (tensor, expected_shape) in shape_checks.items():
+            if tuple(tensor.shape) != expected_shape:
+                raise AssertionError(f"{name} must be {expected_shape}, got {tuple(tensor.shape)}")
         if prediction.shape != y_inv.shape:
             raise AssertionError(
                 f"prediction and y_inv must share shape, got {tuple(prediction.shape)} and {tuple(y_inv.shape)}"

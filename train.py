@@ -34,17 +34,21 @@ LOG_KEYS = [
     "swap_diff_loss",
     "swap_same_loss",
     "kl_loss",
+    "effective_lambda_kl",
     "ind_loss",
     "sparse_loss",
     "entropy_loss",
     "residual_norm_loss",
+    "env_consistency_loss",
     "rho_mean",
     "rho_std",
     "rho_min",
     "rho_max",
     "rho_entropy",
     "delta_gain_mean",
+    "delta_gain_std",
     "delta_gain_pos_ratio",
+    "s_gain_mean",
     "potential_gain_mean",
     "swap_delta_mean",
     "env_mu_abs_mean",
@@ -186,6 +190,7 @@ def debug_batch(cfg: Dict) -> None:
     target_key = cfg["DATASET"].get("target_key", "targets")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
+    print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
     print(f"targets_before_align: {tuple(batch[target_key].shape)}")
 
     output = model(batch[input_key])

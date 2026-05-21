@@ -165,6 +165,8 @@ prediction = y_inv + rho * r_env
 - `rho_mean` near `1`: the gate is always open.
 - very low `rho_std`: little node/horizon-specific gate diversity.
 - positive `delta_gain_mean`: ungated environment residual has potential value.
+- `delta_gain_mean` staying near `0`: the residual branch is not learning useful
+  information beyond the invariant predictor.
 
 ## Recommended Tuning Order
 
@@ -178,8 +180,8 @@ prediction = y_inv + rho * r_env
 
 - Counterfactual swapping is first-version random batch-node swapping, not
   concept-shift pair mining.
-- Future work can add history-similar / future-different pair mining via the
-  existing `SWAP.pair_mining` config slots.
+- Future work can add Samen-style history-similar / future-different pair
+  mining via the existing `SWAP.pair_mining` config slots.
 - The invariant backbone is a lightweight STID-like temporal MLP plus node
   embedding, not the full official STID implementation.
 - Time embeddings are configured but not yet implemented in the backbone.
