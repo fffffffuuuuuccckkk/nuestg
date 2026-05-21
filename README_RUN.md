@@ -62,6 +62,18 @@ The local training loop reuses `basicts.data.BasicTSForecastingDataset`, saves
 `resolved_config.json`, writes `train_log.csv`, and saves `best.pt` / `last.pt`
 under `TRAIN.ckpt_dir`.
 
+## Push Code To GitHub
+
+Use the helper script to commit and push only code/config/docs while excluding
+datasets, checkpoints, logs, outputs, caches, and large artifact suffixes:
+
+```bash
+./push_code.sh "your commit message"
+```
+
+If no message is supplied, the script creates a timestamped commit message. It
+also refuses to commit staged data/checkpoint/archive files as a final guard.
+
 Optional BasicTS launcher:
 
 ```bash
