@@ -58,6 +58,20 @@ LOG_KEYS = [
     "y_inv_mae",
     "y_potential_mae",
     "y_hat_mae",
+    "sep_projection_ratio",
+    "sep_cos_z_env_before",
+    "sep_cos_z_env_after",
+    "sep_lowrank_energy_ratio",
+    "sep_residual_norm",
+    "sep_z_raw_norm",
+    "sep_z_inv_norm",
+    "sep_env_raw_norm",
+    "sep_env_norm",
+    "sep_proj_norm",
+    "sep_basis_rank",
+    "sep_svd_top_singular_mean",
+    "sep_lowrank_rank",
+    "sep_env_residual_norm",
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae"]
 
@@ -125,6 +139,31 @@ def finalize_config(cfg: Dict) -> Dict:
             "LOSS.use_env_consistency=True is not allowed with SWAP.mode='batch_node_random'. "
             "Random env_perm should not be pulled toward the original env; enable this only with same-pair mining."
         )
+    separation_cfg = model_cfg.setdefault("separation", {})
+    separation_cfg.setdefault("enabled", False)
+    separation_cfg.setdefault("mode", "none")
+    if not separation_cfg.get("enabled", False):
+        separation_cfg["mode"] = "none"
+    if separation_cfg.get("mode") not in {
+        "none",
+        "orthogonal_projection",
+        "basis_projection",
+        "lowrank_residual",
+    }:
+        raise NotImplementedError(
+            f"MODEL.separation.mode={separation_cfg.get('mode')!r} is not implemented."
+        )
+    if separation_cfg.get("mode") == "lowrank_residual":
+        lowrank_target = (separation_cfg.get("lowrank", {}) or {}).get("target", "hidden")
+        if lowrank_target != "hidden":
+            raise NotImplementedError("Only MODEL.separation.lowrank.target='hidden' is implemented.")
+    model_cfg["use_separated_z_for_y_inv"] = bool(
+        model_cfg.get(
+            "use_separated_z_for_y_inv",
+            separation_cfg.get("use_separated_z_for_y_inv", True),
+        )
+    )
+    separation_cfg["use_separated_z_for_y_inv"] = model_cfg["use_separated_z_for_y_inv"]
 
     for key in ["input_len", "output_len", "input_dim", "output_dim", "num_nodes"]:
         model_cfg[key] = ds_cfg[key]
@@ -223,9 +262,12 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         "r_env": (batch_size, output_len, num_nodes, output_dim),
         "rho": (batch_size, output_len, num_nodes, 1),
         "z_inv": (batch_size, num_nodes, representation_dim),
+        "z_raw": (batch_size, num_nodes, representation_dim),
         "env_mu": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env_logvar": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+        "env_raw": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+        "y_inv_raw": (batch_size, output_len, num_nodes, output_dim),
     }
     for key, expected_shape in expected.items():
         value = output[key]
@@ -266,6 +308,8 @@ def debug_batch(cfg: Dict) -> None:
     print(f"swap_mode: {cfg.get('SWAP', {}).get('mode', 'batch_node_random')}")
     print(f"pair_mining: {cfg.get('SWAP', {}).get('pair_mining', False)}")
     print(f"env_consistency_enabled: {cfg['LOSS'].get('use_env_consistency', False)}")
+    print(f"separation_mode: {cfg['MODEL'].get('separation', {}).get('mode', 'none')}")
+    print(f"use_separated_z_for_y_inv: {cfg['MODEL'].get('use_separated_z_for_y_inv', True)}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")

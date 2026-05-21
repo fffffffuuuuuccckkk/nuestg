@@ -159,6 +159,66 @@ python train.py --config configs/pems08_nuestg.py --set MODEL.backbone_name=stid
 Backbone-specific parameters live under `MODEL.backbone.stid_mlp`,
 `MODEL.backbone.graph_wavenet`, and `MODEL.backbone.agcrn`.
 
+## Computation-Level Z/E Separation
+
+NUE-STG now separates `z_raw` and `env_raw` in the forward computation before
+forecasting, instead of relying only on the soft `ind_loss`. The separation
+module receives:
+
+```text
+z_raw = backbone(x)["z_inv"]      # [B,N,D]
+y_inv_raw = backbone(x)["y_inv"]  # [B,H,N,C_out]
+env_raw = EnvEncoder(x)           # [B,N,D_env]
+```
+
+It returns separated tensors:
+
+```text
+z_inv = sep_out["z_inv"]
+env = sep_out["env"]
+```
+
+Then `y_inv` is recomputed from `z_inv` by `inv_head_from_z` when
+`MODEL.use_separated_z_for_y_inv=True` (default). The residual head, gate, and
+swap regularizer all use the separated `z_inv/env`, so the computation path is:
+
+```text
+y_inv = inv_head_from_z(z_inv)
+r_env = f_env(z_inv, env)
+rho = g(z_inv, env)
+prediction = y_inv + rho * r_env
+y_potential = y_inv + r_env
+```
+
+Supported modes:
+
+- `orthogonal_projection`: projects `env_raw` into the z space, then removes
+  the per-node environment direction from `z_raw`:
+  `z_inv = z_raw - alpha * Proj_env(z_raw)`.
+- `basis_projection`: builds a shared environment subspace from batch env
+  directions or a learnable basis, then projects `z_raw` onto the orthogonal
+  complement of that subspace.
+- `lowrank_residual`: decomposes each hidden matrix `z_raw[b]` into low-rank
+  stable part plus residual. The low-rank part becomes `z_inv`; the residual is
+  mapped into env and added to `env_raw`.
+
+These modes are computation-level separation, not additional losses. They do
+not use manual environment labels, time-of-day labels, peak/off-peak labels,
+low-frequency/high-frequency decomposition, or pair mining. They cannot prove
+semantic invariance by themselves, but they force Z/E to use different
+directions, subspaces, or matrix components before the utility gate decides
+whether environment residuals are useful.
+
+Examples:
+
+```bash
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.enabled=false
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.mode=orthogonal_projection
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.mode=basis_projection --set MODEL.separation.basis.source=batch_env
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.mode=basis_projection --set MODEL.separation.basis.source=learnable
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.mode=lowrank_residual --set MODEL.separation.lowrank.target=hidden
+```
+
 ## Ablations
 
 ```bash
@@ -246,6 +306,11 @@ prediction = y_inv + rho * r_env
 - `y_hat_mae` relative to `y_potential_mae`: whether the utility gate selects
   residuals effectively.
 - `swap_delta_mean`: error change after replacing environments.
+- `sep_projection_ratio`, `sep_cos_z_env_before`,
+  `sep_cos_z_env_after`: whether computation-level projection actually reduces
+  the z/env directional overlap.
+- `sep_lowrank_energy_ratio`, `sep_residual_norm`: low-rank/residual split
+  diagnostics for `lowrank_residual`.
 
 ## Supported And Not Yet Supported
 
@@ -256,6 +321,8 @@ Current supported method pieces:
 - Environment residual used only as correction, never as a replacement predictor.
 - Potential-gain gate target from `y_potential = y_inv + r_env`.
 - Random batch-node counterfactual swap with `SWAP.mode="batch_node_random"`.
+- Computation-level Z/E separation with `orthogonal_projection`,
+  `basis_projection`, and hidden-target `lowrank_residual`.
 
 Current unsupported config options fail loudly:
 
@@ -269,6 +336,8 @@ Current unsupported config options fail loudly:
 - `SWAP.pair_mining=True`: raises `NotImplementedError`.
 - `SWAP.num_swaps != 1`: raises `NotImplementedError`.
 - `LOSS.use_env_consistency=True` with random swap: raises `ValueError`.
+- `MODEL.separation.lowrank.target="input"`: raises `NotImplementedError`;
+  hidden-target low-rank separation is implemented.
 
 Current swap is deliberately preliminary:
 
@@ -305,4 +374,7 @@ history-similar/future-similar samples.
 - Time embeddings are configured but not yet implemented in the backbone.
 - Stronger or official backbone implementations remain future work behind the
   existing `BaseBackbone` interface.
+- The current separation modes are computation-level constraints, not formal
+  guarantees that Z contains every invariant factor and E contains only
+  environment factors.
 - Samen-style concept-shift pair mining remains future work.

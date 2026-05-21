@@ -109,6 +109,20 @@ class NUESTGLoss(nn.Module):
         "y_inv_mae",
         "y_potential_mae",
         "y_hat_mae",
+        "sep_projection_ratio",
+        "sep_cos_z_env_before",
+        "sep_cos_z_env_after",
+        "sep_lowrank_energy_ratio",
+        "sep_residual_norm",
+        "sep_z_raw_norm",
+        "sep_z_inv_norm",
+        "sep_env_raw_norm",
+        "sep_env_norm",
+        "sep_proj_norm",
+        "sep_basis_rank",
+        "sep_svd_top_singular_mean",
+        "sep_lowrank_rank",
+        "sep_env_residual_norm",
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -188,6 +202,35 @@ class NUESTGLoss(nn.Module):
         if warmup <= 0:
             return float(self.cfg.lambda_kl)
         return float(self.cfg.lambda_kl) * min(1.0, max(self.epoch, 0) / warmup)
+
+    def _separation_logs(self, output: Dict[str, torch.Tensor], like: torch.Tensor) -> Dict[str, torch.Tensor]:
+        extra = output.get("separation_extra") or {}
+        keys = [
+            "sep_projection_ratio",
+            "sep_cos_z_env_before",
+            "sep_cos_z_env_after",
+            "sep_lowrank_energy_ratio",
+            "sep_residual_norm",
+            "sep_z_raw_norm",
+            "sep_z_inv_norm",
+            "sep_env_raw_norm",
+            "sep_env_norm",
+            "sep_proj_norm",
+            "sep_basis_rank",
+            "sep_svd_top_singular_mean",
+            "sep_lowrank_rank",
+            "sep_env_residual_norm",
+        ]
+        logs: Dict[str, torch.Tensor] = {}
+        for key in keys:
+            value = extra.get(key)
+            if isinstance(value, torch.Tensor):
+                logs[key] = value.detach()
+            elif value is None:
+                logs[key] = like.new_zeros(())
+            else:
+                logs[key] = like.new_tensor(float(value))
+        return logs
 
     def forward(
         self,
@@ -335,6 +378,7 @@ class NUESTGLoss(nn.Module):
             "y_potential_mae": potential_loss_raw.detach(),
             "y_hat_mae": pred_loss_raw.detach(),
         }
+        logs.update(self._separation_logs(output, prediction))
         self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
         return total_loss, logs
 

@@ -10,6 +10,7 @@ from basicts.configs import BasicTSModelConfig
 
 from models.backbones import build_backbone
 from models.env_encoder import NodeWiseEnvironmentEncoder
+from models.separation import SeparationModule
 from utils.tensor_ops import ensure_blnc, load_adjacency
 
 
@@ -33,6 +34,8 @@ class NUESTGConfig(BasicTSModelConfig):
     adaptive_adj: bool = False
     backbone_name: str = "stid_mlp"
     backbone: Dict = field(default_factory=dict)
+    separation: Dict = field(default_factory=dict)
+    use_separated_z_for_y_inv: bool = True
     env_dim: int = 32
     env_hidden_dim: int = 64
     env_encoder_type: str = "temporal_mlp"
@@ -98,6 +101,7 @@ class NUESTG(nn.Module):
         self.swap_cfg = config.swap or {}
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
+        self.use_separated_z_for_y_inv = bool(config.use_separated_z_for_y_inv)
 
         if config.use_time_embedding:
             raise NotImplementedError("MODEL.use_time_embedding=True is not implemented in the current backbones.")
@@ -124,6 +128,13 @@ class NUESTG(nn.Module):
         self.backbone = build_backbone({"MODEL": model_cfg})
         self.representation_dim = int(self.backbone.representation_dim)
         self.hidden_dim = self.representation_dim
+        self.inv_head_from_z = nn.Linear(self.representation_dim, config.output_len * config.output_dim)
+        if hasattr(self.backbone, "inv_head") and isinstance(self.backbone.inv_head, nn.Linear):
+            if (
+                self.backbone.inv_head.in_features == self.inv_head_from_z.in_features
+                and self.backbone.inv_head.out_features == self.inv_head_from_z.out_features
+            ):
+                self.inv_head_from_z.load_state_dict(self.backbone.inv_head.state_dict())
 
         if config.env_encoder_type != "temporal_mlp":
             raise ValueError("Only env_encoder_type='temporal_mlp' is implemented in this version.")
@@ -140,6 +151,14 @@ class NUESTG(nn.Module):
             logvar_max=config.env_logvar_max,
             reparameterize=config.env_reparameterize,
             deterministic_eval=config.deterministic_env_eval,
+        )
+        self.separation = SeparationModule(
+            cfg=config.separation,
+            num_nodes=config.num_nodes,
+            z_dim=self.representation_dim,
+            env_dim=config.env_dim,
+            input_len=config.input_len,
+            input_dim=config.input_dim,
         )
 
         decode_in_dim = self.representation_dim + config.env_dim
@@ -167,6 +186,12 @@ class NUESTG(nn.Module):
             self.register_buffer("adj_norm", adj_norm)
         else:
             self.adj_norm = None
+
+    def invariant_predict_from_z(self, z_inv: torch.Tensor) -> torch.Tensor:
+        batch_size, num_nodes, _ = z_inv.shape
+        y_inv = self.inv_head_from_z(z_inv)
+        y_inv = y_inv.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
+        return self._apply_prediction_activation(y_inv)
 
     def _init_gate_bias(self, bias: float) -> None:
         last = self.gate_net[-1]
@@ -210,10 +235,10 @@ class NUESTG(nn.Module):
 
         if detach_inv:
             z_decode = z_inv.detach()
-            y_base = self.backbone.forecast_from_representation(z_decode) if y_inv is None else y_inv.detach()
+            y_base = self.invariant_predict_from_z(z_decode) if y_inv is None else y_inv.detach()
         else:
             z_decode = z_inv
-            y_base = self.backbone.forecast_from_representation(z_decode) if y_inv is None else y_inv
+            y_base = self.invariant_predict_from_z(z_decode) if y_inv is None else y_inv
 
         decode_input = torch.cat([z_decode, env], dim=-1)
         batch_size, num_nodes, _ = decode_input.shape
@@ -257,9 +282,17 @@ class NUESTG(nn.Module):
         adj = getattr(self, "adj_norm", None)
 
         backbone_out = self.backbone(x, adj=adj)
-        z_inv = backbone_out["z_inv"]
-        y_inv = self._apply_prediction_activation(backbone_out["y_inv"])
-        env_mu, env_logvar, env = self.env_encoder(x, adj)
+        z_raw = backbone_out["z_inv"]
+        y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
+        env_mu, env_logvar, env_raw = self.env_encoder(x, adj)
+        sep_out = self.separation(x=x, z_raw=z_raw, env_raw=env_raw, y_inv_raw=y_inv_raw)
+        z_inv = sep_out["z_inv"]
+        env = sep_out["env"]
+        separation_extra = sep_out["extra"]
+        if self.use_separated_z_for_y_inv:
+            y_inv = self.invariant_predict_from_z(z_inv)
+        else:
+            y_inv = y_inv_raw
 
         env_perm = None
         use_shuffled_env = (self.training and self.use_shuffled_env_train) or (
@@ -287,9 +320,12 @@ class NUESTG(nn.Module):
             "r_env": (r_env, expected_pred_shape),
             "rho": (rho, expected_gate_shape),
             "z_inv": (z_inv, expected_z_shape),
+            "z_raw": (z_raw, expected_z_shape),
             "env_mu": (env_mu, expected_env_shape),
             "env_logvar": (env_logvar, expected_env_shape),
             "env": (env, expected_env_shape),
+            "env_raw": (env_raw, expected_env_shape),
+            "y_inv_raw": (y_inv_raw, expected_pred_shape),
         }
         for name, (tensor, expected_shape) in shape_checks.items():
             if tuple(tensor.shape) != expected_shape:
@@ -320,9 +356,14 @@ class NUESTG(nn.Module):
             "r_env": r_env,
             "rho": rho,
             "z_inv": z_inv,
+            "z_raw": z_raw,
             "env_mu": env_mu,
             "env_logvar": env_logvar,
             "env": env,
+            "env_raw": env_raw,
+            "y_inv_raw": y_inv_raw,
+            "separation_mode": sep_out["mode"],
+            "separation_extra": separation_extra,
             "prediction_swap": prediction_swap,
             "rho_swap": rho_swap,
             "env_perm": env_perm,
