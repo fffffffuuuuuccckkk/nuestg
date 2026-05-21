@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import warnings
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -42,7 +43,7 @@ def make_valid_mask(
 ) -> torch.Tensor:
     mask = torch.isfinite(targets)
     if null_val is not None:
-        if np.isnan(null_val):
+        if isinstance(null_val, float) and np.isnan(null_val):
             mask = mask & ~torch.isnan(targets)
         else:
             mask = mask & (targets != null_val)
@@ -75,29 +76,58 @@ def masked_abs_error(
     return abs_error, mask
 
 
-def load_adjacency(adj_path: Optional[str], num_nodes: int) -> Optional[torch.Tensor]:
+def normalize_adjacency(adj: np.ndarray, adj_norm: str) -> np.ndarray:
+    adj_norm = (adj_norm or "none").lower()
+    if adj_norm == "none":
+        return adj.astype(np.float32)
+    if adj_norm == "row":
+        row_sum = adj.sum(axis=-1, keepdims=True)
+        return (adj / np.maximum(row_sum, 1e-6)).astype(np.float32)
+    if adj_norm == "sym":
+        degree = adj.sum(axis=-1)
+        degree_inv_sqrt = np.power(np.maximum(degree, 1e-6), -0.5)
+        return (degree_inv_sqrt[:, None] * adj * degree_inv_sqrt[None, :]).astype(np.float32)
+    raise ValueError(f"Unsupported adj_norm={adj_norm!r}; expected one of none,row,sym")
+
+
+def load_adjacency(
+    adj_path: Optional[str],
+    num_nodes: int,
+    adj_norm: str = "sym",
+    add_self_loop: bool = True,
+) -> Optional[torch.Tensor]:
     if not adj_path:
+        warnings.warn("No adj_path configured; environment encoder will use self-only mode.", RuntimeWarning)
         return None
     path = Path(adj_path)
     if not path.exists():
+        warnings.warn(f"Adjacency file not found at {path}; using self-only environment encoder.", RuntimeWarning)
         return None
 
-    if path.suffix == ".npy":
-        adj = np.load(path)
-    else:
-        with path.open("rb") as f:
-            adj = pickle.load(f)
-        if isinstance(adj, (list, tuple)):
-            candidates = [x for x in adj if hasattr(x, "shape") and len(x.shape) == 2]
-            adj = candidates[-1] if candidates else adj[0]
+    try:
+        if path.suffix == ".npy":
+            adj = np.load(path)
+        else:
+            with path.open("rb") as f:
+                adj = pickle.load(f)
+            if isinstance(adj, (list, tuple)):
+                candidates = [x for x in adj if hasattr(x, "shape") and len(x.shape) == 2]
+                adj = candidates[-1] if candidates else adj[0]
 
-    adj = np.asarray(adj, dtype=np.float32)
-    if adj.shape != (num_nodes, num_nodes):
-        raise ValueError(f"adj shape must be {(num_nodes, num_nodes)}, got {adj.shape} from {path}")
-    adj = adj + np.eye(num_nodes, dtype=np.float32)
-    row_sum = adj.sum(axis=-1, keepdims=True)
-    adj = adj / np.maximum(row_sum, 1e-6)
-    return torch.from_numpy(adj)
+        adj = np.asarray(adj, dtype=np.float32)
+        if adj.shape != (num_nodes, num_nodes):
+            warnings.warn(
+                f"Adjacency shape from {path} is {adj.shape}, expected {(num_nodes, num_nodes)}; "
+                "using self-only environment encoder.",
+                RuntimeWarning,
+            )
+            return None
+        if add_self_loop:
+            adj = adj + np.eye(num_nodes, dtype=np.float32)
+        return torch.from_numpy(normalize_adjacency(adj, adj_norm))
+    except Exception as exc:
+        warnings.warn(f"Failed to load adjacency from {path}: {exc}; using self-only mode.", RuntimeWarning)
+        return None
 
 
 def assert_finite(tensor: torch.Tensor, name: str) -> None:

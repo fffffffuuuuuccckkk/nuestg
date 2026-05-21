@@ -6,29 +6,29 @@ from configs.base_nuestg import CONFIG as BASE_CONFIG
 from utils.config_utils import deep_update
 
 
-DATASET_DIR = "/data/OuXiaoyu/mystg/datasets/METR-LA"
+DATASET_DIR = "/data/OuXiaoyu/mystg/datasets/SD"
 
 
 CONFIG = deep_update(
     copy.deepcopy(BASE_CONFIG),
     {
         "DATASET": {
-            "name": "METR-LA",
+            "name": "SD",
             "data_file_path": DATASET_DIR,
             "adj_path": f"{DATASET_DIR}/adj_mx.pkl",
-            "num_nodes": 207,
+            "num_nodes": 716,
             "input_dim": 1,
             "output_dim": 1,
             "null_val": None,
         },
         "MODEL": {
-            "num_nodes": 207,
+            "num_nodes": 716,
             "input_dim": 1,
             "output_dim": 1,
             "adj_path": f"{DATASET_DIR}/adj_mx.pkl",
         },
         "TRAIN": {
-            "ckpt_dir": "./checkpoints/metr_la_nuestg",
+            "ckpt_dir": "./checkpoints/sd_nuestg",
         },
     },
 )
