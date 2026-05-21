@@ -114,6 +114,11 @@ class NUESTGLoss(nn.Module):
     def __init__(self, **kwargs) -> None:
         super().__init__()
         self.cfg = NUESTGLossConfig(**kwargs)
+        if self.cfg.gate_label_mode != "potential_gain":
+            raise NotImplementedError(
+                "NUE-STG currently supports only LOSS.gate_label_mode='potential_gain'. "
+                "Gate targets must be computed from y_potential = y_inv + r_env, not gated prediction."
+            )
         self.epoch = 0
         self.latest_log_dict: Dict[str, float] = {}
 
@@ -236,7 +241,8 @@ class NUESTGLoss(nn.Module):
         swap_loss_raw = zero
         swap_delta_mean = zero
         prediction_swap = output.get("prediction_swap")
-        if prediction_swap is not None:
+        has_swap = self.cfg.use_swap and self.cfg.lambda_swap != 0 and prediction_swap is not None
+        if has_swap:
             swap_elem, _ = self._channel_mean_error(prediction_swap, y_true, targets_mask)
             loss_full_for_swap = full_elem.detach() if self.cfg.swap_detach_full else full_elem
             if self.cfg.swap_weight_mode == "sgain":
@@ -261,19 +267,16 @@ class NUESTGLoss(nn.Module):
             swap_delta_mean = masked_mean((swap_elem - full_elem).detach(), elem_mask)
 
         env_consistency_loss_raw = zero
-        if output.get("env_perm") is not None:
+        has_env_consistency = self.cfg.use_env_consistency and self.cfg.lambda_env_consistency != 0
+        if has_env_consistency and output.get("env_perm") is not None:
             env_consistency_loss_raw = (output["env_perm"].detach() - env).abs().mean()
 
         pred_loss = pred_loss_raw
         inv_loss = inv_loss_raw if self.cfg.use_inv and self.cfg.lambda_inv != 0 else zero
         gate_loss = gate_loss_raw if self.cfg.use_gate and self.cfg.lambda_gate != 0 else zero
-        swap_loss = (
-            swap_loss_raw
-            if self.cfg.use_swap and self.cfg.lambda_swap != 0 and prediction_swap is not None
-            else zero
-        )
-        swap_diff_loss = swap_diff_loss_raw if swap_loss is not zero else zero
-        swap_same_loss = swap_same_loss_raw if swap_loss is not zero else zero
+        swap_loss = swap_loss_raw if has_swap else zero
+        swap_diff_loss = swap_diff_loss_raw if has_swap else zero
+        swap_same_loss = swap_same_loss_raw if has_swap else zero
         effective_lambda_kl = self._effective_lambda_kl()
         kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
         ind_loss = ind_loss_raw if self.cfg.use_ind and self.cfg.lambda_ind != 0 else zero
@@ -284,11 +287,7 @@ class NUESTGLoss(nn.Module):
             if self.cfg.use_residual_norm and self.cfg.lambda_residual_norm != 0
             else zero
         )
-        env_consistency_loss = (
-            env_consistency_loss_raw
-            if self.cfg.use_env_consistency and self.cfg.lambda_env_consistency != 0
-            else zero
-        )
+        env_consistency_loss = env_consistency_loss_raw if has_env_consistency else zero
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss

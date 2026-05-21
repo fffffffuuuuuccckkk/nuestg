@@ -87,7 +87,23 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
     """Apply a named ablation by mutating and returning cfg."""
     name = name.lower()
     if name == "no_env":
-        deep_update(cfg, {"MODEL": {"force_gate_value": 0.0}, "LOSS": {"use_gate": False, "use_swap": False}, "SWAP": {"enabled": False}})
+        deep_update(
+            cfg,
+            {
+                "MODEL": {"force_gate_value": 0.0},
+                "LOSS": {
+                    "use_gate": False,
+                    "use_swap": False,
+                    "use_kl": False,
+                    "use_ind": False,
+                    "use_sparse": False,
+                    "use_entropy": False,
+                    "use_residual_norm": False,
+                    "use_env_consistency": False,
+                },
+                "SWAP": {"enabled": False},
+            },
+        )
     elif name == "no_gate":
         deep_update(cfg, {"MODEL": {"force_gate_value": 1.0}, "LOSS": {"use_gate": False}})
     elif name == "no_swap":
@@ -103,7 +119,8 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
             cfg,
             {
                 "MODEL": {"use_shuffled_env_train": True, "use_shuffled_env_eval": True},
-                "SWAP": {"enabled": True},
+                "LOSS": {"use_swap": False},
+                "SWAP": {"enabled": False},
             },
         )
     else:
@@ -124,4 +141,5 @@ def resolve_cli_config(config_path: str, ablations: List[str], dotlist: List[str
     cfg = load_config(config_path)
     apply_ablations(cfg, ablations)
     deep_update(cfg, parse_dotlist_overrides(dotlist))
+    cfg.setdefault("RUN", {})["ablations"] = list(ablations or [])
     return cfg

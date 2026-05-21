@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple
@@ -60,6 +61,16 @@ LOG_KEYS = [
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae"]
 
+BACKBONE_DESCRIPTIONS = {
+    "stid_mlp": "lightweight STID-like temporal MLP + node embedding",
+    "mlp": "lightweight STID-like temporal MLP + node embedding",
+    "stid_like": "lightweight STID-like temporal MLP + node embedding",
+    "graphwavenet": "Graph WaveNet-style invariant backbone",
+    "graph_wavenet": "Graph WaveNet-style invariant backbone",
+    "gwnet": "Graph WaveNet-style invariant backbone",
+    "agcrn": "AGCRN-style adaptive graph recurrent backbone",
+}
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -72,6 +83,49 @@ def finalize_config(cfg: Dict) -> Dict:
     """Keep duplicated model/dataset shape fields synchronized."""
     ds_cfg = cfg["DATASET"]
     model_cfg = cfg["MODEL"]
+    loss_cfg = cfg["LOSS"]
+    swap_cfg = cfg.get("SWAP", {})
+
+    if model_cfg.get("use_time_embedding", False):
+        raise NotImplementedError(
+            "MODEL.use_time_embedding=True is not implemented yet. "
+            "Current invariant backbones use historical values and optional node embeddings only."
+        )
+    if model_cfg.get("adaptive_adj", False):
+        raise NotImplementedError(
+            "MODEL.adaptive_adj=True is not implemented at the NUE-STG top level. "
+            "Use backbone-specific adaptive adjacency options, such as MODEL.backbone.graph_wavenet.addaptadj."
+        )
+    env_neighbor_mix = model_cfg.get("env_neighbor_mix", "static_adj")
+    if env_neighbor_mix not in (None, "static_adj"):
+        raise NotImplementedError(
+            f"MODEL.env_neighbor_mix={env_neighbor_mix!r} is not implemented. "
+            "Current EnvEncoder supports self-only fallback and static_adj neighbor aggregation."
+        )
+    if loss_cfg.get("gate_label_mode", "potential_gain") != "potential_gain":
+        raise NotImplementedError(
+            "Only LOSS.gate_label_mode='potential_gain' is implemented. "
+            "NUE-STG gate labels must use y_potential = y_inv + r_env."
+        )
+    swap_mode = swap_cfg.get("mode", "batch_node_random")
+    if swap_mode != "batch_node_random":
+        raise NotImplementedError(
+            f"SWAP.mode={swap_mode!r} is not implemented. "
+            "Current swap is batch_node_random; concept-shift pair mining is future work."
+        )
+    if swap_cfg.get("pair_mining", False):
+        raise NotImplementedError(
+            "SWAP.pair_mining=True is not implemented yet. "
+            "Future work: history-similar/future-different and history-similar/future-similar pair mining."
+        )
+    if int(swap_cfg.get("num_swaps", 1)) != 1:
+        raise NotImplementedError("SWAP.num_swaps other than 1 is not implemented in current random swap.")
+    if loss_cfg.get("use_env_consistency", False) and swap_mode == "batch_node_random":
+        raise ValueError(
+            "LOSS.use_env_consistency=True is not allowed with SWAP.mode='batch_node_random'. "
+            "Random env_perm should not be pulled toward the original env; enable this only with same-pair mining."
+        )
+
     for key in ["input_len", "output_len", "input_dim", "output_dim", "num_nodes"]:
         model_cfg[key] = ds_cfg[key]
     model_cfg["adj_path"] = ds_cfg.get("adj_path", model_cfg.get("adj_path", ""))
@@ -203,7 +257,15 @@ def debug_batch(cfg: Dict) -> None:
     batch = to_device_batch(next(iter(loader)), device)
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
-    print(f"backbone_name: {cfg['MODEL'].get('backbone_name', 'stid_mlp')}")
+    backbone_name = cfg["MODEL"].get("backbone_name", "stid_mlp")
+    ablations = cfg.get("RUN", {}).get("ablations", [])
+    print(f"ablations: {','.join(ablations) if ablations else 'none'}")
+    print(f"backbone_name: {backbone_name}")
+    print(f"backbone_description: {BACKBONE_DESCRIPTIONS.get(str(backbone_name).lower(), 'custom invariant backbone')}")
+    print(f"gate_label_mode: {cfg['LOSS'].get('gate_label_mode', 'potential_gain')}")
+    print(f"swap_mode: {cfg.get('SWAP', {}).get('mode', 'batch_node_random')}")
+    print(f"pair_mining: {cfg.get('SWAP', {}).get('pair_mining', False)}")
+    print(f"env_consistency_enabled: {cfg['LOSS'].get('use_env_consistency', False)}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
@@ -348,6 +410,12 @@ def train_with_basicts_launcher(cfg: Dict) -> None:
     from basicts.configs import BasicTSForecastingConfig
 
     cfg = finalize_config(cfg)
+    warnings.warn(
+        "BasicTS launcher support is experimental for NUE-STG. "
+        "The local runner is the recommended experiment path because it guarantees dict-output auxiliary losses, "
+        "full loss logging, and gate diagnostics.",
+        RuntimeWarning,
+    )
     ds_cfg = cfg["DATASET"]
     train_cfg = cfg["TRAIN"]
     device = train_cfg.get("device", "cpu")

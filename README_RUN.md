@@ -5,6 +5,33 @@ Learning for Spatio-Temporal Graph Forecasting** as a standalone experiment
 project. It imports the pip-installed `basicts` package as a third-party
 dependency and does not modify BasicTS source code or `site-packages`.
 
+## Method Flow
+
+NUE-STG is not just an explicit environment variable model. The training loop
+optimizes node-wise conditional environment utility:
+
+1. The invariant backbone encodes each node history into `z_inv: [B,N,D]`.
+2. The invariant head predicts `y_inv: [B,H,N,C_out]`.
+3. The environment encoder extracts local node-wise environment
+   `env: [B,N,D_env]`; graph-level env is used only for `global_env` ablation.
+4. The residual head predicts `r_env = f_env(z_inv, env)`.
+5. The utility gate predicts `rho: [B,H,N,1]`.
+6. The final forecast is `prediction = y_inv + rho * r_env`.
+7. Gate labels are computed from the ungated potential forecast
+   `y_potential = y_inv + r_env`, not from gated prediction.
+
+The soft gate target is:
+
+```text
+delta_gain = loss(y_inv, Y) - loss(y_potential, Y)
+s_gain = sigmoid((delta_gain - gate_eta) / gate_tau)
+gate_loss = BCE(rho, stop_gradient(s_gain))
+```
+
+This approximates the condition
+`I(Y_{v,t+h}; E_{v,t} | Z_{v,t}) > eta`: an environment is useful only if it
+adds predictive information beyond the invariant representation.
+
 ## Repository Layout
 
 ```text
@@ -87,6 +114,8 @@ python train.py --config configs/pems08_nuestg.py --runner basicts
 
 The BasicTS launcher path is kept for compatibility, but the default local loop
 is recommended because it logs all NUE-STG component losses and gate statistics.
+Treat `--runner basicts` as experimental: full dict-output auxiliary losses and
+gate diagnostics are guaranteed only in the local runner.
 
 ## Override Parameters
 
@@ -140,13 +169,16 @@ python train.py --config configs/pems08_nuestg.py --ablation global_env
 
 Available ablations:
 
-- `no_env`: force `rho=0`, disable gate and swap losses.
-- `no_gate`: force `rho=1`, disable gate utility loss.
-- `no_swap`: disable counterfactual random environment swap.
+- `no_env`: invariant-only baseline. Force `rho=0` and disable gate, swap, KL,
+  independence, sparse, entropy, residual norm, and env consistency losses.
+- `no_gate`: force `rho=1`, directly use all environment residuals, and disable
+  only gate utility loss. Other environment regularizers can remain enabled.
+- `no_swap`: disable counterfactual random environment swap only.
 - `no_kl`: disable environment bottleneck KL.
 - `no_ind`: disable Z/E cross-covariance decorrelation.
 - `global_env`: produce graph-level environment then broadcast to nodes.
-- `shuffled_env`: decode with shuffled environments in train/eval.
+- `shuffled_env`: use randomly shuffled environments as the main prediction
+  environment in train/eval, and disable swap loss to avoid double shuffling.
 
 ## Config Organization
 
@@ -179,6 +211,11 @@ lambda_pred * pred_loss
 Every optional term has a `use_*` switch and a `lambda_*` weight. Disabled terms
 remain present in logs with value `0` so CSV columns stay stable.
 
+`env_consistency_loss` is experimental and should not be used with random
+batch-node swap. The code raises an error if `LOSS.use_env_consistency=True`
+while `SWAP.mode="batch_node_random"` because pulling random `env_perm` toward
+the original `env` conflicts with node-wise environment differentiation.
+
 Gate labels are based on **potential environment gain**, not gated prediction:
 
 ```text
@@ -197,9 +234,53 @@ prediction = y_inv + rho * r_env
 - `rho_mean` near `0`: the model almost never uses environment residuals.
 - `rho_mean` near `1`: the gate is always open.
 - very low `rho_std`: little node/horizon-specific gate diversity.
+- `delta_gain_mean`: average potential environment gain from `y_potential`, not
+  gated prediction.
+- `delta_gain_pos_ratio`: fraction of node-horizon positions where the
+  potential residual improves invariant-only prediction.
+- `s_gain_mean`: average soft gate target from potential gain.
 - positive `delta_gain_mean`: ungated environment residual has potential value.
 - `delta_gain_mean` staying near `0`: the residual branch is not learning useful
   information beyond the invariant predictor.
+- `y_potential_mae < y_inv_mae`: the residual branch has potential value.
+- `y_hat_mae` relative to `y_potential_mae`: whether the utility gate selects
+  residuals effectively.
+- `swap_delta_mean`: error change after replacing environments.
+
+## Supported And Not Yet Supported
+
+Current supported method pieces:
+
+- Node-wise environment `env: [B,N,D_env]`.
+- Invariant representation `z_inv: [B,N,D]` and invariant prediction `y_inv`.
+- Environment residual used only as correction, never as a replacement predictor.
+- Potential-gain gate target from `y_potential = y_inv + r_env`.
+- Random batch-node counterfactual swap with `SWAP.mode="batch_node_random"`.
+
+Current unsupported config options fail loudly:
+
+- `MODEL.use_time_embedding=True`: raises `NotImplementedError`.
+- `MODEL.adaptive_adj=True`: raises `NotImplementedError`; use
+  backbone-specific adaptive adjacency knobs instead.
+- `MODEL.env_neighbor_mix` other than `"static_adj"`: raises
+  `NotImplementedError`.
+- `LOSS.gate_label_mode` other than `"potential_gain"`: raises
+  `NotImplementedError`.
+- `SWAP.pair_mining=True`: raises `NotImplementedError`.
+- `SWAP.num_swaps != 1`: raises `NotImplementedError`.
+- `LOSS.use_env_consistency=True` with random swap: raises `ValueError`.
+
+Current swap is deliberately preliminary:
+
+```text
+env_flat = env.reshape(B*N, D_env)
+env_perm = random_permute(env_flat).reshape(B, N, D_env)
+prediction_swap = decode_with_env(z_inv, env_perm, y_inv)
+```
+
+It is not concept-shift pair mining. Future pair mining should add diff pairs
+with history-similar/future-different samples and same pairs with
+history-similar/future-similar samples.
 
 ## Recommended Tuning Order
 
@@ -222,3 +303,6 @@ prediction = y_inv + rho * r_env
 - `agcrn` is AGCRN-style with a simplified adaptive graph convolution, not a
   line-by-line copy of the official repository.
 - Time embeddings are configured but not yet implemented in the backbone.
+- Stronger or official backbone implementations remain future work behind the
+  existing `BaseBackbone` interface.
+- Samen-style concept-shift pair mining remains future work.

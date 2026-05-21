@@ -99,6 +99,27 @@ class NUESTG(nn.Module):
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
 
+        if config.use_time_embedding:
+            raise NotImplementedError("MODEL.use_time_embedding=True is not implemented in the current backbones.")
+        if config.adaptive_adj:
+            raise NotImplementedError(
+                "MODEL.adaptive_adj=True is not implemented at the NUE-STG top level; "
+                "use backbone-specific adaptive adjacency options instead."
+            )
+        if config.env_neighbor_mix not in (None, "static_adj"):
+            raise NotImplementedError(
+                f"MODEL.env_neighbor_mix={config.env_neighbor_mix!r} is not implemented; "
+                "current EnvEncoder supports static_adj aggregation or self-only fallback."
+            )
+        if self.swap_cfg.get("mode", "batch_node_random") != "batch_node_random":
+            raise NotImplementedError(
+                f"SWAP.mode={self.swap_cfg.get('mode')!r} is not implemented; current swap is batch_node_random."
+            )
+        if self.swap_cfg.get("pair_mining", False):
+            raise NotImplementedError("SWAP.pair_mining=True is not implemented yet.")
+        if int(self.swap_cfg.get("num_swaps", 1)) != 1:
+            raise NotImplementedError("SWAP.num_swaps other than 1 is not implemented.")
+
         model_cfg = asdict(config)
         self.backbone = build_backbone({"MODEL": model_cfg})
         self.representation_dim = int(self.backbone.representation_dim)
