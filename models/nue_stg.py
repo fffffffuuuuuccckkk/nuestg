@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional
 
 import torch
@@ -8,6 +8,7 @@ from torch import nn
 
 from basicts.configs import BasicTSModelConfig
 
+from models.backbones import build_backbone
 from models.env_encoder import NodeWiseEnvironmentEncoder
 from utils.tensor_ops import ensure_blnc, load_adjacency
 
@@ -30,6 +31,8 @@ class NUESTGConfig(BasicTSModelConfig):
     adj_path: str = ""
     adj_norm: str = "sym"
     adaptive_adj: bool = False
+    backbone_name: str = "stid_mlp"
+    backbone: Dict = field(default_factory=dict)
     env_dim: int = 32
     env_hidden_dim: int = 64
     env_encoder_type: str = "temporal_mlp"
@@ -71,10 +74,11 @@ class NUESTG(nn.Module):
 
         Delta = loss(y_inv, Y) - loss(y_inv + r_env, Y).
 
-    The gate rho_{v,t,h} is trained to open when Delta exceeds a usage cost eta.
-    KL bottleneck limits I(E;X), covariance penalty reduces redundancy I(E;Z),
-    sparse penalty prevents always using E, and counterfactual environment
-    swapping regularizes whether replacing E changes prediction.
+    The invariant backbone is pluggable. STID-MLP, Graph WaveNet-style, and
+    AGCRN-style backbones all return the same contract:
+    z_inv [B,N,D] and y_inv [B,H,N,C_out]. The node-wise environment encoder,
+    residual correction, utility gate, swapping regularizer, and loss interface
+    stay unchanged across backbones.
     """
 
     def __init__(self, config: NUESTGConfig) -> None:
@@ -85,7 +89,6 @@ class NUESTG(nn.Module):
         self.num_nodes = config.num_nodes
         self.input_dim = config.input_dim
         self.output_dim = config.output_dim
-        self.hidden_dim = config.hidden_dim
         self.env_dim = config.env_dim
         self.gate_horizon_aware = config.gate_horizon_aware
         self.gate_temperature = config.gate_temperature
@@ -94,33 +97,15 @@ class NUESTG(nn.Module):
         self.use_shuffled_env_eval = config.use_shuffled_env_eval
         self.swap_cfg = config.swap or {}
         self.swap_detach_inv = config.swap_detach_inv
+        self.backbone_name = config.backbone_name
+
+        model_cfg = asdict(config)
+        self.backbone = build_backbone({"MODEL": model_cfg})
+        self.representation_dim = int(self.backbone.representation_dim)
+        self.hidden_dim = self.representation_dim
 
         if config.env_encoder_type != "temporal_mlp":
             raise ValueError("Only env_encoder_type='temporal_mlp' is implemented in this version.")
-
-        self.temporal_encoder = nn.Sequential(
-            nn.Linear(config.input_len * config.input_dim, config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-            nn.GELU(),
-        )
-
-        if config.use_node_embedding:
-            self.node_emb = nn.Parameter(torch.empty(config.num_nodes, config.node_emb_dim))
-            nn.init.xavier_uniform_(self.node_emb)
-            inv_input_dim = config.hidden_dim + config.node_emb_dim
-        else:
-            self.node_emb = None
-            inv_input_dim = config.hidden_dim
-
-        self.inv_projector = nn.Sequential(
-            nn.Linear(inv_input_dim, config.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim),
-        )
-        self.inv_head = nn.Linear(config.hidden_dim, config.output_len * config.output_dim)
 
         self.env_encoder = NodeWiseEnvironmentEncoder(
             input_len=config.input_len,
@@ -136,7 +121,7 @@ class NUESTG(nn.Module):
             deterministic_eval=config.deterministic_env_eval,
         )
 
-        decode_in_dim = config.hidden_dim + config.env_dim
+        decode_in_dim = self.representation_dim + config.env_dim
         self.env_head = nn.Sequential(
             nn.Linear(decode_in_dim, config.residual_hidden_dim),
             nn.GELU(),
@@ -177,29 +162,6 @@ class NUESTG(nn.Module):
                 perm[same] = (perm[same] + 1) % flat.shape[0]
         return flat[perm].reshape(batch_size, num_nodes, env_dim)
 
-    def encode_invariant(self, x: torch.Tensor) -> torch.Tensor:
-        x = ensure_blnc(x, "x")
-        batch_size, input_len, num_nodes, input_dim = x.shape
-        if input_len != self.input_len:
-            raise ValueError(f"expected input_len={self.input_len}, got {input_len}")
-        if num_nodes != self.num_nodes:
-            raise ValueError(f"expected num_nodes={self.num_nodes}, got {num_nodes}")
-        if input_dim != self.input_dim:
-            raise ValueError(f"expected input_dim={self.input_dim}, got {input_dim}")
-
-        node_history = x.permute(0, 2, 1, 3).reshape(batch_size, num_nodes, input_len * input_dim)
-        h = self.temporal_encoder(node_history)
-        if self.node_emb is not None:
-            node_emb = self.node_emb.unsqueeze(0).expand(batch_size, -1, -1)
-            h = torch.cat([h, node_emb], dim=-1)
-        return self.inv_projector(h)
-
-    def invariant_predict(self, z_inv: torch.Tensor) -> torch.Tensor:
-        batch_size, num_nodes, _ = z_inv.shape
-        y_inv = self.inv_head(z_inv)
-        y_inv = y_inv.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
-        return self._apply_prediction_activation(y_inv)
-
     def _apply_prediction_activation(self, y: torch.Tensor) -> torch.Tensor:
         activation = self.config.prediction_activation
         if activation is None:
@@ -227,10 +189,10 @@ class NUESTG(nn.Module):
 
         if detach_inv:
             z_decode = z_inv.detach()
-            y_base = self.invariant_predict(z_decode) if y_inv is None else y_inv.detach()
+            y_base = self.backbone.forecast_from_representation(z_decode) if y_inv is None else y_inv.detach()
         else:
             z_decode = z_inv
-            y_base = self.invariant_predict(z_decode) if y_inv is None else y_inv
+            y_base = self.backbone.forecast_from_representation(z_decode) if y_inv is None else y_inv
 
         decode_input = torch.cat([z_decode, env], dim=-1)
         batch_size, num_nodes, _ = decode_input.shape
@@ -271,10 +233,12 @@ class NUESTG(nn.Module):
     def forward(self, inputs: torch.Tensor, **kwargs) -> Dict[str, Optional[torch.Tensor]]:
         x = ensure_blnc(inputs, "inputs")
         batch_size, _, num_nodes, _ = x.shape
+        adj = getattr(self, "adj_norm", None)
 
-        z_inv = self.encode_invariant(x)
-        y_inv = self.invariant_predict(z_inv)
-        env_mu, env_logvar, env = self.env_encoder(x, getattr(self, "adj_norm", None))
+        backbone_out = self.backbone(x, adj=adj)
+        z_inv = backbone_out["z_inv"]
+        y_inv = self._apply_prediction_activation(backbone_out["y_inv"])
+        env_mu, env_logvar, env = self.env_encoder(x, adj)
 
         env_perm = None
         use_shuffled_env = (self.training and self.use_shuffled_env_train) or (
@@ -293,7 +257,7 @@ class NUESTG(nn.Module):
 
         expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)
         expected_gate_shape = (batch_size, self.output_len, num_nodes, 1)
-        expected_z_shape = (batch_size, num_nodes, self.hidden_dim)
+        expected_z_shape = (batch_size, num_nodes, self.representation_dim)
         expected_env_shape = (batch_size, num_nodes, self.env_dim)
         shape_checks = {
             "prediction": (prediction, expected_pred_shape),

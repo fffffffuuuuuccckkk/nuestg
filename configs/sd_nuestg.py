@@ -26,6 +26,8 @@ CONFIG = deep_update(
             "input_dim": 1,
             "output_dim": 1,
             "adj_path": f"{DATASET_DIR}/adj_mx.pkl",
+            "backbone_name": "stid_mlp",
+            "backbone": {"name": "stid_mlp", "representation_dim": 64},
         },
         "TRAIN": {
             "ckpt_dir": "./checkpoints/sd_nuestg",

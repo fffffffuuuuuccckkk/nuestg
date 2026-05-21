@@ -18,6 +18,11 @@ nuestg/
   models/
     nue_stg.py
     env_encoder.py
+    backbones/
+      base.py
+      stid_mlp.py
+      graph_wavenet.py
+      agcrn.py
   losses/
     nue_loss.py
   utils/
@@ -96,6 +101,34 @@ python train.py --config configs/pems08_nuestg.py \
 
 Values are cast automatically: `true/false` to bool, integers to int, floats to
 float, and `none/null` to `None`.
+
+## Backbone Selection
+
+NUE-STG treats the invariant forecasting backbone as a plug-in. A backbone only
+needs to return `z_inv: [B,N,D]` and `y_inv: [B,H,N,C_out]`; the node-wise
+environment encoder, residual correction, utility gate, potential-gain label,
+and swap regularizer are shared by all backbones.
+
+Supported values for `MODEL.backbone_name`:
+
+- `stid_mlp`: default lightweight STID-like temporal MLP with optional node
+  embeddings. It is best for fast debug and ablations, and is not the complete
+  official STID implementation.
+- `graphwavenet`: Graph WaveNet-style invariant backbone with dilated gated
+  temporal convolutions, static adjacency support, and adaptive adjacency.
+- `agcrn`: AGCRN-style adaptive graph recurrent backbone using node embeddings
+  to construct adaptive adjacency.
+
+Run with a selected backbone:
+
+```bash
+python train.py --config configs/pems08_nuestg.py --set MODEL.backbone_name=graphwavenet
+python train.py --config configs/pems08_nuestg.py --set MODEL.backbone_name=agcrn
+python train.py --config configs/pems08_nuestg.py --set MODEL.backbone_name=stid_mlp
+```
+
+Backbone-specific parameters live under `MODEL.backbone.stid_mlp`,
+`MODEL.backbone.graph_wavenet`, and `MODEL.backbone.agcrn`.
 
 ## Ablations
 
@@ -182,6 +215,10 @@ prediction = y_inv + rho * r_env
   concept-shift pair mining.
 - Future work can add Samen-style history-similar / future-different pair
   mining via the existing `SWAP.pair_mining` config slots.
-- The invariant backbone is a lightweight STID-like temporal MLP plus node
-  embedding, not the full official STID implementation.
+- `stid_mlp` is a lightweight STID-like temporal MLP plus node embedding, not
+  the full official STID implementation.
+- `graphwavenet` is Graph WaveNet-style, not a line-by-line copy of the
+  official repository.
+- `agcrn` is AGCRN-style with a simplified adaptive graph convolution, not a
+  line-by-line copy of the official repository.
 - Time embeddings are configured but not yet implemented in the backbone.

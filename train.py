@@ -75,6 +75,20 @@ def finalize_config(cfg: Dict) -> Dict:
     for key in ["input_len", "output_len", "input_dim", "output_dim", "num_nodes"]:
         model_cfg[key] = ds_cfg[key]
     model_cfg["adj_path"] = ds_cfg.get("adj_path", model_cfg.get("adj_path", ""))
+    backbone_cfg = model_cfg.setdefault("backbone", {})
+    model_cfg["backbone_name"] = model_cfg.get("backbone_name", backbone_cfg.get("name", "stid_mlp"))
+    backbone_cfg["name"] = model_cfg["backbone_name"]
+    representation_dim = int(backbone_cfg.get("representation_dim", model_cfg.get("hidden_dim", 64)))
+    backbone_key = str(model_cfg["backbone_name"]).lower()
+    if backbone_key in {"graphwavenet", "gwnet"}:
+        backbone_key = "graph_wavenet"
+    if backbone_key in {"mlp", "stid_like"}:
+        backbone_key = "stid_mlp"
+    selected_cfg = backbone_cfg.get(backbone_key, {})
+    if isinstance(selected_cfg, dict) and selected_cfg.get("representation_dim") is not None:
+        representation_dim = int(selected_cfg["representation_dim"])
+    backbone_cfg["representation_dim"] = representation_dim
+    model_cfg["hidden_dim"] = representation_dim
     model_cfg["swap"] = cfg.get("SWAP", {})
     model_cfg["swap_detach_inv"] = cfg.get("LOSS", {}).get("swap_detach_inv", True)
     cfg["LOSS"]["null_val"] = ds_cfg.get("null_val", cfg["LOSS"].get("null_val"))
@@ -147,13 +161,14 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
     output_len = cfg["DATASET"]["output_len"]
     num_nodes = cfg["DATASET"]["num_nodes"]
     output_dim = cfg["DATASET"]["output_dim"]
+    representation_dim = int(cfg["MODEL"].get("backbone", {}).get("representation_dim", cfg["MODEL"]["hidden_dim"]))
     expected = {
         "prediction": (batch_size, output_len, num_nodes, output_dim),
         "y_inv": (batch_size, output_len, num_nodes, output_dim),
         "y_potential": (batch_size, output_len, num_nodes, output_dim),
         "r_env": (batch_size, output_len, num_nodes, output_dim),
         "rho": (batch_size, output_len, num_nodes, 1),
-        "z_inv": (batch_size, num_nodes, cfg["MODEL"]["hidden_dim"]),
+        "z_inv": (batch_size, num_nodes, representation_dim),
         "env_mu": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env_logvar": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
@@ -188,6 +203,7 @@ def debug_batch(cfg: Dict) -> None:
     batch = to_device_batch(next(iter(loader)), device)
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
+    print(f"backbone_name: {cfg['MODEL'].get('backbone_name', 'stid_mlp')}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
