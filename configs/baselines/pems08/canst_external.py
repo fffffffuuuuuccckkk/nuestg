@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "CAN-ST", "dataset": "PEMS08", "status": "external_required", "category": "st_ood", "result_template": "results/external_import_templates/canst_pems08.csv", "notes": "Requires official or verified external CAN-ST implementation."}}

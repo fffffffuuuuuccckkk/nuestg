@@ -300,6 +300,94 @@ disables persistence influence on gate labels because gate loss is off.
 `shuffled_env` disables persistence influence on gate labels to avoid mixing
 node-mismatched environments with persistence pseudo labels.
 
+## Baseline Plan
+
+The experiment layer separates runnable in-repository baselines from methods
+that require official external code or imported results.
+
+Runnable forecasting baselines:
+
+- `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`. This is the local
+  lightweight temporal MLP plus node embedding, not the official STID code.
+- `GraphWaveNet-style`: `configs/baselines/pems08/graphwavenet.py`. This uses
+  the local Graph WaveNet-style backbone, not a line-by-line official
+  reproduction.
+- `AGCRN-style`: `configs/baselines/pems08/agcrn.py`. This uses the local
+  AGCRN-style adaptive recurrent backbone, not a line-by-line official
+  reproduction.
+
+All runnable forecasting baselines reuse `train.py` and disable NUE-STG
+environment mechanisms through the invariant-only `no_env` setup. Their
+prediction is effectively `y_inv`; gate, swap, KL, independence, sparse,
+entropy, residual norm, env consistency, persistence MI, and computation-level
+separation are disabled.
+
+Runnable NUE-STG plug-in backbone experiments:
+
+- `Ours-STIDMLP`: `configs/ours/pems08/nuestg_stid_mlp.py`.
+- `Ours-GraphWaveNet`: `configs/ours/pems08/nuestg_graphwavenet.py`.
+- `Ours-AGCRN`: `configs/ours/pems08/nuestg_agcrn.py`.
+
+These keep the unified NUE-STG environment utility module and only swap the
+invariant backbone that produces `z_inv` and `y_inv`.
+
+External-required forecasting and ST-OOD baselines:
+
+- Forecasting: `DGCRN`, `D2STGNN`, `STAEformer`.
+- ST-OOD / distribution shift: `CauSTG`, `CaST`, `STONE`, `Samen`, `CAN-ST`,
+  `STOP`, `DIDA`, `I-DIDA`, `EAGLE`.
+
+These are registered with `status=external_required`. The repository provides
+metadata configs and import templates under
+`results/external_import_templates/`, but it does not train these methods with
+`train.py`. Do not claim this repository implements them unless a real adapter
+or implementation is added later.
+
+Useful commands:
+
+```bash
+bash scripts/run_debug_all.sh
+bash scripts/run_forecasting_baselines.sh
+bash scripts/run_ours_backbones.sh
+bash scripts/run_ablations.sh
+bash scripts/run_ood_baselines_placeholders.sh
+bash scripts/collect_all_results.sh
+```
+
+The scripts accept environment variables:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 DATASET=pems08 SEEDS="2024 2025 2026" bash scripts/run_ours_backbones.sh
+DATASET=pems08 DEBUG_BATCH_SIZE=4 bash scripts/run_debug_all.sh
+EXTRA_ARGS="--set TRAIN.epochs=20" bash scripts/run_ablations.sh
+```
+
+Baseline fairness notes:
+
+- Use the same dataset split, input length, output horizon, scaler, and metric
+  definitions.
+- Run multiple seeds when reporting final numbers.
+- External baselines must include a `source` field such as
+  `official_reproduction`, `paper_table`, or `third_party_reproduction`.
+- External results should be placed in `results/raw/*.csv` using the schema in
+  `results/README.md`.
+
+Paper table suggestions:
+
+- Table 1: normal forecasting baselines.
+- Table 2: OOD / ST distribution-shift baselines imported from external runs.
+- Table 3: NUE-STG plug-in backbone study.
+- Table 4: full ablation.
+- Table 5: separation mode study.
+- Table 6: persistence MI and gate-target study.
+
+Generate tables after training or importing external results:
+
+```bash
+python experiments/collect_results.py --results_dir results --out results/tables/all_results.csv
+python experiments/make_tables.py --input results/tables/all_results.csv --out_dir results/tables
+```
+
 ## Config Organization
 
 - `DATASET`: dataset name, paths, shapes, null value, BasicTS input/target keys.

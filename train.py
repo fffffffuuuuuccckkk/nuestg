@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import warnings
 from contextlib import nullcontext
@@ -21,6 +22,9 @@ from utils import (
     append_csv_log,
     assert_finite,
     format_logs,
+    masked_mae_value,
+    masked_mape_value,
+    masked_rmse_value,
     resolve_cli_config,
     save_resolved_config,
 )
@@ -80,7 +84,7 @@ LOG_KEYS = [
     "sep_lowrank_rank",
     "sep_env_residual_norm",
 ]
-CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae"]
+CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae", "val_rmse", "val_mape"]
 
 BACKBONE_DESCRIPTIONS = {
     "stid_mlp": "lightweight STID-like temporal MLP + node embedding",
@@ -343,20 +347,63 @@ def debug_batch(cfg: Dict) -> None:
 
 
 @torch.no_grad()
-def evaluate(model: NUESTG, loader: DataLoader, device: torch.device, cfg: Dict, max_batches: int) -> float:
+def evaluate(model: NUESTG, loader: DataLoader, device: torch.device, cfg: Dict, max_batches: int) -> Dict[str, float]:
     model.eval()
-    values = []
+    values = {"mae": [], "rmse": [], "mape": []}
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
+    null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
     for step, batch in enumerate(loader):
         if step >= max_batches:
             break
         batch = to_device_batch(batch, device)
         output = model(batch[input_key])
-        mae = nue_mae_metric(output["prediction"], batch[target_key])
-        values.append(float(mae.detach().cpu()))
+        prediction = output["prediction"]
+        targets = batch[target_key]
+        values["mae"].append(float(masked_mae_value(prediction, targets, null_val).detach().cpu()))
+        values["rmse"].append(float(masked_rmse_value(prediction, targets, null_val).detach().cpu()))
+        values["mape"].append(float(masked_mape_value(prediction, targets, null_val).detach().cpu()))
     model.train()
-    return float(np.mean(values)) if values else float("nan")
+    if not values["mae"]:
+        return {"mae": float("nan"), "rmse": float("nan"), "mape": float("nan")}
+    return {key: float(np.mean(item_values)) for key, item_values in values.items()}
+
+
+def build_metrics_payload(
+    cfg: Dict,
+    epoch: int,
+    global_step: int,
+    metrics: Dict[str, float],
+    ckpt_path: Path,
+    split: str = "val",
+) -> Dict:
+    run_cfg = cfg.get("RUN", {})
+    model_cfg = cfg["MODEL"]
+    return {
+        "dataset": cfg["DATASET"]["name"],
+        "setting": run_cfg.get("setting", "forecasting"),
+        "method": run_cfg.get("method", model_cfg.get("name", "NUE-STG")),
+        "category": run_cfg.get("category", "plugin_ours"),
+        "backbone": model_cfg.get("backbone_name", ""),
+        "ablation": ",".join(run_cfg.get("ablations", [])) if run_cfg.get("ablations") else run_cfg.get("ablation", ""),
+        "seed": cfg["TRAIN"].get("seed"),
+        "epoch": epoch,
+        "global_step": global_step,
+        "split": split,
+        "mae": metrics.get("mae", float("nan")),
+        "rmse": metrics.get("rmse", float("nan")),
+        "mape": metrics.get("mape", float("nan")),
+        "config_path": run_cfg.get("config_path", ""),
+        "ckpt_path": str(ckpt_path),
+        "status": run_cfg.get("status", "runnable"),
+        "notes": run_cfg.get("notes", ""),
+    }
+
+
+def save_metrics_json(path: Path, payload: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
 
 
 def append_train_log(cfg: Dict, row: Dict) -> None:
@@ -418,12 +465,31 @@ def train_local(cfg: Dict) -> None:
             scalar_logs = {key: float(value.detach().cpu()) for key, value in logs.items()}
             meters.update(scalar_logs)
             if global_step % train_cfg.get("log_interval", 20) == 0:
-                row = {"epoch": epoch, "step": global_step, "split": "train", **scalar_logs, "val_mae": ""}
+                row = {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "split": "train",
+                    **scalar_logs,
+                    "val_mae": "",
+                    "val_rmse": "",
+                    "val_mape": "",
+                }
                 append_train_log(cfg, row)
                 print(f"epoch={epoch} step={global_step} {format_logs(scalar_logs, LOG_KEYS)}")
 
         epoch_logs = meters.mean()
-        append_train_log(cfg, {"epoch": epoch, "step": global_step, "split": "train_epoch", **epoch_logs, "val_mae": ""})
+        append_train_log(
+            cfg,
+            {
+                "epoch": epoch,
+                "step": global_step,
+                "split": "train_epoch",
+                **epoch_logs,
+                "val_mae": "",
+                "val_rmse": "",
+                "val_mape": "",
+            },
+        )
 
         if train_cfg.get("save_last", True):
             torch.save(
@@ -438,14 +504,37 @@ def train_local(cfg: Dict) -> None:
             )
 
         if epoch % train_cfg.get("val_interval", 1) == 0:
-            val_mae = evaluate(model, val_loader, device, cfg, train_cfg.get("val_batches", 50))
-            print(f"epoch={epoch} val_mae={val_mae:.6f}")
-            append_train_log(cfg, {"epoch": epoch, "step": global_step, "split": "val", "val_mae": val_mae})
-            improved = val_mae < best_val
+            val_metrics = evaluate(model, val_loader, device, cfg, train_cfg.get("val_batches", 50))
+            print(
+                f"epoch={epoch} val_mae={val_metrics['mae']:.6f} "
+                f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f}"
+            )
+            append_train_log(
+                cfg,
+                {
+                    "epoch": epoch,
+                    "step": global_step,
+                    "split": "val",
+                    "val_mae": val_metrics["mae"],
+                    "val_rmse": val_metrics["rmse"],
+                    "val_mape": val_metrics["mape"],
+                },
+            )
+            last_payload = build_metrics_payload(
+                cfg,
+                epoch,
+                global_step,
+                val_metrics,
+                ckpt_dir / "last.pt",
+                split="val",
+            )
+            save_metrics_json(ckpt_dir / "last_metrics.json", last_payload)
+            improved = val_metrics["mae"] < best_val
             if improved:
-                best_val = val_mae
+                best_val = val_metrics["mae"]
                 patience = 0
                 if train_cfg.get("save_best", True):
+                    best_ckpt_path = ckpt_dir / "best.pt"
                     torch.save(
                         {
                             "model": model.state_dict(),
@@ -453,11 +542,22 @@ def train_local(cfg: Dict) -> None:
                             "config": cfg,
                             "epoch": epoch,
                             "global_step": global_step,
-                            "val_mae": val_mae,
+                            "val_mae": val_metrics["mae"],
+                            "val_rmse": val_metrics["rmse"],
+                            "val_mape": val_metrics["mape"],
                         },
-                        ckpt_dir / "best.pt",
+                        best_ckpt_path,
                     )
-                    print(f"saved best checkpoint: {ckpt_dir / 'best.pt'}")
+                    best_payload = build_metrics_payload(
+                        cfg,
+                        epoch,
+                        global_step,
+                        val_metrics,
+                        best_ckpt_path,
+                        split="val",
+                    )
+                    save_metrics_json(ckpt_dir / "best_metrics.json", best_payload)
+                    print(f"saved best checkpoint: {best_ckpt_path}")
             else:
                 patience += 1
                 early_stop_patience = train_cfg.get("early_stop_patience")

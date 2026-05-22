@@ -1,0 +1,2 @@
+dataset,split,setting,baseline,seed,mae,rmse,mape,source,notes
+PEMS08,test,ood,EAGLE,2026,,,,official_reproduction,"fill metrics from external run"

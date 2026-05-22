@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "D2STGNN", "dataset": "PEMS08", "status": "external_required", "category": "forecasting", "result_template": "results/external_import_templates/d2stgnn_pems08.csv", "notes": "Requires official or verified external D2STGNN implementation."}}

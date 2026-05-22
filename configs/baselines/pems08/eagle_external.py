@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "EAGLE", "dataset": "PEMS08", "status": "external_required", "category": "st_ood", "result_template": "results/external_import_templates/eagle_pems08.csv", "notes": "Optional external ST-OOD baseline."}}

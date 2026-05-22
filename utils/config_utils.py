@@ -90,7 +90,12 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
         deep_update(
             cfg,
             {
-                "MODEL": {"force_gate_value": 0.0, "persistence": {"enabled": False}},
+                "MODEL": {
+                    "force_gate_value": 0.0,
+                    "persistence": {"enabled": False},
+                    "separation": {"enabled": False, "mode": "none"},
+                    "use_separated_z_for_y_inv": True,
+                },
                 "LOSS": {
                     "use_gate": False,
                     "use_swap": False,
@@ -120,6 +125,18 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
         deep_update(cfg, {"LOSS": {"use_kl": False}})
     elif name == "no_ind":
         deep_update(cfg, {"LOSS": {"use_ind": False}})
+    elif name == "no_sparse":
+        deep_update(cfg, {"LOSS": {"use_sparse": False}})
+    elif name == "no_separation":
+        deep_update(
+            cfg,
+            {
+                "MODEL": {
+                    "separation": {"enabled": False, "mode": "none"},
+                    "use_separated_z_for_y_inv": True,
+                }
+            },
+        )
     elif name == "global_env":
         deep_update(cfg, {"MODEL": {"env_global_mode": True}})
     elif name == "shuffled_env":
@@ -142,7 +159,8 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
     else:
         raise ValueError(
             f"Unknown ablation {name!r}; expected one of "
-            "no_env,no_gate,no_swap,no_kl,no_ind,global_env,shuffled_env,no_persistence"
+            "no_env,no_gate,no_swap,no_kl,no_ind,no_sparse,no_separation,"
+            "global_env,shuffled_env,no_persistence"
         )
     return cfg
 
@@ -158,4 +176,5 @@ def resolve_cli_config(config_path: str, ablations: List[str], dotlist: List[str
     apply_ablations(cfg, ablations)
     deep_update(cfg, parse_dotlist_overrides(dotlist))
     cfg.setdefault("RUN", {})["ablations"] = list(ablations or [])
+    cfg.setdefault("RUN", {})["config_path"] = str(Path(config_path).resolve())
     return cfg

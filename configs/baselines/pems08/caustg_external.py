@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "CauSTG", "dataset": "PEMS08", "status": "external_required", "category": "st_ood", "result_template": "results/external_import_templates/caustg_pems08.csv", "notes": "Requires official or verified external CauSTG implementation."}}

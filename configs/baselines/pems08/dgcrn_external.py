@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "DGCRN", "dataset": "PEMS08", "status": "external_required", "category": "forecasting", "result_template": "results/external_import_templates/dgcrn_pems08.csv", "notes": "Requires official or verified external DGCRN implementation."}}

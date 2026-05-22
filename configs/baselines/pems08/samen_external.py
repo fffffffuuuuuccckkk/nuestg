@@ -1,0 +1,1 @@
+CONFIG = {"BASELINE": {"name": "Samen", "dataset": "PEMS08", "status": "external_required", "category": "st_ood", "result_template": "results/external_import_templates/samen_pems08.csv", "notes": "Requires official or verified external Samen implementation; this repository does not implement concept-shift pair mining."}}

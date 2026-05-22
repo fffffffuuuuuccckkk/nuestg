@@ -76,6 +76,42 @@ def masked_abs_error(
     return abs_error, mask
 
 
+def masked_mae_value(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    abs_error, mask = masked_abs_error(prediction, targets, null_val, existing_mask)
+    return masked_mean(abs_error, mask)
+
+
+def masked_rmse_value(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    targets = align_target(targets, prediction)
+    mask = make_valid_mask(targets, null_val, existing_mask)
+    squared_error = (prediction - torch.nan_to_num(targets, nan=0.0)).pow(2)
+    return torch.sqrt(masked_mean(squared_error, mask).clamp_min(0.0))
+
+
+def masked_mape_value(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    targets = align_target(targets, prediction)
+    mask = make_valid_mask(targets, null_val, existing_mask)
+    denom = torch.nan_to_num(targets.abs(), nan=0.0).clamp_min(eps)
+    ape = (prediction - torch.nan_to_num(targets, nan=0.0)).abs() / denom
+    return masked_mean(ape, mask)
+
+
 def normalize_adjacency(adj: np.ndarray, adj_norm: str) -> np.ndarray:
     adj_norm = (adj_norm or "none").lower()
     if adj_norm == "none":
