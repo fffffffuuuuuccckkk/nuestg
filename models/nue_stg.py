@@ -10,8 +10,9 @@ from basicts.configs import BasicTSModelConfig
 
 from models.backbones import build_backbone
 from models.env_encoder import NodeWiseEnvironmentEncoder
+from models.future_env_encoder import FutureEnvEncoder
 from models.separation import SeparationModule
-from utils.tensor_ops import ensure_blnc, load_adjacency
+from utils.tensor_ops import align_target, ensure_blnc, load_adjacency
 
 
 @dataclass
@@ -36,6 +37,7 @@ class NUESTGConfig(BasicTSModelConfig):
     backbone: Dict = field(default_factory=dict)
     separation: Dict = field(default_factory=dict)
     use_separated_z_for_y_inv: bool = True
+    persistence: Dict = field(default_factory=dict)
     env_dim: int = 32
     env_hidden_dim: int = 64
     env_encoder_type: str = "temporal_mlp"
@@ -102,6 +104,8 @@ class NUESTG(nn.Module):
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
         self.use_separated_z_for_y_inv = bool(config.use_separated_z_for_y_inv)
+        self.persistence_cfg = config.persistence or {}
+        self.persistence_enabled = bool(self.persistence_cfg.get("enabled", False))
 
         if config.use_time_embedding:
             raise NotImplementedError("MODEL.use_time_embedding=True is not implemented in the current backbones.")
@@ -160,6 +164,18 @@ class NUESTG(nn.Module):
             input_len=config.input_len,
             input_dim=config.input_dim,
         )
+        self.future_env_encoder = FutureEnvEncoder(
+            output_len=config.output_len,
+            output_dim=config.output_dim,
+            env_dim=config.env_dim,
+            hidden_dim=int(self.persistence_cfg.get("future_env_hidden_dim", 64)),
+            dropout=float(self.persistence_cfg.get("dropout", 0.1)),
+        )
+        projection_dim = int(self.persistence_cfg.get("projection_dim", 32))
+        projection_hidden_dim = int(self.persistence_cfg.get("projection_hidden_dim", 64))
+        projection_dropout = float(self.persistence_cfg.get("dropout", 0.1))
+        self.persist_q = self._make_persistence_head(config.env_dim, projection_hidden_dim, projection_dim, projection_dropout)
+        self.persist_k = self._make_persistence_head(config.env_dim, projection_hidden_dim, projection_dim, projection_dropout)
 
         decode_in_dim = self.representation_dim + config.env_dim
         self.env_head = nn.Sequential(
@@ -186,6 +202,15 @@ class NUESTG(nn.Module):
             self.register_buffer("adj_norm", adj_norm)
         else:
             self.adj_norm = None
+
+    @staticmethod
+    def _make_persistence_head(in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+        )
 
     def invariant_predict_from_z(self, z_inv: torch.Tensor) -> torch.Tensor:
         batch_size, num_nodes, _ = z_inv.shape
@@ -276,7 +301,43 @@ class NUESTG(nn.Module):
             "y_potential": y_potential,
         }
 
-    def forward(self, inputs: torch.Tensor, **kwargs) -> Dict[str, Optional[torch.Tensor]]:
+    def _compute_persistence(
+        self,
+        env_hist: torch.Tensor,
+        y_inv: torch.Tensor,
+        y_true: Optional[torch.Tensor],
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        env_fut = None
+        q_hist = None
+        k_fut = None
+        persist_score = None
+        if self.persistence_enabled and self.training and y_true is not None:
+            aligned_true = align_target(y_true, y_inv)
+            future_residual = aligned_true - y_inv.detach()
+            env_fut = self.future_env_encoder(future_residual)
+            q_hist = self.persist_q(env_hist)
+            k_fut_raw = self.persist_k(env_fut)
+            k_fut = (
+                k_fut_raw.detach()
+                if bool(self.persistence_cfg.get("detach_future_key", True))
+                else k_fut_raw
+            )
+            q_norm = torch.nn.functional.normalize(q_hist, dim=-1)
+            k_norm = torch.nn.functional.normalize(k_fut, dim=-1)
+            persist_score = (q_norm * k_norm).sum(dim=-1, keepdim=True)
+        return {
+            "env_fut": env_fut,
+            "persist_q": q_hist,
+            "persist_k": k_fut,
+            "persist_score": persist_score,
+        }
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        y_true: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, Optional[torch.Tensor]]:
         x = ensure_blnc(inputs, "inputs")
         batch_size, _, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
@@ -293,6 +354,7 @@ class NUESTG(nn.Module):
             y_inv = self.invariant_predict_from_z(z_inv)
         else:
             y_inv = y_inv_raw
+        persistence_out = self._compute_persistence(env, y_inv, y_true)
 
         env_perm = None
         use_shuffled_env = (self.training and self.use_shuffled_env_train) or (
@@ -324,6 +386,7 @@ class NUESTG(nn.Module):
             "env_mu": (env_mu, expected_env_shape),
             "env_logvar": (env_logvar, expected_env_shape),
             "env": (env, expected_env_shape),
+            "env_hist": (env, expected_env_shape),
             "env_raw": (env_raw, expected_env_shape),
             "y_inv_raw": (y_inv_raw, expected_pred_shape),
         }
@@ -360,10 +423,16 @@ class NUESTG(nn.Module):
             "env_mu": env_mu,
             "env_logvar": env_logvar,
             "env": env,
+            "env_hist": env,
             "env_raw": env_raw,
             "y_inv_raw": y_inv_raw,
             "separation_mode": sep_out["mode"],
             "separation_extra": separation_extra,
+            "env_fut": persistence_out["env_fut"],
+            "persist_q": persistence_out["persist_q"],
+            "persist_k": persistence_out["persist_k"],
+            "persist_score": persistence_out["persist_score"],
+            "persistence_enabled": self.persistence_enabled,
             "prediction_swap": prediction_swap,
             "rho_swap": rho_swap,
             "env_perm": env_perm,

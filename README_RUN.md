@@ -219,12 +219,65 @@ python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.sepa
 python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.separation.mode=lowrank_residual --set MODEL.separation.lowrank.target=hidden
 ```
 
+## Environment Persistence MI
+
+Effective environments should usually persist from the historical receptive
+field into the forecast horizon, rather than behaving like instantaneous noise.
+During training, NUE-STG now derives a self-supervised future environment from
+future residuals:
+
+```text
+env_hist = env                         # from historical X only
+future_residual = Y - stopgrad(y_inv)
+env_fut = FutureEnvEncoder(future_residual)
+```
+
+`env_fut` is used only for training constraints. It never enters `prediction`,
+and validation/test calls use `model(x)` without `y_true`, so `env_fut`,
+`persist_q`, and `persist_k` are `None`.
+
+The persistence objective is an InfoNCE estimate of `I(env_hist; env_fut)` over
+batch-node instances:
+
+```text
+q_i = q(env_hist_i)
+k_i = k(env_fut_i)
+L_persistence_mi = CE(normalize(q) @ normalize(k).T / tau, labels=i)
+```
+
+The gate target can optionally combine potential gain with persistence:
+
+```text
+s_gain = sigmoid((delta_gain - gate_eta) / gate_tau)
+s_persist = sigmoid((cos(q(env_hist), k(env_fut)) - persistence_margin) / persistence_tau)
+s_gate = s_gain * s_persist
+```
+
+When `LOSS.persistence_affects_gate=False`, gate training uses `s_gain` alone.
+This keeps the original potential-gain gate available as an ablation.
+
+Examples:
+
+```bash
+python train.py --config configs/pems08_nuestg.py --debug_batch --set LOSS.use_persistence_mi=true
+python train.py --config configs/pems08_nuestg.py --debug_batch --set LOSS.persistence_affects_gate=false
+python train.py --config configs/pems08_nuestg.py --debug_batch --set LOSS.lambda_persistence_mi=0.01
+python train.py --config configs/pems08_nuestg.py --debug_batch --ablation no_persistence
+```
+
+Persistence assumes useful environments have some historical-future continuity.
+For transient anomalies that are predictive but not persistent, large
+`lambda_persistence_mi` or forcing persistence into the gate target may be too
+strong; tune `LOSS.lambda_persistence_mi` and
+`LOSS.persistence_affects_gate`.
+
 ## Ablations
 
 ```bash
 python train.py --config configs/pems08_nuestg.py --ablation no_swap
 python train.py --config configs/pems08_nuestg.py --ablation no_gate
 python train.py --config configs/pems08_nuestg.py --ablation global_env
+python train.py --config configs/pems08_nuestg.py --ablation no_persistence
 ```
 
 Available ablations:
@@ -239,6 +292,13 @@ Available ablations:
 - `global_env`: produce graph-level environment then broadcast to nodes.
 - `shuffled_env`: use randomly shuffled environments as the main prediction
   environment in train/eval, and disable swap loss to avoid double shuffling.
+- `no_persistence`: disable FutureEnvEncoder, persistence InfoNCE, and
+  persistence influence on gate labels.
+
+`no_env` also disables persistence. `no_gate` may keep persistence InfoNCE, but
+disables persistence influence on gate labels because gate loss is off.
+`shuffled_env` disables persistence influence on gate labels to avoid mixing
+node-mismatched environments with persistence pseudo labels.
 
 ## Config Organization
 
@@ -262,6 +322,7 @@ lambda_pred * pred_loss
 + lambda_gate * gate_loss
 + lambda_swap * swap_loss
 + effective_lambda_kl * kl_loss
++ effective_lambda_persistence_mi * persistence_mi_loss
 + lambda_ind * ind_loss
 + lambda_sparse * sparse_loss
 + lambda_entropy * entropy_loss
@@ -311,6 +372,10 @@ prediction = y_inv + rho * r_env
   the z/env directional overlap.
 - `sep_lowrank_energy_ratio`, `sep_residual_norm`: low-rank/residual split
   diagnostics for `lowrank_residual`.
+- `persistence_mi_loss`: InfoNCE loss between historical and future
+  environments, training only.
+- `persist_score_mean`, `s_persist_mean`, `s_gate_mean`: persistence score,
+  persistence pseudo label, and final gate target statistics.
 
 ## Supported And Not Yet Supported
 

@@ -54,6 +54,13 @@ class NUESTGLossConfig:
     lambda_residual_norm: float = 0.0
     use_env_consistency: bool = False
     lambda_env_consistency: float = 0.0
+    use_persistence_mi: bool = True
+    lambda_persistence_mi: float = 0.05
+    persistence_tau: float = 0.2
+    persistence_margin: float = 0.0
+    persistence_affects_gate: bool = True
+    persistence_warmup_epochs: int = 5
+    detach_future_env: bool = True
 
 
 class NUESTGLoss(nn.Module):
@@ -92,6 +99,8 @@ class NUESTGLoss(nn.Module):
         "entropy_loss",
         "residual_norm_loss",
         "env_consistency_loss",
+        "persistence_mi_loss",
+        "effective_lambda_persistence_mi",
         "rho_mean",
         "rho_std",
         "rho_min",
@@ -101,6 +110,11 @@ class NUESTGLoss(nn.Module):
         "delta_gain_std",
         "delta_gain_pos_ratio",
         "s_gain_mean",
+        "persist_score_mean",
+        "persist_score_std",
+        "s_persist_mean",
+        "s_gate_mean",
+        "persistence_valid",
         "potential_gain_mean",
         "swap_delta_mean",
         "env_mu_abs_mean",
@@ -203,6 +217,55 @@ class NUESTGLoss(nn.Module):
             return float(self.cfg.lambda_kl)
         return float(self.cfg.lambda_kl) * min(1.0, max(self.epoch, 0) / warmup)
 
+    def _effective_lambda_persistence_mi(self) -> float:
+        if not self.cfg.use_persistence_mi or self.cfg.lambda_persistence_mi == 0:
+            return 0.0
+        warmup = int(self.cfg.persistence_warmup_epochs or 0)
+        if warmup <= 0:
+            return float(self.cfg.lambda_persistence_mi)
+        return float(self.cfg.lambda_persistence_mi) * min(1.0, max(self.epoch, 0) / warmup)
+
+    def _persistence_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, torch.Tensor]]:
+        q = output.get("persist_q")
+        k = output.get("persist_k")
+        zero = self._zero(like)
+        logs = {
+            "persist_score_mean": zero,
+            "persist_score_std": zero,
+            "s_persist_mean": zero,
+            "persistence_valid": zero,
+        }
+        if q is None or k is None or q.numel() == 0 or k.numel() == 0:
+            return zero, None, logs
+
+        q_flat = q.reshape(-1, q.shape[-1])
+        k_for_loss = k.detach() if self.cfg.detach_future_env else k
+        k_flat = k_for_loss.reshape(-1, k_for_loss.shape[-1])
+        if q_flat.shape[0] <= 1 or k_flat.shape[0] <= 1:
+            return zero, None, logs
+        q_norm = F.normalize(q_flat, dim=-1)
+        k_norm = F.normalize(k_flat, dim=-1)
+        tau = max(float(self.cfg.persistence_tau), 1e-6)
+        logits = q_norm.matmul(k_norm.transpose(0, 1)) / tau
+        labels = torch.arange(q_flat.shape[0], device=q_flat.device)
+        mi_loss = F.cross_entropy(logits, labels)
+
+        persist_score = (q_norm * k_norm).sum(dim=-1).reshape(q.shape[0], q.shape[1], 1)
+        s_persist = torch.sigmoid(
+            (persist_score - float(self.cfg.persistence_margin)) / tau
+        )
+        logs = {
+            "persist_score_mean": persist_score.detach().mean(),
+            "persist_score_std": persist_score.detach().std(unbiased=False),
+            "s_persist_mean": s_persist.detach().mean(),
+            "persistence_valid": like.new_tensor(1.0),
+        }
+        return mi_loss, s_persist, logs
+
     def _separation_logs(self, output: Dict[str, torch.Tensor], like: torch.Tensor) -> Dict[str, torch.Tensor]:
         extra = output.get("separation_extra") or {}
         keys = [
@@ -255,6 +318,11 @@ class NUESTGLoss(nn.Module):
 
         delta_gain = inv_elem - potential_elem
         s_gain = torch.sigmoid((delta_gain - self.cfg.gate_eta) / max(self.cfg.gate_tau, 1e-6)).detach()
+        persistence_mi_loss_raw, s_persist, persistence_logs = self._persistence_terms(output, prediction)
+        if self.cfg.use_persistence_mi and self.cfg.persistence_affects_gate and s_persist is not None:
+            s_gate = s_gain * s_persist.detach().unsqueeze(1)
+        else:
+            s_gate = s_gain
         delta_gain_detached = delta_gain.detach()
         delta_gain_mean = masked_mean(delta_gain_detached, elem_mask)
         delta_gain_std = torch.sqrt(
@@ -262,7 +330,7 @@ class NUESTGLoss(nn.Module):
         )
         s_gain_mean = masked_mean(s_gain, elem_mask)
 
-        gate_loss_raw = self._bce_gate_loss(rho, s_gain, elem_mask)
+        gate_loss_raw = self._bce_gate_loss(rho, s_gate.detach(), elem_mask)
         env_mu = output["env_mu"]
         env_logvar = output["env_logvar"]
         env = output["env"]
@@ -321,7 +389,13 @@ class NUESTGLoss(nn.Module):
         swap_diff_loss = swap_diff_loss_raw if has_swap else zero
         swap_same_loss = swap_same_loss_raw if has_swap else zero
         effective_lambda_kl = self._effective_lambda_kl()
+        effective_lambda_persistence_mi = self._effective_lambda_persistence_mi()
         kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
+        persistence_mi_loss = (
+            persistence_mi_loss_raw
+            if effective_lambda_persistence_mi != 0 and persistence_logs["persistence_valid"].item() == 1.0
+            else zero
+        )
         ind_loss = ind_loss_raw if self.cfg.use_ind and self.cfg.lambda_ind != 0 else zero
         sparse_loss = sparse_loss_raw if self.cfg.use_sparse and self.cfg.lambda_sparse != 0 else zero
         entropy_loss = entropy_loss_raw if self.cfg.use_entropy and self.cfg.lambda_entropy != 0 else zero
@@ -338,6 +412,7 @@ class NUESTGLoss(nn.Module):
             + self.cfg.lambda_gate * gate_loss
             + self.cfg.lambda_swap * swap_loss
             + effective_lambda_kl * kl_loss
+            + effective_lambda_persistence_mi * persistence_mi_loss
             + self.cfg.lambda_ind * ind_loss
             + self.cfg.lambda_sparse * sparse_loss
             + self.cfg.lambda_entropy * entropy_loss
@@ -360,6 +435,8 @@ class NUESTGLoss(nn.Module):
             "entropy_loss": entropy_loss.detach(),
             "residual_norm_loss": residual_norm_loss.detach(),
             "env_consistency_loss": env_consistency_loss.detach(),
+            "persistence_mi_loss": persistence_mi_loss.detach(),
+            "effective_lambda_persistence_mi": prediction.new_tensor(effective_lambda_persistence_mi),
             "rho_mean": rho.detach().mean(),
             "rho_std": rho.detach().std(unbiased=False),
             "rho_min": rho.detach().min(),
@@ -369,6 +446,7 @@ class NUESTGLoss(nn.Module):
             "delta_gain_std": delta_gain_std,
             "delta_gain_pos_ratio": masked_mean((delta_gain_detached > 0).float(), elem_mask),
             "s_gain_mean": s_gain_mean,
+            "s_gate_mean": masked_mean(s_gate.detach(), elem_mask),
             "potential_gain_mean": delta_gain_mean,
             "swap_delta_mean": swap_delta_mean.detach(),
             "env_mu_abs_mean": env_mu.detach().abs().mean(),
@@ -378,6 +456,7 @@ class NUESTGLoss(nn.Module):
             "y_potential_mae": potential_loss_raw.detach(),
             "y_hat_mae": pred_loss_raw.detach(),
         }
+        logs.update({key: value.detach() for key, value in persistence_logs.items()})
         logs.update(self._separation_logs(output, prediction))
         self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
         return total_loss, logs

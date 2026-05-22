@@ -41,6 +41,8 @@ LOG_KEYS = [
     "entropy_loss",
     "residual_norm_loss",
     "env_consistency_loss",
+    "persistence_mi_loss",
+    "effective_lambda_persistence_mi",
     "rho_mean",
     "rho_std",
     "rho_min",
@@ -50,6 +52,11 @@ LOG_KEYS = [
     "delta_gain_std",
     "delta_gain_pos_ratio",
     "s_gain_mean",
+    "persist_score_mean",
+    "persist_score_std",
+    "s_persist_mean",
+    "s_gate_mean",
+    "persistence_valid",
     "potential_gain_mean",
     "swap_delta_mean",
     "env_mu_abs_mean",
@@ -266,6 +273,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         "env_mu": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env_logvar": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+        "env_hist": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "env_raw": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
         "y_inv_raw": (batch_size, output_len, num_nodes, output_dim),
     }
@@ -276,6 +284,13 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             raise AssertionError(f"{key} expected {expected_shape}, got {tuple(value.shape)}")
         assert_finite(value, key)
     for key in ["prediction_swap", "rho_swap", "env_perm"]:
+        value = output.get(key)
+        if value is None:
+            print(f"{key}: None")
+        else:
+            print(f"{key}: {tuple(value.shape)}")
+            assert_finite(value, key)
+    for key in ["env_fut", "persist_q", "persist_k", "persist_score"]:
         value = output.get(key)
         if value is None:
             print(f"{key}: None")
@@ -310,12 +325,14 @@ def debug_batch(cfg: Dict) -> None:
     print(f"env_consistency_enabled: {cfg['LOSS'].get('use_env_consistency', False)}")
     print(f"separation_mode: {cfg['MODEL'].get('separation', {}).get('mode', 'none')}")
     print(f"use_separated_z_for_y_inv: {cfg['MODEL'].get('use_separated_z_for_y_inv', True)}")
+    print(f"persistence_enabled: {cfg['MODEL'].get('persistence', {}).get('enabled', False)}")
+    print(f"persistence_affects_gate: {cfg['LOSS'].get('persistence_affects_gate', False)}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
     print(f"targets_before_align: {tuple(batch[target_key].shape)}")
 
-    output = model(batch[input_key])
+    output = model(batch[input_key], y_true=batch[target_key])
     check_output_shapes(output, batch[target_key], cfg)
     loss, logs = loss_fn(output, batch[target_key])
     loss.backward()
@@ -388,7 +405,7 @@ def train_local(cfg: Dict) -> None:
             batch = to_device_batch(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx():
-                output = model(batch[input_key])
+                output = model(batch[input_key], y_true=batch[target_key])
                 loss, logs = loss_fn(output, batch[target_key])
             scaler.scale(loss).backward()
             grad_clip = train_cfg.get("grad_clip")

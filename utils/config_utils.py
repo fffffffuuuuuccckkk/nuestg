@@ -90,7 +90,7 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
         deep_update(
             cfg,
             {
-                "MODEL": {"force_gate_value": 0.0},
+                "MODEL": {"force_gate_value": 0.0, "persistence": {"enabled": False}},
                 "LOSS": {
                     "use_gate": False,
                     "use_swap": False,
@@ -100,12 +100,20 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
                     "use_entropy": False,
                     "use_residual_norm": False,
                     "use_env_consistency": False,
+                    "use_persistence_mi": False,
+                    "persistence_affects_gate": False,
                 },
                 "SWAP": {"enabled": False},
             },
         )
     elif name == "no_gate":
-        deep_update(cfg, {"MODEL": {"force_gate_value": 1.0}, "LOSS": {"use_gate": False}})
+        deep_update(
+            cfg,
+            {
+                "MODEL": {"force_gate_value": 1.0},
+                "LOSS": {"use_gate": False, "persistence_affects_gate": False},
+            },
+        )
     elif name == "no_swap":
         deep_update(cfg, {"LOSS": {"use_swap": False}, "SWAP": {"enabled": False}})
     elif name == "no_kl":
@@ -119,14 +127,22 @@ def apply_ablation(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
             cfg,
             {
                 "MODEL": {"use_shuffled_env_train": True, "use_shuffled_env_eval": True},
-                "LOSS": {"use_swap": False},
+                "LOSS": {"use_swap": False, "persistence_affects_gate": False},
                 "SWAP": {"enabled": False},
+            },
+        )
+    elif name == "no_persistence":
+        deep_update(
+            cfg,
+            {
+                "MODEL": {"persistence": {"enabled": False}},
+                "LOSS": {"use_persistence_mi": False, "persistence_affects_gate": False},
             },
         )
     else:
         raise ValueError(
             f"Unknown ablation {name!r}; expected one of "
-            "no_env,no_gate,no_swap,no_kl,no_ind,global_env,shuffled_env"
+            "no_env,no_gate,no_swap,no_kl,no_ind,global_env,shuffled_env,no_persistence"
         )
     return cfg
 
