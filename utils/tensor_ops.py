@@ -3,10 +3,121 @@ from __future__ import annotations
 import pickle
 import warnings
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+
+
+class ZScoreDataScaler:
+    """Graph WaveNet / BasicTS-style z-score scaler fitted on train data.
+
+    The local runner keeps the model and loss in normalized space, then inverse
+    transforms predictions and targets for reported metrics. By default the
+    scaler uses one global mean/std over the training split, matching the common
+    Graph WaveNet preprocessing convention. Per-channel stats are also
+    supported for multi-channel data.
+    """
+
+    def __init__(
+        self,
+        mean: np.ndarray | float,
+        std: np.ndarray | float,
+        enabled: bool = True,
+        eps: float = 1e-5,
+    ) -> None:
+        self.enabled = bool(enabled)
+        self.eps = float(eps)
+        self.mean = torch.as_tensor(mean, dtype=torch.float32)
+        self.std = torch.as_tensor(std, dtype=torch.float32).clamp_min(self.eps)
+
+    @classmethod
+    def identity(cls) -> "ZScoreDataScaler":
+        return cls(0.0, 1.0, enabled=False)
+
+    @classmethod
+    def fit(
+        cls,
+        data: np.ndarray,
+        null_val: Optional[float] = None,
+        norm_each_channel: bool = False,
+        eps: float = 1e-5,
+    ) -> "ZScoreDataScaler":
+        array = np.asarray(data, dtype=np.float32)
+        mask = np.isfinite(array)
+        if null_val is not None:
+            if isinstance(null_val, float) and np.isnan(null_val):
+                mask &= ~np.isnan(array)
+            else:
+                mask &= array != null_val
+
+        if norm_each_channel and array.ndim >= 1:
+            channels = array.shape[-1] if array.ndim >= 3 else 1
+            reshaped = array.reshape(-1, channels)
+            mask_reshaped = mask.reshape(-1, channels)
+            mean = np.zeros((channels,), dtype=np.float32)
+            std = np.ones((channels,), dtype=np.float32)
+            for idx in range(channels):
+                values = reshaped[mask_reshaped[:, idx], idx]
+                if values.size > 0:
+                    mean[idx] = np.mean(values, dtype=np.float64)
+                    std[idx] = np.std(values, dtype=np.float64)
+            std = np.maximum(std, eps)
+            view_shape = (1,) * (max(array.ndim, 3) - 1) + (channels,)
+            return cls(mean.reshape(view_shape), std.reshape(view_shape), enabled=True, eps=eps)
+
+        values = array[mask]
+        if values.size == 0:
+            return cls(0.0, 1.0, enabled=True, eps=eps)
+        mean = float(np.mean(values, dtype=np.float64))
+        std = max(float(np.std(values, dtype=np.float64)), eps)
+        return cls(mean, std, enabled=True, eps=eps)
+
+    def to(self, device: torch.device | str) -> "ZScoreDataScaler":
+        self.mean = self.mean.to(device)
+        self.std = self.std.to(device)
+        return self
+
+    def transform(self, tensor: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not self.enabled:
+            return tensor
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+        scaled = (tensor - mean) / std
+        if mask is not None:
+            scaled = torch.where(mask.to(tensor.device).bool(), scaled, tensor)
+        return scaled
+
+    def inverse_transform(self, tensor: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if not self.enabled:
+            return tensor
+        mean = self.mean.to(device=tensor.device, dtype=tensor.dtype)
+        std = self.std.to(device=tensor.device, dtype=tensor.dtype)
+        restored = tensor * std + mean
+        if mask is not None:
+            restored = torch.where(mask.to(tensor.device).bool(), restored, tensor)
+        return restored
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "eps": self.eps,
+            "mean": self.mean.detach().cpu().tolist(),
+            "std": self.std.detach().cpu().tolist(),
+        }
+
+    def summary(self) -> Dict[str, float | bool]:
+        mean = self.mean.detach().float().cpu()
+        std = self.std.detach().float().cpu()
+        return {
+            "enabled": self.enabled,
+            "mean": float(mean.mean()),
+            "std": float(std.mean()),
+            "mean_min": float(mean.min()),
+            "mean_max": float(mean.max()),
+            "std_min": float(std.min()),
+            "std_max": float(std.max()),
+        }
 
 
 def ensure_blnc(x: torch.Tensor, name: str = "x") -> torch.Tensor:

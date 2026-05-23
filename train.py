@@ -25,8 +25,10 @@ from utils import (
     masked_mae_value,
     masked_mape_value,
     masked_rmse_value,
+    make_valid_mask,
     resolve_cli_config,
     save_resolved_config,
+    ZScoreDataScaler,
 )
 
 
@@ -110,6 +112,13 @@ def finalize_config(cfg: Dict) -> Dict:
     model_cfg = cfg["MODEL"]
     loss_cfg = cfg["LOSS"]
     swap_cfg = cfg.get("SWAP", {})
+    scaler_cfg = cfg.setdefault("SCALER", {})
+    scaler_cfg.setdefault("enabled", True)
+    scaler_cfg.setdefault("type", "zscore")
+    scaler_cfg.setdefault("norm_each_channel", False)
+    scaler_cfg.setdefault("rescale", True)
+    scaler_cfg.setdefault("eps", 1e-5)
+    ds_cfg.setdefault("null_to_num", 0.0)
 
     if model_cfg.get("use_time_embedding", False):
         raise NotImplementedError(
@@ -230,6 +239,61 @@ def build_loader(cfg: Dict, split: str, shuffle: bool) -> DataLoader:
     )
 
 
+def get_scaler_cfg(cfg: Dict) -> Dict:
+    scaler_cfg = cfg.get("SCALER")
+    if scaler_cfg is None:
+        scaler_cfg = cfg.get("DATASET", {}).get("scaler", {})
+    return scaler_cfg or {}
+
+
+def build_data_scaler(cfg: Dict, device: torch.device) -> ZScoreDataScaler:
+    scaler_cfg = get_scaler_cfg(cfg)
+    if not scaler_cfg.get("enabled", True):
+        return ZScoreDataScaler.identity().to(device)
+    scaler_type = str(scaler_cfg.get("type", "zscore")).lower()
+    if scaler_type not in {"zscore", "standard", "standardization"}:
+        raise NotImplementedError(f"Only zscore/standard scaler is implemented, got {scaler_type!r}")
+    train_data = build_dataset(cfg, "train").data
+    scaler = ZScoreDataScaler.fit(
+        train_data,
+        null_val=cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+        norm_each_channel=bool(scaler_cfg.get("norm_each_channel", False)),
+        eps=float(scaler_cfg.get("eps", 1e-5)),
+    ).to(device)
+    return scaler
+
+
+def preprocess_batch(
+    batch: Dict[str, torch.Tensor],
+    cfg: Dict,
+    data_scaler: ZScoreDataScaler,
+) -> Dict[str, torch.Tensor]:
+    input_key = cfg["DATASET"].get("input_key", "inputs")
+    target_key = cfg["DATASET"].get("target_key", "targets")
+    null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
+    null_to_num = float(cfg["DATASET"].get("null_to_num", 0.0))
+    processed = dict(batch)
+
+    inputs_mask = make_valid_mask(batch[input_key], null_val)
+    targets_mask = make_valid_mask(batch[target_key], null_val)
+    inputs_scaled = data_scaler.transform(batch[input_key], inputs_mask)
+    targets_scaled = data_scaler.transform(batch[target_key], targets_mask)
+
+    processed[input_key] = torch.where(
+        inputs_mask,
+        inputs_scaled,
+        torch.as_tensor(null_to_num, dtype=inputs_scaled.dtype, device=inputs_scaled.device),
+    )
+    processed[target_key] = torch.where(
+        targets_mask,
+        targets_scaled,
+        torch.as_tensor(null_to_num, dtype=targets_scaled.dtype, device=targets_scaled.device),
+    )
+    processed["inputs_mask"] = inputs_mask
+    processed["targets_mask"] = targets_mask
+    return processed
+
+
 def to_device_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
     out = {}
     for key, value in batch.items():
@@ -310,14 +374,17 @@ def debug_batch(cfg: Dict) -> None:
     train_cfg = cfg["TRAIN"]
     set_seed(train_cfg["seed"])
     device = get_device(train_cfg)
+    data_scaler = build_data_scaler(cfg, device)
     loader = build_loader(cfg, "train", shuffle=True)
     model, loss_fn = build_model_and_loss(cfg, device)
     loss_fn.set_epoch(1)
     model.train()
 
-    batch = to_device_batch(next(iter(loader)), device)
+    raw_batch = to_device_batch(next(iter(loader)), device)
+    batch = preprocess_batch(raw_batch, cfg, data_scaler)
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
+    scaler_summary = data_scaler.summary()
     backbone_name = cfg["MODEL"].get("backbone_name", "stid_mlp")
     ablations = cfg.get("RUN", {}).get("ablations", [])
     print(f"ablations: {','.join(ablations) if ablations else 'none'}")
@@ -331,23 +398,54 @@ def debug_batch(cfg: Dict) -> None:
     print(f"use_separated_z_for_y_inv: {cfg['MODEL'].get('use_separated_z_for_y_inv', True)}")
     print(f"persistence_enabled: {cfg['MODEL'].get('persistence', {}).get('enabled', False)}")
     print(f"persistence_affects_gate: {cfg['LOSS'].get('persistence_affects_gate', False)}")
+    print(
+        "scaler: "
+        f"enabled={scaler_summary['enabled']} "
+        f"mean={scaler_summary['mean']:.6f} std={scaler_summary['std']:.6f}"
+    )
+    print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
+    print(f"{target_key}_raw: {tuple(raw_batch[target_key].shape)}")
+    print(f"{input_key}_scaled: {tuple(batch[input_key].shape)}")
+    print(f"{target_key}_scaled: {tuple(batch[target_key].shape)}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
+    print(
+        f"{input_key}_raw_mean={raw_batch[input_key].float().mean().item():.6f} "
+        f"{input_key}_scaled_mean={batch[input_key].float().mean().item():.6f}"
+    )
+    print(
+        f"{target_key}_raw_mean={raw_batch[target_key].float().mean().item():.6f} "
+        f"{target_key}_scaled_mean={batch[target_key].float().mean().item():.6f}"
+    )
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
     print(f"targets_before_align: {tuple(batch[target_key].shape)}")
 
     output = model(batch[input_key], y_true=batch[target_key])
     check_output_shapes(output, batch[target_key], cfg)
-    loss, logs = loss_fn(output, batch[target_key])
+    loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
     loss.backward()
     assert_finite(loss, "total_loss")
     assert_finite(output["rho"], "rho")
+    pred_original = data_scaler.inverse_transform(output["prediction"])
+    original_mae = masked_mae_value(
+        pred_original,
+        raw_batch[target_key],
+        cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+    )
+    print(f"debug_original_scale_mae={float(original_mae.detach().cpu()):.6f}")
     print(format_logs(logs, LOG_KEYS))
     print("debug_batch ok: forward/loss/backward finished without NaN or shape errors")
 
 
 @torch.no_grad()
-def evaluate(model: NUESTG, loader: DataLoader, device: torch.device, cfg: Dict, max_batches: int) -> Dict[str, float]:
+def evaluate(
+    model: NUESTG,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: Dict,
+    max_batches: int,
+    data_scaler: ZScoreDataScaler,
+) -> Dict[str, float]:
     model.eval()
     values = {"mae": [], "rmse": [], "mape": []}
     input_key = cfg["DATASET"].get("input_key", "inputs")
@@ -356,10 +454,11 @@ def evaluate(model: NUESTG, loader: DataLoader, device: torch.device, cfg: Dict,
     for step, batch in enumerate(loader):
         if step >= max_batches:
             break
-        batch = to_device_batch(batch, device)
+        raw_batch = to_device_batch(batch, device)
+        batch = preprocess_batch(raw_batch, cfg, data_scaler)
         output = model(batch[input_key])
-        prediction = output["prediction"]
-        targets = batch[target_key]
+        prediction = data_scaler.inverse_transform(output["prediction"])
+        targets = raw_batch[target_key]
         values["mae"].append(float(masked_mae_value(prediction, targets, null_val).detach().cpu()))
         values["rmse"].append(float(masked_rmse_value(prediction, targets, null_val).detach().cpu()))
         values["mape"].append(float(masked_mape_value(prediction, targets, null_val).detach().cpu()))
@@ -418,6 +517,9 @@ def train_local(cfg: Dict) -> None:
     train_cfg = cfg["TRAIN"]
     set_seed(train_cfg["seed"])
     device = get_device(train_cfg)
+    data_scaler = build_data_scaler(cfg, device)
+    cfg.setdefault("SCALER", {})
+    cfg["SCALER"]["stats"] = data_scaler.state_dict()
     train_loader = build_loader(cfg, "train", shuffle=True)
     val_loader = build_loader(cfg, "val", shuffle=False)
     model, loss_fn = build_model_and_loss(cfg, device)
@@ -449,11 +551,12 @@ def train_local(cfg: Dict) -> None:
             if train_cfg.get("max_train_batches") is not None and batch_idx > int(train_cfg["max_train_batches"]):
                 break
             global_step += 1
-            batch = to_device_batch(batch, device)
+            raw_batch = to_device_batch(batch, device)
+            batch = preprocess_batch(raw_batch, cfg, data_scaler)
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx():
                 output = model(batch[input_key], y_true=batch[target_key])
-                loss, logs = loss_fn(output, batch[target_key])
+                loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
             scaler.scale(loss).backward()
             grad_clip = train_cfg.get("grad_clip")
             if grad_clip:
@@ -497,6 +600,7 @@ def train_local(cfg: Dict) -> None:
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "config": cfg,
+                    "scaler": data_scaler.state_dict(),
                     "epoch": epoch,
                     "global_step": global_step,
                 },
@@ -504,7 +608,14 @@ def train_local(cfg: Dict) -> None:
             )
 
         if epoch % train_cfg.get("val_interval", 1) == 0:
-            val_metrics = evaluate(model, val_loader, device, cfg, train_cfg.get("val_batches", 50))
+            val_metrics = evaluate(
+                model,
+                val_loader,
+                device,
+                cfg,
+                train_cfg.get("val_batches", 50),
+                data_scaler,
+            )
             print(
                 f"epoch={epoch} val_mae={val_metrics['mae']:.6f} "
                 f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f}"
@@ -540,6 +651,7 @@ def train_local(cfg: Dict) -> None:
                             "model": model.state_dict(),
                             "optimizer": optimizer.state_dict(),
                             "config": cfg,
+                            "scaler": data_scaler.state_dict(),
                             "epoch": epoch,
                             "global_step": global_step,
                             "val_mae": val_metrics["mae"],
@@ -571,6 +683,12 @@ def train_with_basicts_launcher(cfg: Dict) -> None:
     from basicts.configs import BasicTSForecastingConfig
 
     cfg = finalize_config(cfg)
+    if get_scaler_cfg(cfg).get("enabled", True):
+        raise NotImplementedError(
+            "The local runner now enforces GraphWaveNet/BasicTS-style scaling. "
+            "BasicTS launcher scaler wiring for NUE-STG dict outputs is not supported here; "
+            "use --runner local for scaled experiments."
+        )
     warnings.warn(
         "BasicTS launcher support is experimental for NUE-STG. "
         "The local runner is the recommended experiment path because it guarantees dict-output auxiliary losses, "

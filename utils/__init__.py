@@ -17,6 +17,8 @@ from .tensor_ops import (
     masked_mape_value,
     masked_mean,
     masked_rmse_value,
+    make_valid_mask,
+    ZScoreDataScaler,
 )
 
 __all__ = [
@@ -35,7 +37,9 @@ __all__ = [
     "masked_mape_value",
     "masked_mean",
     "masked_rmse_value",
+    "make_valid_mask",
     "parse_dotlist_overrides",
     "resolve_cli_config",
     "save_resolved_config",
+    "ZScoreDataScaler",
 ]

@@ -14,8 +14,16 @@ CONFIG = {
         "use_timestamps": False,
         "memmap": True,
         "null_val": None,
+        "null_to_num": 0.0,
         "target_key": "targets",
         "input_key": "inputs",
+    },
+    "SCALER": {
+        "enabled": True,
+        "type": "zscore",
+        "norm_each_channel": False,
+        "rescale": True,
+        "eps": 1e-5,
     },
     "MODEL": {
         "name": "NUESTG",

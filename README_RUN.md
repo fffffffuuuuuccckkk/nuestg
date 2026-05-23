@@ -115,7 +115,43 @@ python train.py --config configs/pems08_nuestg.py --runner basicts
 The BasicTS launcher path is kept for compatibility, but the default local loop
 is recommended because it logs all NUE-STG component losses and gate statistics.
 Treat `--runner basicts` as experimental: full dict-output auxiliary losses and
-gate diagnostics are guaranteed only in the local runner.
+gate diagnostics are guaranteed only in the local runner. Scaled NUE-STG
+dict-output training is enforced in the local runner; `--runner basicts` is not
+the recommended path for experiments.
+
+## Scaling
+
+The local runner now uses Graph WaveNet / BasicTS-style z-score scaling by
+default. It fits mean/std on the training split, transforms both `inputs` and
+`targets`, optimizes NUE-STG losses in normalized space, and inverse-transforms
+predictions for reported MAE/RMSE/MAPE:
+
+```text
+train_data -> mean/std
+inputs_scaled = (inputs - mean) / std
+targets_scaled = (targets - mean) / std
+prediction_scaled = model(inputs_scaled)
+loss = NUESTGLoss(prediction_scaled, targets_scaled)
+reported_metrics = metric(inverse(prediction_scaled), raw_targets)
+```
+
+Default config:
+
+```python
+"SCALER": {
+    "enabled": True,
+    "type": "zscore",
+    "norm_each_channel": False,
+    "rescale": True,
+    "eps": 1e-5,
+}
+```
+
+`norm_each_channel=False` matches the common Graph WaveNet global-scaler
+preprocessing convention. `debug_batch` prints scaler mean/std plus raw/scaled
+batch statistics. Training losses in `train_log.csv` are normalized-unit losses;
+validation metrics, `best_metrics.json`, and `last_metrics.json` are original
+data-scale metrics.
 
 ## Override Parameters
 
@@ -390,7 +426,9 @@ python experiments/make_tables.py --input results/tables/all_results.csv --out_d
 
 ## Config Organization
 
-- `DATASET`: dataset name, paths, shapes, null value, BasicTS input/target keys.
+- `DATASET`: dataset name, paths, shapes, null value, null replacement value,
+  BasicTS input/target keys.
+- `SCALER`: mandatory local-runner z-score scaling configuration.
 - `MODEL`: model dimensions, invariant backbone, env encoder, adjacency, gate,
   residual head, forced gate values, shuffled-env flags.
 - `LOSS`: loss switches, loss weights, gate label parameters, swap loss details,
