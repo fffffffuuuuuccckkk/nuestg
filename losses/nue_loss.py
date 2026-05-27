@@ -589,8 +589,10 @@ class NUESTGLoss(nn.Module):
             source = output.get("env_fut")
             if source is None:
                 source = output.get("env_plus")
-        else:
+        elif mode == "env_plus_diff":
             source = output.get("env_plus")
+        else:
+            raise ValueError(f"Unsupported swap_weight_mode={self.cfg.swap_weight_mode!r}")
         if source is None or output.get("env_perm_index") is None:
             weight = torch.ones_like(full_elem)
             return weight, weight.mean()
