@@ -9,7 +9,8 @@ from torch import nn
 from basicts.configs import BasicTSModelConfig
 
 from models.backbones import build_backbone
-from models.env_encoder import NodeWiseEnvironmentEncoder
+from models.env_encoder import NodeWiseEnvironmentEncoder, TimeNodeEnvironmentEncoder
+from models.env_mask import FuturePredictiveEnvMask
 from models.future_env_encoder import FutureEnvEncoder
 from models.separation import SeparationModule
 from utils.tensor_ops import align_target, ensure_blnc, load_adjacency
@@ -35,6 +36,7 @@ class NUESTGConfig(BasicTSModelConfig):
     adaptive_adj: bool = False
     backbone_name: str = "stid_mlp"
     backbone: Dict = field(default_factory=dict)
+    method_variant: str = "nue"
     separation: Dict = field(default_factory=dict)
     use_separated_z_for_y_inv: bool = True
     persistence: Dict = field(default_factory=dict)
@@ -58,6 +60,20 @@ class NUESTGConfig(BasicTSModelConfig):
     residual_hidden_dim: int = 64
     residual_dropout: float = 0.1
     prediction_activation: Optional[str] = None
+    env_token_mode: bool = False
+    mask_hidden_dim: int = 64
+    mask_dropout: float = 0.1
+    mask_init_bias: float = -1.0
+    mask_temperature: float = 1.0
+    mask_pooling: str = "masked_mean"
+    mask_eps: float = 1e-6
+    force_mask_value: Optional[float] = None
+    fusion_type: str = "film"
+    fusion_hidden_dim: int = 64
+    fusion_dropout: float = 0.1
+    fusion_zero_init: bool = True
+    env_transition_hidden_dim: int = 64
+    env_transition_dropout: float = 0.1
     use_shuffled_env_train: bool = False
     use_shuffled_env_eval: bool = False
     swap: Dict = field(default_factory=dict)
@@ -103,9 +119,15 @@ class NUESTG(nn.Module):
         self.swap_cfg = config.swap or {}
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
+        self.method_variant = str(config.method_variant or "nue").lower()
+        self.is_fpem = self.method_variant == "fpem"
         self.use_separated_z_for_y_inv = bool(config.use_separated_z_for_y_inv)
         self.persistence_cfg = config.persistence or {}
         self.persistence_enabled = bool(self.persistence_cfg.get("enabled", False))
+        if self.method_variant not in {"nue", "nuestg", "fpem"}:
+            raise NotImplementedError(
+                f"MODEL.method_variant={config.method_variant!r} is not implemented; expected 'nue' or 'fpem'."
+            )
 
         if config.use_time_embedding:
             raise NotImplementedError("MODEL.use_time_embedding=True is not implemented in the current backbones.")
@@ -156,6 +178,19 @@ class NUESTG(nn.Module):
             reparameterize=config.env_reparameterize,
             deterministic_eval=config.deterministic_env_eval,
         )
+        self.env_token_encoder = TimeNodeEnvironmentEncoder(
+            input_len=config.input_len,
+            input_dim=config.input_dim,
+            env_dim=config.env_dim,
+            hidden_dim=config.env_hidden_dim,
+            dropout=config.env_dropout,
+            use_neighbor=config.env_use_neighbor,
+            global_mode=config.env_global_mode,
+            logvar_min=config.env_logvar_min,
+            logvar_max=config.env_logvar_max,
+            reparameterize=config.env_reparameterize,
+            deterministic_eval=config.deterministic_env_eval,
+        )
         self.separation = SeparationModule(
             cfg=config.separation,
             num_nodes=config.num_nodes,
@@ -176,6 +211,41 @@ class NUESTG(nn.Module):
         projection_dropout = float(self.persistence_cfg.get("dropout", 0.1))
         self.persist_q = self._make_persistence_head(config.env_dim, projection_hidden_dim, projection_dim, projection_dropout)
         self.persist_k = self._make_persistence_head(config.env_dim, projection_hidden_dim, projection_dim, projection_dropout)
+
+        self.env_mask = FuturePredictiveEnvMask(
+            env_dim=config.env_dim,
+            hidden_dim=config.mask_hidden_dim,
+            dropout=config.mask_dropout,
+            init_bias=config.mask_init_bias,
+            temperature=config.mask_temperature,
+            force_mask_value=config.force_mask_value,
+            pooling=config.mask_pooling,
+            eps=config.mask_eps,
+        )
+        if config.fusion_type != "film":
+            raise NotImplementedError("FPEM currently supports only MODEL.fusion_type='film'.")
+        self.fpem_fusion = nn.Sequential(
+            nn.Linear(config.env_dim, config.fusion_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.fusion_dropout),
+            nn.Linear(config.fusion_hidden_dim, 2 * self.representation_dim),
+        )
+        if config.fusion_zero_init:
+            last = self.fpem_fusion[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+        self.fpem_predictor = nn.Linear(self.representation_dim, config.output_len * config.output_dim)
+        if self.inv_head_from_z.in_features == self.fpem_predictor.in_features and (
+            self.inv_head_from_z.out_features == self.fpem_predictor.out_features
+        ):
+            self.fpem_predictor.load_state_dict(self.inv_head_from_z.state_dict())
+        self.env_transition_head = nn.Sequential(
+            nn.Linear(config.env_dim, config.env_transition_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(config.env_transition_dropout),
+            nn.Linear(config.env_transition_hidden_dim, config.env_dim),
+        )
 
         decode_in_dim = self.representation_dim + config.env_dim
         self.env_head = nn.Sequential(
@@ -218,12 +288,38 @@ class NUESTG(nn.Module):
         y_inv = y_inv.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
         return self._apply_prediction_activation(y_inv)
 
+    def _predict_from_hidden(self, hidden: torch.Tensor, predictor: nn.Linear) -> torch.Tensor:
+        batch_size, num_nodes, hidden_dim = hidden.shape
+        if hidden_dim != self.representation_dim:
+            raise AssertionError(f"hidden must end with D_z={self.representation_dim}, got {tuple(hidden.shape)}")
+        pred = predictor(hidden)
+        pred = pred.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
+        return self._apply_prediction_activation(pred)
+
+    def fpem_predict_from_z_env(self, z_inv: torch.Tensor, env_plus: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if z_inv.dim() != 3:
+            raise AssertionError(f"z_inv must be [B, N, D_z], got {tuple(z_inv.shape)}")
+        if env_plus.dim() != 3:
+            raise AssertionError(f"env_plus must be [B, N, D_env], got {tuple(env_plus.shape)}")
+        if z_inv.shape[:2] != env_plus.shape[:2]:
+            raise AssertionError(f"z_inv/env_plus shape mismatch: {tuple(z_inv.shape)} vs {tuple(env_plus.shape)}")
+        gamma_beta = self.fpem_fusion(env_plus)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        h_fuse = (1.0 + gamma) * z_inv + beta
+        prediction = self._predict_from_hidden(h_fuse, self.fpem_predictor)
+        return {
+            "prediction": prediction,
+            "hidden": h_fuse,
+            "fusion_gamma": gamma,
+            "fusion_beta": beta,
+        }
+
     def _init_gate_bias(self, bias: float) -> None:
         last = self.gate_net[-1]
         if isinstance(last, nn.Linear) and bias is not None:
             nn.init.constant_(last.bias, bias)
 
-    def _permute_env(self, env: torch.Tensor) -> torch.Tensor:
+    def _permute_env_with_indices(self, env: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_nodes, env_dim = env.shape
         flat = env.reshape(batch_size * num_nodes, env_dim)
         perm = torch.randperm(batch_size * num_nodes, device=env.device)
@@ -231,7 +327,11 @@ class NUESTG(nn.Module):
             same = perm == torch.arange(flat.shape[0], device=env.device)
             if same.any():
                 perm[same] = (perm[same] + 1) % flat.shape[0]
-        return flat[perm].reshape(batch_size, num_nodes, env_dim)
+        return flat[perm].reshape(batch_size, num_nodes, env_dim), perm.reshape(batch_size, num_nodes)
+
+    def _permute_env(self, env: torch.Tensor) -> torch.Tensor:
+        env_perm, _ = self._permute_env_with_indices(env)
+        return env_perm
 
     def _apply_prediction_activation(self, y: torch.Tensor) -> torch.Tensor:
         activation = self.config.prediction_activation
@@ -332,6 +432,139 @@ class NUESTG(nn.Module):
             "persist_score": persist_score,
         }
 
+    def _forward_fpem(
+        self,
+        x: torch.Tensor,
+        y_true: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        batch_size, input_len, num_nodes, _ = x.shape
+        adj = getattr(self, "adj_norm", None)
+
+        backbone_out = self.backbone(x, adj=adj)
+        z_raw = backbone_out["z_inv"]
+        y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
+        env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(x, adj)
+        env_hist_raw = env_tokens.mean(dim=1)
+
+        sep_out = self.separation(x=x, z_raw=z_raw, env_raw=env_hist_raw, y_inv_raw=y_inv_raw)
+        z_inv = sep_out["z_inv"]
+        env_hist = sep_out["env"]
+        separation_extra = sep_out["extra"]
+
+        mask_out = self.env_mask(env_tokens)
+        mask = mask_out["mask"]
+        env_plus = mask_out["env_plus"]
+        env_minus = mask_out["env_minus"]
+
+        pred_out = self.fpem_predict_from_z_env(z_inv, env_plus)
+        prediction = pred_out["prediction"]
+        zero_env = torch.zeros_like(env_plus)
+        inv_out = self.fpem_predict_from_z_env(z_inv, zero_env)
+        y_inv = inv_out["prediction"]
+
+        env_fut = None
+        env_fut_pred = None
+        env_fut_pred_minus = None
+        persist_q = None
+        persist_k = None
+        persist_score = None
+        if self.training and y_true is not None:
+            aligned_true = align_target(y_true, y_inv)
+            future_residual = aligned_true - y_inv.detach()
+            env_fut = self.future_env_encoder(future_residual)
+            env_fut_pred = self.env_transition_head(env_plus)
+            env_fut_pred_minus = self.env_transition_head(env_minus)
+            if self.persistence_enabled:
+                persist_q = self.persist_q(env_plus)
+                k_fut_raw = self.persist_k(env_fut)
+                persist_k = (
+                    k_fut_raw.detach()
+                    if bool(self.persistence_cfg.get("detach_future_key", True))
+                    else k_fut_raw
+                )
+                q_norm = torch.nn.functional.normalize(persist_q, dim=-1)
+                k_norm = torch.nn.functional.normalize(persist_k, dim=-1)
+                persist_score = (q_norm * k_norm).sum(dim=-1, keepdim=True)
+
+        prediction_swap = None
+        env_perm = None
+        env_perm_index = None
+        if self.training and self.swap_cfg.get("enabled", True):
+            env_perm, env_perm_index = self._permute_env_with_indices(env_plus)
+            env_swap_decode = env_perm.detach() if bool(self.swap_cfg.get("detach_env", True)) else env_perm
+            swap_out = self.fpem_predict_from_z_env(z_inv, env_swap_decode)
+            prediction_swap = swap_out["prediction"]
+
+        expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)
+        expected_gate_shape = (batch_size, self.output_len, num_nodes, 1)
+        expected_z_shape = (batch_size, num_nodes, self.representation_dim)
+        expected_env_shape = (batch_size, num_nodes, self.env_dim)
+        expected_token_shape = (batch_size, input_len, num_nodes, self.env_dim)
+        expected_mask_shape = (batch_size, input_len, num_nodes, 1)
+        shape_checks = {
+            "prediction": (prediction, expected_pred_shape),
+            "y_inv": (y_inv, expected_pred_shape),
+            "z_inv": (z_inv, expected_z_shape),
+            "z_raw": (z_raw, expected_z_shape),
+            "env_mu_tokens": (env_mu_tokens, expected_token_shape),
+            "env_logvar_tokens": (env_logvar_tokens, expected_token_shape),
+            "env_tokens": (env_tokens, expected_token_shape),
+            "env_hist": (env_hist, expected_env_shape),
+            "env_plus": (env_plus, expected_env_shape),
+            "env_minus": (env_minus, expected_env_shape),
+            "mask": (mask, expected_mask_shape),
+            "y_inv_raw": (y_inv_raw, expected_pred_shape),
+        }
+        for name, (tensor, expected_shape) in shape_checks.items():
+            if tuple(tensor.shape) != expected_shape:
+                raise AssertionError(f"{name} must be {expected_shape}, got {tuple(tensor.shape)}")
+
+        rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)
+        if tuple(rho.shape) != expected_gate_shape:
+            raise AssertionError(f"rho placeholder must be {expected_gate_shape}, got {tuple(rho.shape)}")
+        r_env = torch.zeros_like(prediction)
+        y_potential = prediction
+
+        return {
+            "method_variant": "fpem",
+            "prediction": prediction,
+            "y_inv": y_inv,
+            "y_potential": y_potential,
+            "r_env": r_env,
+            "rho": rho,
+            "z_inv": z_inv,
+            "z_raw": z_raw,
+            "env_mu": env_mu_tokens,
+            "env_logvar": env_logvar_tokens,
+            "env": env_hist,
+            "env_hist": env_hist,
+            "env_raw": env_hist_raw,
+            "env_tokens": env_tokens,
+            "env_plus": env_plus,
+            "env_minus": env_minus,
+            "env_plus_tokens": mask_out["env_plus_tokens"],
+            "env_minus_tokens": mask_out["env_minus_tokens"],
+            "mask": mask,
+            "y_inv_raw": y_inv_raw,
+            "separation_mode": sep_out["mode"],
+            "separation_extra": separation_extra,
+            "env_fut": env_fut,
+            "env_fut_pred": env_fut_pred,
+            "env_fut_pred_minus": env_fut_pred_minus,
+            "persist_q": persist_q,
+            "persist_k": persist_k,
+            "persist_score": persist_score,
+            "persistence_enabled": self.persistence_enabled,
+            "prediction_swap": prediction_swap,
+            "rho_swap": None,
+            "env_perm": env_perm,
+            "env_perm_index": env_perm_index,
+            "fusion_gamma": pred_out["fusion_gamma"],
+            "fusion_beta": pred_out["fusion_beta"],
+            "fusion_gamma_inv": inv_out["fusion_gamma"],
+            "fusion_beta_inv": inv_out["fusion_beta"],
+        }
+
     def forward(
         self,
         inputs: torch.Tensor,
@@ -339,6 +572,8 @@ class NUESTG(nn.Module):
         **kwargs,
     ) -> Dict[str, Optional[torch.Tensor]]:
         x = ensure_blnc(inputs, "inputs")
+        if self.is_fpem:
+            return self._forward_fpem(x, y_true=y_true)
         batch_size, _, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
 
@@ -413,6 +648,7 @@ class NUESTG(nn.Module):
             rho_swap = swap_decoded["rho"]
 
         return {
+            "method_variant": "nue",
             "prediction": prediction,
             "y_inv": y_inv,
             "y_potential": y_potential,
@@ -436,4 +672,5 @@ class NUESTG(nn.Module):
             "prediction_swap": prediction_swap,
             "rho_swap": rho_swap,
             "env_perm": env_perm,
+            "env_perm_index": None,
         }

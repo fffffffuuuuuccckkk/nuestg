@@ -48,6 +48,10 @@ LOG_KEYS = [
     "residual_norm_loss",
     "env_consistency_loss",
     "persistence_mi_loss",
+    "envpred_loss",
+    "future_mi_loss",
+    "rank_loss",
+    "mask_sparse_loss",
     "effective_lambda_persistence_mi",
     "rho_mean",
     "rho_std",
@@ -65,6 +69,7 @@ LOG_KEYS = [
     "persistence_valid",
     "potential_gain_mean",
     "swap_delta_mean",
+    "swap_weight_mean",
     "env_mu_abs_mean",
     "env_std_mean",
     "r_env_abs_mean",
@@ -85,6 +90,19 @@ LOG_KEYS = [
     "sep_svd_top_singular_mean",
     "sep_lowrank_rank",
     "sep_env_residual_norm",
+    "mask_mean",
+    "mask_std",
+    "mask_min",
+    "mask_max",
+    "mask_entropy",
+    "mask_active_ratio",
+    "env_plus_norm",
+    "env_minus_norm",
+    "env_hist_norm",
+    "env_fut_norm",
+    "env_fut_pred_norm",
+    "fusion_gamma_abs_mean",
+    "fusion_beta_abs_mean",
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae", "val_rmse", "val_mape"]
 
@@ -187,6 +205,10 @@ def finalize_config(cfg: Dict) -> Dict:
 
     for key in ["input_len", "output_len", "input_dim", "output_dim", "num_nodes"]:
         model_cfg[key] = ds_cfg[key]
+    method_variant = str(model_cfg.get("method_variant", "nue")).lower()
+    model_cfg["method_variant"] = method_variant
+    if method_variant == "fpem":
+        model_cfg["env_token_mode"] = True
     model_cfg["adj_path"] = ds_cfg.get("adj_path", model_cfg.get("adj_path", ""))
     backbone_cfg = model_cfg.setdefault("backbone", {})
     model_cfg["backbone_name"] = model_cfg.get("backbone_name", backbone_cfg.get("name", "stid_mlp"))
@@ -326,10 +348,58 @@ def build_optimizer(cfg: Dict, model: torch.nn.Module) -> torch.optim.Optimizer:
 
 def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, cfg: Dict) -> None:
     batch_size = targets.shape[0]
+    input_len = cfg["DATASET"]["input_len"]
     output_len = cfg["DATASET"]["output_len"]
     num_nodes = cfg["DATASET"]["num_nodes"]
     output_dim = cfg["DATASET"]["output_dim"]
     representation_dim = int(cfg["MODEL"].get("backbone", {}).get("representation_dim", cfg["MODEL"]["hidden_dim"]))
+    method_variant = output.get("method_variant", cfg["MODEL"].get("method_variant", "nue"))
+    print(f"method_variant: {method_variant}")
+    if method_variant == "fpem":
+        expected = {
+            "prediction": (batch_size, output_len, num_nodes, output_dim),
+            "y_inv": (batch_size, output_len, num_nodes, output_dim),
+            "y_potential": (batch_size, output_len, num_nodes, output_dim),
+            "r_env": (batch_size, output_len, num_nodes, output_dim),
+            "rho": (batch_size, output_len, num_nodes, 1),
+            "z_inv": (batch_size, num_nodes, representation_dim),
+            "z_raw": (batch_size, num_nodes, representation_dim),
+            "env_mu": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_logvar": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_tokens": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_hist": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_raw": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_plus": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_minus": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "mask": (batch_size, input_len, num_nodes, 1),
+            "y_inv_raw": (batch_size, output_len, num_nodes, output_dim),
+        }
+        for key, expected_shape in expected.items():
+            value = output[key]
+            print(f"{key}: {tuple(value.shape)}")
+            if tuple(value.shape) != expected_shape:
+                raise AssertionError(f"{key} expected {expected_shape}, got {tuple(value.shape)}")
+            assert_finite(value, key)
+        for key in [
+            "env_fut",
+            "env_fut_pred",
+            "env_fut_pred_minus",
+            "prediction_swap",
+            "env_perm",
+            "fusion_gamma",
+            "fusion_beta",
+        ]:
+            value = output.get(key)
+            if value is None:
+                print(f"{key}: None")
+            else:
+                print(f"{key}: {tuple(value.shape)}")
+                assert_finite(value, key)
+        aligned = align_target(targets, output["prediction"])
+        print(f"aligned_targets: {tuple(aligned.shape)}")
+        return
+
     expected = {
         "prediction": (batch_size, output_len, num_nodes, output_dim),
         "y_inv": (batch_size, output_len, num_nodes, output_dim),
@@ -388,6 +458,7 @@ def debug_batch(cfg: Dict) -> None:
     backbone_name = cfg["MODEL"].get("backbone_name", "stid_mlp")
     ablations = cfg.get("RUN", {}).get("ablations", [])
     print(f"ablations: {','.join(ablations) if ablations else 'none'}")
+    print(f"method_variant: {cfg['MODEL'].get('method_variant', 'nue')}")
     print(f"backbone_name: {backbone_name}")
     print(f"backbone_description: {BACKBONE_DESCRIPTIONS.get(str(backbone_name).lower(), 'custom invariant backbone')}")
     print(f"gate_label_mode: {cfg['LOSS'].get('gate_label_mode', 'potential_gain')}")

@@ -503,6 +503,67 @@ prediction = y_inv + rho * r_env
 - `persist_score_mean`, `s_persist_mean`, `s_gate_mean`: persistence score,
   persistence pseudo label, and final gate target statistics.
 
+## Future-Predictive Environment Masking, FPEM
+
+FPEM is enabled with `MODEL.method_variant="fpem"` and keeps the old NUE-STG
+path available when the variant is not selected. It changes the prediction
+mechanism from output-space correction to latent-space fusion:
+
+```text
+E_hist_tokens = TimeNodeEnvironmentEncoder(X)      # [B,L,N,D_env]
+M = FuturePredictiveEnvMask(E_hist_tokens)         # [B,L,N,1]
+E_plus = pool_time(M * E_hist_tokens)              # [B,N,D_env]
+H = FiLM(Z, E_plus)
+prediction = Pred(H)
+```
+
+The invariant-only auxiliary path uses the same FiLM and predictor with a zero
+environment:
+
+```text
+y_inv = Pred(FiLM(Z, zero_env))
+```
+
+So in FPEM, `prediction` is not `y_inv + rho * r_env`. The `rho` field printed
+in debug output is only a compatibility placeholder derived from the mean mask.
+
+Training-only future supervision:
+
+- `FutureEnvEncoder` sees `Y - stopgrad(y_inv)` only during training when
+  `y_true` is passed to `model(x, y_true=y)`.
+- Eval/test calls use `model(x)` and do not compute `env_fut`, so future
+  information cannot enter prediction.
+- `env_fut_pred = EnvTransitionHead(E_plus)` is trained with `envpred_loss`.
+- Optional `future_mi_loss` aligns `E_plus` and `env_fut` with InfoNCE.
+
+Regularization semantics in FPEM:
+
+- `ind_loss` / separation uses full historical environment
+  `env_hist = mean_time(E_hist_tokens)`, not the selected `E_plus`.
+- `sparse_loss` becomes mask sparsity: `mean(mask)` or
+  `abs(mean(mask) - sparse_target)`.
+- Swap exchanges selected future-predictive environment `E_plus`, not the full
+  token environment. The default FPEM config weights swap by future environment
+  difference when `env_fut` exists.
+- Optional rank loss can enforce that `E_plus` predicts `env_fut` better than
+  `E_minus`; it is disabled by default.
+
+Run a FPEM debug batch:
+
+```bash
+python train.py --config configs/ours/pems08_fpem.py --debug_batch
+```
+
+Or smoke-test the variant directly on the base config:
+
+```bash
+python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.method_variant=fpem
+```
+
+Useful FPEM debug fields include `env_tokens`, `mask`, `env_plus`,
+`env_minus`, `env_fut`, `env_fut_pred`, `envpred_loss`, `future_mi_loss`,
+`mask_mean`, `mask_entropy`, `swap_weight_mean`, and FiLM gamma/beta stats.
+
 ## Supported And Not Yet Supported
 
 Current supported method pieces:
@@ -514,6 +575,9 @@ Current supported method pieces:
 - Random batch-node counterfactual swap with `SWAP.mode="batch_node_random"`.
 - Computation-level Z/E separation with `orthogonal_projection`,
   `basis_projection`, and hidden-target `lowrank_residual`.
+- Future-Predictive Environment Masking (`MODEL.method_variant="fpem"`) with
+  time-node env tokens, mask-based latent fusion, training-only future env
+  supervision, mask sparsity, and E-plus swap.
 
 Current unsupported config options fail loudly:
 

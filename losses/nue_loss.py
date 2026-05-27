@@ -61,6 +61,16 @@ class NUESTGLossConfig:
     persistence_affects_gate: bool = True
     persistence_warmup_epochs: int = 5
     detach_future_env: bool = True
+    use_envpred: bool = False
+    lambda_envpred: float = 0.0
+    envpred_loss_type: str = "mse"
+    use_future_mi: bool = False
+    lambda_future_mi: float = 0.0
+    future_mi_tau: float = 0.2
+    use_rank: bool = False
+    lambda_rank: float = 0.0
+    rank_margin: float = 0.1
+    use_mask_sparse: bool = False
 
 
 class NUESTGLoss(nn.Module):
@@ -100,6 +110,10 @@ class NUESTGLoss(nn.Module):
         "residual_norm_loss",
         "env_consistency_loss",
         "persistence_mi_loss",
+        "envpred_loss",
+        "future_mi_loss",
+        "rank_loss",
+        "mask_sparse_loss",
         "effective_lambda_persistence_mi",
         "rho_mean",
         "rho_std",
@@ -117,6 +131,7 @@ class NUESTGLoss(nn.Module):
         "persistence_valid",
         "potential_gain_mean",
         "swap_delta_mean",
+        "swap_weight_mean",
         "env_mu_abs_mean",
         "env_std_mean",
         "r_env_abs_mean",
@@ -137,6 +152,19 @@ class NUESTGLoss(nn.Module):
         "sep_svd_top_singular_mean",
         "sep_lowrank_rank",
         "sep_env_residual_norm",
+        "mask_mean",
+        "mask_std",
+        "mask_min",
+        "mask_max",
+        "mask_entropy",
+        "mask_active_ratio",
+        "env_plus_norm",
+        "env_minus_norm",
+        "env_hist_norm",
+        "env_fut_norm",
+        "env_fut_pred_norm",
+        "fusion_gamma_abs_mean",
+        "fusion_beta_abs_mean",
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -295,12 +323,237 @@ class NUESTGLoss(nn.Module):
                 logs[key] = like.new_tensor(float(value))
         return logs
 
+    def _future_mi_loss(
+        self,
+        env_plus: Optional[torch.Tensor],
+        env_fut: Optional[torch.Tensor],
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        zero = self._zero(like)
+        if env_plus is None or env_fut is None:
+            return zero
+        if env_plus.numel() == 0 or env_fut.numel() == 0:
+            return zero
+        q_flat = env_plus.reshape(-1, env_plus.shape[-1])
+        k_flat = env_fut.detach().reshape(-1, env_fut.shape[-1])
+        if q_flat.shape[0] <= 1 or k_flat.shape[0] <= 1:
+            return zero
+        q_norm = F.normalize(q_flat, dim=-1)
+        k_norm = F.normalize(k_flat, dim=-1)
+        logits = q_norm.matmul(k_norm.transpose(0, 1)) / max(float(self.cfg.future_mi_tau), 1e-6)
+        labels = torch.arange(q_flat.shape[0], device=q_flat.device)
+        return F.cross_entropy(logits, labels)
+
+    def _fpem_swap_weight(
+        self,
+        output: Dict[str, torch.Tensor],
+        full_elem: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mode = str(self.cfg.swap_weight_mode)
+        if mode == "uniform":
+            weight = torch.ones_like(full_elem)
+            return weight, weight.mean()
+
+        if mode == "future_env_diff":
+            source = output.get("env_fut")
+            if source is None:
+                source = output.get("env_plus")
+        else:
+            source = output.get("env_plus")
+        if source is None or output.get("env_perm_index") is None:
+            weight = torch.ones_like(full_elem)
+            return weight, weight.mean()
+        batch_size, num_nodes, dim = source.shape
+        flat = source.reshape(batch_size * num_nodes, dim)
+        perm = output["env_perm_index"].reshape(-1).long()
+        paired = flat[perm]
+        cosine = F.cosine_similarity(flat.detach(), paired.detach(), dim=-1)
+        alpha = ((1.0 - cosine) * 0.5).clamp(0.0, 1.0).reshape(batch_size, 1, num_nodes, 1)
+        return alpha.expand_as(full_elem), alpha.mean()
+
+    def _forward_fpem(
+        self,
+        output: Dict[str, torch.Tensor],
+        y_true: torch.Tensor,
+        targets_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        prediction = output["prediction"]
+        y_inv = output["y_inv"]
+        zero = self._zero(prediction)
+
+        pred_loss_raw = self._mae_loss(prediction, y_true, targets_mask)
+        inv_loss_raw = self._mae_loss(y_inv, y_true, targets_mask)
+        full_elem, elem_mask = self._channel_mean_error(prediction, y_true, targets_mask)
+
+        env_fut = output.get("env_fut")
+        env_fut_pred = output.get("env_fut_pred")
+        envpred_loss_raw = zero
+        if env_fut is not None and env_fut_pred is not None:
+            env_fut_target = env_fut.detach()
+            if self.cfg.envpred_loss_type == "mse":
+                envpred_loss_raw = F.mse_loss(env_fut_pred, env_fut_target)
+            elif self.cfg.envpred_loss_type == "cosine":
+                envpred_loss_raw = 1.0 - F.cosine_similarity(env_fut_pred, env_fut_target, dim=-1).mean()
+            else:
+                raise ValueError(f"Unsupported envpred_loss_type={self.cfg.envpred_loss_type!r}")
+
+        future_mi_loss_raw = self._future_mi_loss(output.get("env_plus"), env_fut, prediction)
+        env_hist = output.get("env_hist", output.get("env"))
+        ind_loss_raw = self._independence_loss(output["z_inv"], env_hist) if env_hist is not None else zero
+        env_mu = output["env_mu"]
+        env_logvar = output["env_logvar"]
+        kl_loss_raw = self._kl_loss(env_mu, env_logvar)
+
+        mask = output.get("mask")
+        if mask is None:
+            sparse_loss_raw = zero
+            mask_mean = zero
+            mask_std = zero
+            mask_min = zero
+            mask_max = zero
+            mask_entropy_mean = zero
+            mask_active_ratio = zero
+        else:
+            mask_mean = mask.mean()
+            mask_std = mask.detach().std(unbiased=False)
+            mask_min = mask.detach().min()
+            mask_max = mask.detach().max()
+            mask_clamped = mask.clamp(1e-6, 1.0 - 1e-6)
+            mask_entropy = -(
+                mask_clamped * mask_clamped.log()
+                + (1.0 - mask_clamped) * (1.0 - mask_clamped).log()
+            )
+            mask_entropy_mean = mask_entropy.mean()
+            mask_active_ratio = (mask.detach() > 0.5).float().mean()
+            sparse_loss_raw = mask_mean
+            if self.cfg.sparse_target is not None:
+                sparse_loss_raw = (sparse_loss_raw - float(self.cfg.sparse_target)).abs()
+
+        swap_loss_raw = zero
+        swap_diff_loss_raw = zero
+        swap_same_loss_raw = zero
+        swap_delta_mean = zero
+        swap_weight_mean = zero
+        prediction_swap = output.get("prediction_swap")
+        has_swap = self.cfg.use_swap and self.cfg.lambda_swap != 0 and prediction_swap is not None
+        if has_swap:
+            swap_elem, _ = self._channel_mean_error(prediction_swap, y_true, targets_mask)
+            swap_weight, swap_weight_mean = self._fpem_swap_weight(output, full_elem)
+            swap_diff_loss_raw = masked_mean(
+                F.relu(float(self.cfg.swap_margin) + full_elem.detach() - swap_elem) * swap_weight,
+                elem_mask,
+            )
+            swap_loss_raw = swap_diff_loss_raw
+            swap_delta_mean = masked_mean((swap_elem - full_elem).detach(), elem_mask)
+
+        rank_loss_raw = zero
+        env_fut_pred_minus = output.get("env_fut_pred_minus")
+        if env_fut is not None and env_fut_pred is not None and env_fut_pred_minus is not None:
+            env_fut_target = env_fut.detach()
+            s_plus = F.cosine_similarity(env_fut_pred, env_fut_target, dim=-1)
+            s_minus = F.cosine_similarity(env_fut_pred_minus, env_fut_target, dim=-1)
+            rank_loss_raw = F.relu(float(self.cfg.rank_margin) - s_plus + s_minus).mean()
+
+        pred_loss = pred_loss_raw
+        inv_loss = inv_loss_raw if self.cfg.use_inv and self.cfg.lambda_inv != 0 else zero
+        envpred_loss = envpred_loss_raw if self.cfg.use_envpred and self.cfg.lambda_envpred != 0 else zero
+        future_mi_loss = future_mi_loss_raw if self.cfg.use_future_mi and self.cfg.lambda_future_mi != 0 else zero
+        rank_loss = rank_loss_raw if self.cfg.use_rank and self.cfg.lambda_rank != 0 else zero
+        sparse_enabled = self.cfg.use_mask_sparse or self.cfg.use_sparse
+        sparse_loss = sparse_loss_raw if sparse_enabled and self.cfg.lambda_sparse != 0 else zero
+        effective_lambda_kl = self._effective_lambda_kl()
+        kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
+        ind_loss = ind_loss_raw if self.cfg.use_ind and self.cfg.lambda_ind != 0 else zero
+        swap_loss = swap_loss_raw if has_swap else zero
+        swap_diff_loss = swap_diff_loss_raw if has_swap else zero
+
+        total_loss = (
+            self.cfg.lambda_pred * pred_loss
+            + self.cfg.lambda_inv * inv_loss
+            + self.cfg.lambda_envpred * envpred_loss
+            + self.cfg.lambda_future_mi * future_mi_loss
+            + self.cfg.lambda_ind * ind_loss
+            + self.cfg.lambda_sparse * sparse_loss
+            + self.cfg.lambda_swap * swap_loss
+            + effective_lambda_kl * kl_loss
+            + self.cfg.lambda_rank * rank_loss
+        )
+
+        rho = output.get("rho")
+        env_plus = output.get("env_plus")
+        env_minus = output.get("env_minus")
+        fusion_gamma = output.get("fusion_gamma")
+        fusion_beta = output.get("fusion_beta")
+        logs = {
+            "total_loss": total_loss.detach(),
+            "pred_loss": pred_loss.detach(),
+            "inv_loss": inv_loss.detach(),
+            "gate_loss": zero,
+            "swap_loss": swap_loss.detach(),
+            "swap_diff_loss": swap_diff_loss.detach(),
+            "swap_same_loss": swap_same_loss_raw.detach(),
+            "kl_loss": kl_loss.detach(),
+            "effective_lambda_kl": prediction.new_tensor(effective_lambda_kl),
+            "ind_loss": ind_loss.detach(),
+            "sparse_loss": sparse_loss.detach(),
+            "mask_sparse_loss": sparse_loss.detach(),
+            "entropy_loss": zero,
+            "residual_norm_loss": zero,
+            "env_consistency_loss": zero,
+            "persistence_mi_loss": zero,
+            "effective_lambda_persistence_mi": zero,
+            "envpred_loss": envpred_loss.detach(),
+            "future_mi_loss": future_mi_loss.detach(),
+            "rank_loss": rank_loss.detach(),
+            "rho_mean": rho.detach().mean() if rho is not None else zero,
+            "rho_std": rho.detach().std(unbiased=False) if rho is not None else zero,
+            "rho_min": rho.detach().min() if rho is not None else zero,
+            "rho_max": rho.detach().max() if rho is not None else zero,
+            "rho_entropy": mask_entropy_mean.detach(),
+            "delta_gain_mean": zero,
+            "delta_gain_std": zero,
+            "delta_gain_pos_ratio": zero,
+            "s_gain_mean": zero,
+            "persist_score_mean": zero,
+            "persist_score_std": zero,
+            "s_persist_mean": zero,
+            "s_gate_mean": zero,
+            "persistence_valid": prediction.new_tensor(float(env_fut is not None)),
+            "potential_gain_mean": zero,
+            "swap_delta_mean": swap_delta_mean.detach(),
+            "swap_weight_mean": swap_weight_mean.detach(),
+            "env_mu_abs_mean": env_mu.detach().abs().mean(),
+            "env_std_mean": torch.exp(0.5 * env_logvar.detach()).mean(),
+            "r_env_abs_mean": zero,
+            "y_inv_mae": inv_loss_raw.detach(),
+            "y_potential_mae": pred_loss_raw.detach(),
+            "y_hat_mae": pred_loss_raw.detach(),
+            "mask_mean": mask_mean.detach(),
+            "mask_std": mask_std.detach(),
+            "mask_min": mask_min.detach(),
+            "mask_max": mask_max.detach(),
+            "mask_entropy": mask_entropy_mean.detach(),
+            "mask_active_ratio": mask_active_ratio.detach(),
+            "env_plus_norm": env_plus.detach().norm(dim=-1).mean() if env_plus is not None else zero,
+            "env_minus_norm": env_minus.detach().norm(dim=-1).mean() if env_minus is not None else zero,
+            "env_hist_norm": env_hist.detach().norm(dim=-1).mean() if env_hist is not None else zero,
+            "env_fut_norm": env_fut.detach().norm(dim=-1).mean() if env_fut is not None else zero,
+            "env_fut_pred_norm": env_fut_pred.detach().norm(dim=-1).mean() if env_fut_pred is not None else zero,
+            "fusion_gamma_abs_mean": fusion_gamma.detach().abs().mean() if fusion_gamma is not None else zero,
+            "fusion_beta_abs_mean": fusion_beta.detach().abs().mean() if fusion_beta is not None else zero,
+        }
+        logs.update(self._separation_logs(output, prediction))
+        self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
+        return total_loss, logs
+
     def forward(
         self,
         output: Dict[str, torch.Tensor],
         y_true: torch.Tensor,
         targets_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if output.get("method_variant", "nue") == "fpem":
+            return self._forward_fpem(output, y_true, targets_mask)
         prediction = output["prediction"]
         y_inv = output["y_inv"]
         y_potential = output["y_potential"]
