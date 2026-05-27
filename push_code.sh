@@ -18,34 +18,19 @@ if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   git remote add "$REMOTE" "$REMOTE_URL"
 fi
 
-git add -A -- \
-  . \
-  ':(exclude)datasets' \
-  ':(exclude)datasets/**' \
-  ':(exclude)outputs' \
-  ':(exclude)outputs/**' \
-  ':(exclude)checkpoints' \
-  ':(exclude)checkpoints/**' \
-  ':(exclude)runs' \
-  ':(exclude)runs/**' \
-  ':(exclude)wandb' \
-  ':(exclude)wandb/**' \
-  ':(exclude)logs' \
-  ':(exclude)logs/**' \
-  ':(exclude)**/__pycache__/**' \
-  ':(exclude)**/*.pyc' \
-  ':(exclude)**/*.pt' \
-  ':(exclude)**/*.pth' \
-  ':(exclude)**/*.ckpt' \
-  ':(exclude)**/*.safetensors' \
-  ':(exclude)**/*.npy' \
-  ':(exclude)**/*.npz' \
-  ':(exclude)**/*.h5' \
-  ':(exclude)**/*.hdf5' \
-  ':(exclude)**/*.pkl' \
-  ':(exclude)**/*.zip' \
-  ':(exclude)**/*.tar' \
-  ':(exclude)**/*.tar.gz'
+# Stage tracked modifications/deletions first, then add only untracked files
+# that are not ignored by .gitignore. This avoids failing on ignored local
+# artifacts such as checkpoints while still picking up new source files.
+git add -u
+
+untracked_files=()
+while IFS= read -r -d '' file; do
+  untracked_files+=("$file")
+done < <(git ls-files -o --exclude-standard -z)
+
+if (( ${#untracked_files[@]} > 0 )); then
+  git add -- "${untracked_files[@]}"
+fi
 
 blocked="$(
   git diff --cached --name-only |

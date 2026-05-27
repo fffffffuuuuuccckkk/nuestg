@@ -9,10 +9,12 @@ from torch import nn
 from basicts.configs import BasicTSModelConfig
 
 from models.backbones import build_backbone
+from models.env_future_decoder import FutureEnvDistributionDecoder
 from models.env_encoder import NodeWiseEnvironmentEncoder, TimeNodeEnvironmentEncoder
 from models.env_mask import FuturePredictiveEnvMask
 from models.future_env_encoder import FutureEnvEncoder
 from models.separation import SeparationModule
+from models.time_embedding import TimestampEncoder
 from utils.tensor_ops import align_target, ensure_blnc, load_adjacency
 
 
@@ -27,9 +29,21 @@ class NUESTGConfig(BasicTSModelConfig):
     hidden_dim: int = 64
     node_emb_dim: int = 32
     time_emb_dim: int = 0
+    tod_emb_dim: int = 16
+    dow_emb_dim: int = 8
+    num_time_in_day: int = 288
+    num_day_in_week: int = 7
+    timestamp_feature_dim: int = 0
     dropout: float = 0.1
     use_node_embedding: bool = True
     use_time_embedding: bool = False
+    use_timestamp: bool = False
+    time_encoding_type: str = "none"
+    use_time_of_day: bool = True
+    use_day_of_week: bool = True
+    use_current_timestamp_for_z: bool = True
+    use_current_timestamp_for_env: bool = True
+    required_timestamp: bool = False
     use_adj: bool = True
     adj_path: str = ""
     adj_norm: str = "sym"
@@ -68,16 +82,89 @@ class NUESTGConfig(BasicTSModelConfig):
     mask_pooling: str = "masked_mean"
     mask_eps: float = 1e-6
     force_mask_value: Optional[float] = None
+    mask_use_time: bool = True
     fusion_type: str = "film"
     fusion_hidden_dim: int = 64
     fusion_dropout: float = 0.1
     fusion_zero_init: bool = True
     env_transition_hidden_dim: int = 64
     env_transition_dropout: float = 0.1
+    future_decoder_hidden_dim: int = 64
+    future_decoder_dropout: float = 0.1
+    future_decoder_use_time: bool = True
+    future_decoder_logvar_min: float = -8.0
+    future_decoder_logvar_max: float = 4.0
     use_shuffled_env_train: bool = False
     use_shuffled_env_eval: bool = False
     swap: Dict = field(default_factory=dict)
     swap_detach_inv: bool = True
+
+
+class LatentFusion(nn.Module):
+    """Fuse invariant Z and selected environment in latent space."""
+
+    def __init__(
+        self,
+        z_dim: int,
+        env_dim: int,
+        fusion_type: str = "film",
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        zero_init: bool = True,
+    ) -> None:
+        super().__init__()
+        self.z_dim = int(z_dim)
+        self.env_dim = int(env_dim)
+        self.fusion_type = str(fusion_type or "film").lower()
+        if self.fusion_type == "film":
+            self.net = nn.Sequential(
+                nn.Linear(env_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 2 * z_dim),
+            )
+        elif self.fusion_type == "concat":
+            self.net = nn.Sequential(
+                nn.Linear(z_dim + env_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, z_dim),
+            )
+        elif self.fusion_type == "gated_add":
+            self.gate = nn.Sequential(nn.Linear(env_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, z_dim))
+            self.delta = nn.Sequential(nn.Linear(env_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, z_dim))
+        else:
+            raise NotImplementedError(
+                f"MODEL.fusion_type={fusion_type!r} is not implemented; expected film, concat, or gated_add."
+            )
+        if zero_init:
+            modules = [self.net[-1]] if hasattr(self, "net") else [self.gate[-1], self.delta[-1]]
+            for module in modules:
+                if isinstance(module, nn.Linear):
+                    nn.init.zeros_(module.weight)
+                    nn.init.zeros_(module.bias)
+
+    def forward(self, z_inv: torch.Tensor, env: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if z_inv.dim() != 3:
+            raise AssertionError(f"z_inv must be [B,N,D_z], got {tuple(z_inv.shape)}")
+        if env.dim() != 3:
+            raise AssertionError(f"env must be [B,N,D_env], got {tuple(env.shape)}")
+        if z_inv.shape[:2] != env.shape[:2]:
+            raise AssertionError(f"z/env batch-node mismatch: {tuple(z_inv.shape)} vs {tuple(env.shape)}")
+        if z_inv.shape[-1] != self.z_dim or env.shape[-1] != self.env_dim:
+            raise AssertionError(f"expected z/env dims {(self.z_dim, self.env_dim)}, got {(z_inv.shape[-1], env.shape[-1])}")
+        if self.fusion_type == "film":
+            gamma, beta = self.net(env).chunk(2, dim=-1)
+            hidden = (1.0 + gamma) * z_inv + beta
+            return {"hidden": hidden, "fusion_gamma": gamma, "fusion_beta": beta}
+        if self.fusion_type == "concat":
+            hidden = self.net(torch.cat([z_inv, env], dim=-1))
+            zeros = torch.zeros_like(z_inv)
+            return {"hidden": hidden, "fusion_gamma": zeros, "fusion_beta": zeros}
+        gate = torch.sigmoid(self.gate(env))
+        delta = self.delta(env)
+        hidden = z_inv + gate * delta
+        return {"hidden": hidden, "fusion_gamma": gate, "fusion_beta": delta}
 
 
 class NUESTG(nn.Module):
@@ -124,6 +211,10 @@ class NUESTG(nn.Module):
         self.use_separated_z_for_y_inv = bool(config.use_separated_z_for_y_inv)
         self.persistence_cfg = config.persistence or {}
         self.persistence_enabled = bool(self.persistence_cfg.get("enabled", False))
+        self.use_timestamp = bool(config.use_timestamp)
+        self.time_emb_dim = int(config.time_emb_dim) if self.use_timestamp else 0
+        self.use_current_timestamp_for_z = bool(config.use_current_timestamp_for_z)
+        self.use_current_timestamp_for_env = bool(config.use_current_timestamp_for_env)
         if self.method_variant not in {"nue", "nuestg", "fpem"}:
             raise NotImplementedError(
                 f"MODEL.method_variant={config.method_variant!r} is not implemented; expected 'nue' or 'fpem'."
@@ -154,6 +245,24 @@ class NUESTG(nn.Module):
         self.backbone = build_backbone({"MODEL": model_cfg})
         self.representation_dim = int(self.backbone.representation_dim)
         self.hidden_dim = self.representation_dim
+        self.time_encoder = TimestampEncoder(
+            encoding_type=config.time_encoding_type if self.use_timestamp else "none",
+            time_emb_dim=self.time_emb_dim,
+            tod_emb_dim=config.tod_emb_dim,
+            dow_emb_dim=config.dow_emb_dim,
+            num_time_in_day=config.num_time_in_day,
+            num_day_in_week=config.num_day_in_week,
+            timestamp_feature_dim=config.timestamp_feature_dim,
+            use_time_of_day=config.use_time_of_day,
+            use_day_of_week=config.use_day_of_week,
+            required_timestamp=config.required_timestamp,
+            dropout=config.dropout,
+        )
+        self.z_time_adapter = (
+            nn.Linear(self.time_emb_dim, self.representation_dim, bias=False)
+            if self.use_timestamp and self.time_emb_dim > 0 and self.use_current_timestamp_for_z
+            else None
+        )
         self.inv_head_from_z = nn.Linear(self.representation_dim, config.output_len * config.output_dim)
         if hasattr(self.backbone, "inv_head") and isinstance(self.backbone.inv_head, nn.Linear):
             if (
@@ -190,6 +299,10 @@ class NUESTG(nn.Module):
             logvar_max=config.env_logvar_max,
             reparameterize=config.env_reparameterize,
             deterministic_eval=config.deterministic_env_eval,
+            time_emb_dim=self.time_emb_dim if self.use_current_timestamp_for_env else 0,
+            use_node_embedding=config.use_node_embedding,
+            num_nodes=config.num_nodes,
+            node_emb_dim=config.node_emb_dim,
         )
         self.separation = SeparationModule(
             cfg=config.separation,
@@ -221,20 +334,17 @@ class NUESTG(nn.Module):
             force_mask_value=config.force_mask_value,
             pooling=config.mask_pooling,
             eps=config.mask_eps,
+            time_emb_dim=self.time_emb_dim if self.use_current_timestamp_for_env else 0,
+            use_time=config.mask_use_time,
         )
-        if config.fusion_type != "film":
-            raise NotImplementedError("FPEM currently supports only MODEL.fusion_type='film'.")
-        self.fpem_fusion = nn.Sequential(
-            nn.Linear(config.env_dim, config.fusion_hidden_dim),
-            nn.GELU(),
-            nn.Dropout(config.fusion_dropout),
-            nn.Linear(config.fusion_hidden_dim, 2 * self.representation_dim),
+        self.latent_fusion = LatentFusion(
+            z_dim=self.representation_dim,
+            env_dim=config.env_dim,
+            fusion_type=config.fusion_type,
+            hidden_dim=config.fusion_hidden_dim,
+            dropout=config.fusion_dropout,
+            zero_init=config.fusion_zero_init,
         )
-        if config.fusion_zero_init:
-            last = self.fpem_fusion[-1]
-            if isinstance(last, nn.Linear):
-                nn.init.zeros_(last.weight)
-                nn.init.zeros_(last.bias)
         self.fpem_predictor = nn.Linear(self.representation_dim, config.output_len * config.output_dim)
         if self.inv_head_from_z.in_features == self.fpem_predictor.in_features and (
             self.inv_head_from_z.out_features == self.fpem_predictor.out_features
@@ -245,6 +355,15 @@ class NUESTG(nn.Module):
             nn.GELU(),
             nn.Dropout(config.env_transition_dropout),
             nn.Linear(config.env_transition_hidden_dim, config.env_dim),
+        )
+        self.future_env_decoder = FutureEnvDistributionDecoder(
+            env_dim=config.env_dim,
+            time_emb_dim=self.time_emb_dim,
+            hidden_dim=config.future_decoder_hidden_dim,
+            dropout=config.future_decoder_dropout,
+            use_time=config.future_decoder_use_time,
+            logvar_min=config.future_decoder_logvar_min,
+            logvar_max=config.future_decoder_logvar_max,
         )
 
         decode_in_dim = self.representation_dim + config.env_dim
@@ -303,15 +422,14 @@ class NUESTG(nn.Module):
             raise AssertionError(f"env_plus must be [B, N, D_env], got {tuple(env_plus.shape)}")
         if z_inv.shape[:2] != env_plus.shape[:2]:
             raise AssertionError(f"z_inv/env_plus shape mismatch: {tuple(z_inv.shape)} vs {tuple(env_plus.shape)}")
-        gamma_beta = self.fpem_fusion(env_plus)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-        h_fuse = (1.0 + gamma) * z_inv + beta
+        fusion_out = self.latent_fusion(z_inv, env_plus)
+        h_fuse = fusion_out["hidden"]
         prediction = self._predict_from_hidden(h_fuse, self.fpem_predictor)
         return {
             "prediction": prediction,
             "hidden": h_fuse,
-            "fusion_gamma": gamma,
-            "fusion_beta": beta,
+            "fusion_gamma": fusion_out["fusion_gamma"],
+            "fusion_beta": fusion_out["fusion_beta"],
         }
 
     def _init_gate_bias(self, bias: float) -> None:
@@ -432,26 +550,74 @@ class NUESTG(nn.Module):
             "persist_score": persist_score,
         }
 
+    def _encode_time(
+        self,
+        x: torch.Tensor,
+        seq_time: Optional[torch.Tensor],
+        cur_time: Optional[torch.Tensor],
+        future_time: Optional[torch.Tensor],
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        return self.time_encoder(
+            seq_time=seq_time,
+            cur_time=cur_time,
+            future_time=future_time,
+            batch_size=x.shape[0],
+            seq_len=x.shape[1],
+            future_len=self.output_len,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+    def _match_env_input_dim(self, y: torch.Tensor) -> torch.Tensor:
+        y = ensure_blnc(y, "future_env_input")
+        if y.shape[-1] == self.input_dim:
+            return y
+        if y.shape[-1] > self.input_dim:
+            return y[..., : self.input_dim]
+        pad = self.input_dim - y.shape[-1]
+        return torch.nn.functional.pad(y, (0, pad))
+
+    def _apply_time_to_z(self, z_raw: torch.Tensor, cur_time_emb: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.z_time_adapter is None or cur_time_emb is None:
+            return z_raw
+        if tuple(cur_time_emb.shape) != (z_raw.shape[0], self.time_emb_dim):
+            raise AssertionError(
+                f"cur_time_emb must be {(z_raw.shape[0], self.time_emb_dim)}, got {tuple(cur_time_emb.shape)}"
+            )
+        return z_raw + self.z_time_adapter(cur_time_emb).unsqueeze(1)
+
     def _forward_fpem(
         self,
         x: torch.Tensor,
         y_true: Optional[torch.Tensor] = None,
+        seq_time: Optional[torch.Tensor] = None,
+        cur_time: Optional[torch.Tensor] = None,
+        future_time: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size, input_len, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
+        time_out = self._encode_time(x, seq_time, cur_time, future_time)
+        seq_time_emb = time_out["seq_time_emb"] if self.use_current_timestamp_for_env else None
+        cur_time_emb = time_out["cur_time_emb"] if self.use_current_timestamp_for_env else None
+        future_time_emb = time_out["future_time_emb"]
 
         backbone_out = self.backbone(x, adj=adj)
-        z_raw = backbone_out["z_inv"]
+        z_raw = self._apply_time_to_z(backbone_out["z_inv"], time_out["cur_time_emb"])
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
-        env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(x, adj)
-        env_hist_raw = env_tokens.mean(dim=1)
+        env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(
+            x,
+            seq_time_emb=seq_time_emb,
+            cur_time_emb=cur_time_emb,
+            adj_norm=adj,
+        )
+        mask_out = self.env_mask(env_tokens, seq_time_emb=seq_time_emb, cur_time_emb=cur_time_emb)
+        env_hist_raw = mask_out["env_hist"]
 
         sep_out = self.separation(x=x, z_raw=z_raw, env_raw=env_hist_raw, y_inv_raw=y_inv_raw)
         z_inv = sep_out["z_inv"]
         env_hist = sep_out["env"]
         separation_extra = sep_out["extra"]
 
-        mask_out = self.env_mask(env_tokens)
         mask = mask_out["mask"]
         env_plus = mask_out["env_plus"]
         env_minus = mask_out["env_minus"]
@@ -462,18 +628,43 @@ class NUESTG(nn.Module):
         inv_out = self.fpem_predict_from_z_env(z_inv, zero_env)
         y_inv = inv_out["prediction"]
 
+        env_fut_tokens = None
+        env_fut_mu_tokens = None
+        env_fut_logvar_tokens = None
         env_fut = None
-        env_fut_pred = None
-        env_fut_pred_minus = None
+        pred_fut_mu = None
+        pred_fut_logvar = None
+        pred_fut_mu_minus = None
+        pred_fut_logvar_minus = None
         persist_q = None
         persist_k = None
         persist_score = None
         if self.training and y_true is not None:
             aligned_true = align_target(y_true, y_inv)
-            future_residual = aligned_true - y_inv.detach()
-            env_fut = self.future_env_encoder(future_residual)
-            env_fut_pred = self.env_transition_head(env_plus)
-            env_fut_pred_minus = self.env_transition_head(env_minus)
+            future_env_input = self._match_env_input_dim(aligned_true)
+            env_fut_mu_tokens, env_fut_logvar_tokens, env_fut_tokens = self.env_token_encoder(
+                future_env_input,
+                seq_time_emb=future_time_emb if self.use_current_timestamp_for_env else None,
+                cur_time_emb=cur_time_emb,
+                adj_norm=adj,
+            )
+            env_fut = env_fut_tokens.mean(dim=1)
+            decoder_plus = self.future_env_decoder(
+                env_plus,
+                future_time_emb=future_time_emb,
+                cur_time_emb=time_out["cur_time_emb"],
+                future_len=self.output_len,
+            )
+            decoder_minus = self.future_env_decoder(
+                env_minus,
+                future_time_emb=future_time_emb,
+                cur_time_emb=time_out["cur_time_emb"],
+                future_len=self.output_len,
+            )
+            pred_fut_mu = decoder_plus["pred_fut_mu"]
+            pred_fut_logvar = decoder_plus["pred_fut_logvar"]
+            pred_fut_mu_minus = decoder_minus["pred_fut_mu"]
+            pred_fut_logvar_minus = decoder_minus["pred_fut_logvar"]
             if self.persistence_enabled:
                 persist_q = self.persist_q(env_plus)
                 k_fut_raw = self.persist_k(env_fut)
@@ -518,6 +709,16 @@ class NUESTG(nn.Module):
         for name, (tensor, expected_shape) in shape_checks.items():
             if tuple(tensor.shape) != expected_shape:
                 raise AssertionError(f"{name} must be {expected_shape}, got {tuple(tensor.shape)}")
+        expected_fut_token_shape = (batch_size, self.output_len, num_nodes, self.env_dim)
+        for name, tensor in {
+            "env_fut_tokens": env_fut_tokens,
+            "env_fut_mu_tokens": env_fut_mu_tokens,
+            "env_fut_logvar_tokens": env_fut_logvar_tokens,
+            "pred_fut_mu": pred_fut_mu,
+            "pred_fut_logvar": pred_fut_logvar,
+        }.items():
+            if tensor is not None and tuple(tensor.shape) != expected_fut_token_shape:
+                raise AssertionError(f"{name} must be {expected_fut_token_shape}, got {tuple(tensor.shape)}")
 
         rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)
         if tuple(rho.shape) != expected_gate_shape:
@@ -538,6 +739,10 @@ class NUESTG(nn.Module):
             "env_logvar": env_logvar_tokens,
             "env": env_hist,
             "env_hist": env_hist,
+            "env_hist_bar": env_hist,
+            "env_hist_tokens": env_tokens,
+            "env_hist_mu_tokens": env_mu_tokens,
+            "env_hist_logvar_tokens": env_logvar_tokens,
             "env_raw": env_hist_raw,
             "env_tokens": env_tokens,
             "env_plus": env_plus,
@@ -549,8 +754,15 @@ class NUESTG(nn.Module):
             "separation_mode": sep_out["mode"],
             "separation_extra": separation_extra,
             "env_fut": env_fut,
-            "env_fut_pred": env_fut_pred,
-            "env_fut_pred_minus": env_fut_pred_minus,
+            "env_fut_tokens": env_fut_tokens,
+            "env_fut_mu_tokens": env_fut_mu_tokens,
+            "env_fut_logvar_tokens": env_fut_logvar_tokens,
+            "pred_fut_mu": pred_fut_mu,
+            "pred_fut_logvar": pred_fut_logvar,
+            "pred_fut_mu_minus": pred_fut_mu_minus,
+            "pred_fut_logvar_minus": pred_fut_logvar_minus,
+            "env_fut_pred": pred_fut_mu.mean(dim=1) if pred_fut_mu is not None else None,
+            "env_fut_pred_minus": pred_fut_mu_minus.mean(dim=1) if pred_fut_mu_minus is not None else None,
             "persist_q": persist_q,
             "persist_k": persist_k,
             "persist_score": persist_score,
@@ -563,17 +775,31 @@ class NUESTG(nn.Module):
             "fusion_beta": pred_out["fusion_beta"],
             "fusion_gamma_inv": inv_out["fusion_gamma"],
             "fusion_beta_inv": inv_out["fusion_beta"],
+            "seq_time_emb": time_out["seq_time_emb"],
+            "cur_time_emb": time_out["cur_time_emb"],
+            "future_time_emb": time_out["future_time_emb"],
+            "timestamp_valid": time_out["timestamp_valid"],
+            "time_encoding_type_id": time_out["time_encoding_type_id"],
         }
 
     def forward(
         self,
         inputs: torch.Tensor,
         y_true: Optional[torch.Tensor] = None,
+        seq_time: Optional[torch.Tensor] = None,
+        cur_time: Optional[torch.Tensor] = None,
+        future_time: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Dict[str, Optional[torch.Tensor]]:
         x = ensure_blnc(inputs, "inputs")
         if self.is_fpem:
-            return self._forward_fpem(x, y_true=y_true)
+            return self._forward_fpem(
+                x,
+                y_true=y_true,
+                seq_time=seq_time,
+                cur_time=cur_time,
+                future_time=future_time,
+            )
         batch_size, _, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
 

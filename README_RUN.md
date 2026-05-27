@@ -510,43 +510,75 @@ path available when the variant is not selected. It changes the prediction
 mechanism from output-space correction to latent-space fusion:
 
 ```text
-E_hist_tokens = TimeNodeEnvironmentEncoder(X)      # [B,L,N,D_env]
-M = FuturePredictiveEnvMask(E_hist_tokens)         # [B,L,N,1]
-E_plus = pool_time(M * E_hist_tokens)              # [B,N,D_env]
+Z = Backbone(X) + TimeAdapter(T_cur)                    # [B,N,D_z]
+E_hist_tokens = TimeNodeEnvironmentEncoder(X, T_hist, T_cur)
+M = FuturePredictiveEnvMask(E_hist_tokens, T_hist, T_cur)
+E_plus = masked_pool_time(M * E_hist_tokens)            # [B,N,D_env]
 H = FiLM(Z, E_plus)
-prediction = Pred(H)
+prediction = UnifiedPredictor(H)
 ```
 
 The invariant-only auxiliary path uses the same FiLM and predictor with a zero
 environment:
 
 ```text
-y_inv = Pred(FiLM(Z, zero_env))
+y_inv = UnifiedPredictor(FiLM(Z, zero_env))
 ```
 
 So in FPEM, `prediction` is not `y_inv + rho * r_env`. The `rho` field printed
 in debug output is only a compatibility placeholder derived from the mean mask.
 
-Training-only future supervision:
+Timestamp handling:
 
-- `FutureEnvEncoder` sees `Y - stopgrad(y_inv)` only during training when
-  `y_true` is passed to `model(x, y_true=y)`.
-- Eval/test calls use `model(x)` and do not compute `env_fut`, so future
-  information cannot enter prediction.
-- `env_fut_pred = EnvTransitionHead(E_plus)` is trained with `envpred_loss`.
-- Optional `future_mi_loss` aligns `E_plus` and `env_fut` with InfoNCE.
+- `configs/ours/pems08_fpem.py` sets `DATASET.use_timestamps=True`, so BasicTS
+  batches expose `inputs_timestamps` and `targets_timestamps`.
+- `TimestampEncoder` supports `stid`, `sinusoidal`, `mlp`, and `none`.
+- Current timestamp embedding is injected into `Z` through a lightweight
+  adapter when the backbone itself does not consume time embeddings.
+- Historical sequence timestamp and current timestamp embeddings are concatenated
+  into the time-node environment encoder and the mask network.
+- If timestamps are absent and `MODEL.required_timestamp=False`, the model falls
+  back to zero time embeddings and still runs debug.
 
-Regularization semantics in FPEM:
+Training-only future environment:
 
-- `ind_loss` / separation uses full historical environment
-  `env_hist = mean_time(E_hist_tokens)`, not the selected `E_plus`.
-- `sparse_loss` becomes mask sparsity: `mean(mask)` or
-  `abs(mean(mask) - sparse_target)`.
-- Swap exchanges selected future-predictive environment `E_plus`, not the full
-  token environment. The default FPEM config weights swap by future environment
-  difference when `env_fut` exists.
-- Optional rank loss can enforce that `E_plus` predicts `env_fut` better than
-  `E_minus`; it is disabled by default.
+- FPEM does not use residual future encoding. In FPEM, the future environment is
+  encoded by the same `TimeNodeEnvironmentEncoder` from the true future sequence
+  `Y_future` and future timestamps:
+
+```text
+E_fut_tokens = TimeNodeEnvironmentEncoder(Y_future, T_future, T_cur)
+```
+
+- `E_fut_tokens` is computed only when `model(..., y_true=y, future_time=...)`
+  is called during training/debug.
+- Eval/test calls use `model(x, seq_time=..., cur_time=...)` without `y_true`;
+  they do not compute `E_fut_tokens`, so future values cannot enter prediction.
+
+Mutual-information objectives:
+
+- `I(E_plus; E_future)` is controlled by `LOSS.future_mi_type`.
+- Default `ba_nll` uses a Barber-Agakov conditional Gaussian decoder
+  `q_phi(E_future | E_plus, T_future, T_cur)` and minimizes negative log
+  likelihood.
+- `ba_kl` matches the future encoder distribution with a predicted Gaussian.
+- `mse` matches predicted future environment mean to stop-gradient future env.
+- `infonce` remains available as an optional contrastive variant.
+- `I(E_hist; Z)` minimization is controlled by `LOSS.sep_mi_type`.
+- Default `cross_cov` uses the full historical environment
+  `E_hist_bar = mean_time(E_hist_tokens)`, not `E_plus`.
+- Optional `club` provides a CLUB upper-bound estimator; optional `hsic` provides
+  a sampled HSIC dependency penalty.
+
+Other FPEM losses:
+
+- `mask_sparse_loss` is `mean(mask)` or `abs(mean(mask) - sparse_target)`.
+- Swap exchanges selected future-predictive `E_plus`, not full `E_hist_tokens`.
+  `Z_i` stays fixed and the swapped-in `E_plus_j` is detached by default.
+- Swap weights can use future environment difference, selected environment
+  difference, or uniform weights.
+- Optional rank loss can enforce that `E_plus` predicts future environment
+  better than `E_minus`; it is disabled by default.
 
 Run a FPEM debug batch:
 
@@ -560,9 +592,21 @@ Or smoke-test the variant directly on the base config:
 python train.py --config configs/pems08_nuestg.py --debug_batch --set MODEL.method_variant=fpem
 ```
 
+Run the reproducible FPEM smoke workflow:
+
+```bash
+bash scripts/run_fpem_repro.sh
+```
+
+The script compiles source files, runs FPEM debug, optionally runs the base
+config with `MODEL.method_variant=fpem`, and then checks old NUE-STG debug
+compatibility. Set `RUN_TRAIN=1` to launch a real training run after smoke tests.
+
 Useful FPEM debug fields include `env_tokens`, `mask`, `env_plus`,
-`env_minus`, `env_fut`, `env_fut_pred`, `envpred_loss`, `future_mi_loss`,
-`mask_mean`, `mask_entropy`, `swap_weight_mean`, and FiLM gamma/beta stats.
+`env_minus`, `env_fut_tokens`, `pred_fut_mu`, `pred_fut_logvar`,
+`future_mi_loss`, `env_fut_nll`, `env_fut_kl`, `sep_loss`, `cross_cov_loss`,
+`club_upper_bound`, `hsic_loss`, `mask_mean`, `mask_entropy`,
+`swap_weight_mean`, timestamp embedding norms, and FiLM gamma/beta stats.
 
 ## Supported And Not Yet Supported
 

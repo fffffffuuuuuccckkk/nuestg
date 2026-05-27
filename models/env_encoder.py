@@ -130,20 +130,34 @@ class TimeNodeEnvironmentEncoder(nn.Module):
         logvar_max: float,
         reparameterize: bool,
         deterministic_eval: bool,
+        time_emb_dim: int = 0,
+        use_node_embedding: bool = False,
+        num_nodes: int = 1,
+        node_emb_dim: int = 0,
     ) -> None:
         super().__init__()
         self.input_len = int(input_len)
         self.input_dim = int(input_dim)
         self.env_dim = int(env_dim)
+        self.time_emb_dim = int(time_emb_dim)
+        self.use_node_embedding = bool(use_node_embedding) and int(node_emb_dim) > 0
         self.use_neighbor = bool(use_neighbor)
         self.global_mode = bool(global_mode)
         self.logvar_min = float(logvar_min)
         self.logvar_max = float(logvar_max)
         self.reparameterize = bool(reparameterize)
         self.deterministic_eval = bool(deterministic_eval)
+        if self.use_node_embedding:
+            self.node_emb = nn.Parameter(torch.empty(int(num_nodes), int(node_emb_dim)))
+            nn.init.xavier_uniform_(self.node_emb)
+            node_dim = int(node_emb_dim)
+        else:
+            self.node_emb = None
+            node_dim = 0
 
+        token_in_dim = input_dim + 2 * self.time_emb_dim + node_dim
         self.token_encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(token_in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, env_dim),
@@ -176,16 +190,39 @@ class TimeNodeEnvironmentEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        seq_time_emb: Optional[torch.Tensor] = None,
+        cur_time_emb: Optional[torch.Tensor] = None,
         adj_norm: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = ensure_blnc(x, "x")
         batch_size, input_len, num_nodes, input_dim = x.shape
-        if input_len != self.input_len:
-            raise ValueError(f"expected input_len={self.input_len}, got {input_len}")
         if input_dim != self.input_dim:
             raise ValueError(f"expected input_dim={self.input_dim}, got {input_dim}")
 
-        h_self = self.token_encoder(x)
+        parts = [x]
+        if self.time_emb_dim > 0:
+            if seq_time_emb is None:
+                seq_time_emb = x.new_zeros(batch_size, input_len, self.time_emb_dim)
+            if cur_time_emb is None:
+                cur_time_emb = x.new_zeros(batch_size, self.time_emb_dim)
+            if tuple(seq_time_emb.shape) != (batch_size, input_len, self.time_emb_dim):
+                raise AssertionError(
+                    f"seq_time_emb must be {(batch_size, input_len, self.time_emb_dim)}, "
+                    f"got {tuple(seq_time_emb.shape)}"
+                )
+            if tuple(cur_time_emb.shape) != (batch_size, self.time_emb_dim):
+                raise AssertionError(
+                    f"cur_time_emb must be {(batch_size, self.time_emb_dim)}, got {tuple(cur_time_emb.shape)}"
+                )
+            parts.append(seq_time_emb.unsqueeze(2).expand(-1, -1, num_nodes, -1))
+            parts.append(cur_time_emb.unsqueeze(1).unsqueeze(2).expand(-1, input_len, num_nodes, -1))
+        if self.node_emb is not None:
+            if self.node_emb.shape[0] != num_nodes:
+                raise AssertionError(f"node_emb has {self.node_emb.shape[0]} nodes, got input num_nodes={num_nodes}")
+            parts.append(self.node_emb.to(x.device, x.dtype).view(1, 1, num_nodes, -1).expand(batch_size, input_len, -1, -1))
+
+        token_input = torch.cat(parts, dim=-1)
+        h_self = self.token_encoder(token_input)
         if self.global_mode:
             h_global = h_self.mean(dim=2, keepdim=True).expand(-1, -1, num_nodes, -1)
             env_mu = self.mu_global(h_global)

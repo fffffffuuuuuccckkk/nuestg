@@ -13,6 +13,7 @@ except Exception:  # pragma: no cover - fallback for unusual installs
     basicts_masked_mae = None
 
 from utils.tensor_ops import align_target, make_valid_mask, masked_abs_error, masked_mean
+from models.mi_estimators import CLUBEstimator
 
 
 @dataclass
@@ -37,6 +38,7 @@ class NUESTGLossConfig:
     swap_weight_mode: str = "sgain"
     swap_detach_inv: bool = True
     swap_detach_full: bool = True
+    swap_detach_env: bool = True
     use_kl: bool = True
     lambda_kl: float = 1e-4
     kl_warmup_epochs: int = 5
@@ -44,6 +46,12 @@ class NUESTGLossConfig:
     use_ind: bool = True
     lambda_ind: float = 1e-3
     ind_type: str = "cross_cov"
+    sep_mi_type: str = "cross_cov"
+    sep_use_full_env: bool = True
+    sep_proj_dim: int = 32
+    z_dim: int = 0
+    env_dim: int = 0
+    lambda_sep: Optional[float] = None
     use_sparse: bool = True
     lambda_sparse: float = 1e-3
     sparse_target: Optional[float] = None
@@ -66,11 +74,25 @@ class NUESTGLossConfig:
     envpred_loss_type: str = "mse"
     use_future_mi: bool = False
     lambda_future_mi: float = 0.0
+    future_mi_type: str = "ba_nll"
+    future_mi_detach_target: bool = True
+    future_mi_infonce_tau: float = 0.2
     future_mi_tau: float = 0.2
+    infonce_granularity: str = "token"
     use_rank: bool = False
     lambda_rank: float = 0.0
     rank_margin: float = 0.1
     use_mask_sparse: bool = False
+    lambda_mask_sparse: Optional[float] = None
+    use_club: bool = False
+    lambda_club: float = 1e-3
+    lambda_club_fit: float = 1.0
+    club_separate_update: bool = False
+    club_detach_pair: bool = True
+    club_negative_mode: str = "shuffle"
+    club_hidden_dim: int = 64
+    hsic_kernel: str = "rbf"
+    hsic_sample_size: int = 1024
 
 
 class NUESTGLoss(nn.Module):
@@ -112,6 +134,18 @@ class NUESTGLoss(nn.Module):
         "persistence_mi_loss",
         "envpred_loss",
         "future_mi_loss",
+        "future_mi_type",
+        "env_fut_nll",
+        "env_fut_kl",
+        "pred_fut_logvar_mean",
+        "pred_fut_mu_norm",
+        "future_mi_valid",
+        "sep_loss",
+        "sep_mi_type",
+        "club_upper_bound",
+        "club_fit_nll",
+        "cross_cov_loss",
+        "hsic_loss",
         "rank_loss",
         "mask_sparse_loss",
         "effective_lambda_persistence_mi",
@@ -165,6 +199,10 @@ class NUESTGLoss(nn.Module):
         "env_fut_pred_norm",
         "fusion_gamma_abs_mean",
         "fusion_beta_abs_mean",
+        "timestamp_valid",
+        "cur_time_emb_norm",
+        "seq_time_emb_norm",
+        "future_time_emb_norm",
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -177,6 +215,21 @@ class NUESTGLoss(nn.Module):
             )
         self.epoch = 0
         self.latest_log_dict: Dict[str, float] = {}
+        self.sep_z_proj = (
+            nn.Linear(self.cfg.z_dim, self.cfg.sep_proj_dim, bias=False)
+            if self.cfg.z_dim > 0 and self.cfg.sep_proj_dim > 0
+            else None
+        )
+        self.sep_e_proj = (
+            nn.Linear(self.cfg.env_dim, self.cfg.sep_proj_dim, bias=False)
+            if self.cfg.env_dim > 0 and self.cfg.sep_proj_dim > 0
+            else None
+        )
+        self.club_estimator = (
+            CLUBEstimator(self.cfg.env_dim, self.cfg.z_dim, hidden_dim=self.cfg.club_hidden_dim)
+            if self.cfg.env_dim > 0 and self.cfg.z_dim > 0
+            else None
+        )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -323,26 +376,204 @@ class NUESTGLoss(nn.Module):
                 logs[key] = like.new_tensor(float(value))
         return logs
 
-    def _future_mi_loss(
+    @staticmethod
+    def _diag_gaussian_nll(target: torch.Tensor, pred_mu: torch.Tensor, pred_logvar: torch.Tensor) -> torch.Tensor:
+        return 0.5 * ((target - pred_mu).pow(2) * torch.exp(-pred_logvar) + pred_logvar)
+
+    @staticmethod
+    def _diag_gaussian_kl(
+        true_mu: torch.Tensor,
+        true_logvar: torch.Tensor,
+        pred_mu: torch.Tensor,
+        pred_logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        true_var = true_logvar.exp()
+        pred_var = pred_logvar.exp().clamp_min(1e-8)
+        return 0.5 * (
+            pred_logvar
+            - true_logvar
+            + (true_var + (true_mu - pred_mu).pow(2)) / pred_var
+            - 1.0
+        )
+
+    def _future_infonce(
         self,
-        env_plus: Optional[torch.Tensor],
-        env_fut: Optional[torch.Tensor],
+        output: Dict[str, torch.Tensor],
         like: torch.Tensor,
     ) -> torch.Tensor:
         zero = self._zero(like)
-        if env_plus is None or env_fut is None:
-            return zero
-        if env_plus.numel() == 0 or env_fut.numel() == 0:
-            return zero
-        q_flat = env_plus.reshape(-1, env_plus.shape[-1])
-        k_flat = env_fut.detach().reshape(-1, env_fut.shape[-1])
-        if q_flat.shape[0] <= 1 or k_flat.shape[0] <= 1:
+        granularity = str(self.cfg.infonce_granularity)
+        if granularity == "token":
+            q = output.get("env_plus_tokens")
+            k = output.get("env_fut_tokens")
+            if q is not None and k is not None and q.shape[:3] == k.shape[:3]:
+                q_flat = q.reshape(-1, q.shape[-1])
+                k_flat = k.detach().reshape(-1, k.shape[-1])
+            else:
+                q = output.get("env_plus")
+                k = output.get("env_fut")
+                if q is None or k is None:
+                    return zero
+                q_flat = q.reshape(-1, q.shape[-1])
+                k_flat = k.detach().reshape(-1, k.shape[-1])
+        else:
+            q = output.get("env_plus")
+            k = output.get("env_fut")
+            if q is None or k is None:
+                return zero
+            q_flat = q.reshape(-1, q.shape[-1])
+            k_flat = k.detach().reshape(-1, k.shape[-1])
+        if q_flat.shape[0] <= 1:
             return zero
         q_norm = F.normalize(q_flat, dim=-1)
         k_norm = F.normalize(k_flat, dim=-1)
-        logits = q_norm.matmul(k_norm.transpose(0, 1)) / max(float(self.cfg.future_mi_tau), 1e-6)
+        tau = max(float(self.cfg.future_mi_infonce_tau or self.cfg.future_mi_tau), 1e-6)
+        logits = q_norm.matmul(k_norm.transpose(0, 1)) / tau
         labels = torch.arange(q_flat.shape[0], device=q_flat.device)
         return F.cross_entropy(logits, labels)
+
+    def _future_mi_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = self._zero(like)
+        type_map = {"ba_nll": 1.0, "ba_kl": 2.0, "mse": 3.0, "infonce": 4.0}
+        mi_type = str(self.cfg.future_mi_type or "ba_nll")
+        pred_mu = output.get("pred_fut_mu")
+        pred_logvar = output.get("pred_fut_logvar")
+        env_fut_tokens = output.get("env_fut_tokens")
+        env_fut_mu = output.get("env_fut_mu_tokens")
+        env_fut_logvar = output.get("env_fut_logvar_tokens")
+        logs = {
+            "future_mi_type": like.new_tensor(type_map.get(mi_type, 0.0)),
+            "env_fut_nll": zero,
+            "env_fut_kl": zero,
+            "pred_fut_logvar_mean": zero,
+            "pred_fut_mu_norm": zero,
+            "future_mi_valid": zero,
+        }
+        valid_dist = pred_mu is not None and pred_logvar is not None and env_fut_tokens is not None
+        if pred_mu is not None:
+            logs["pred_fut_mu_norm"] = pred_mu.detach().norm(dim=-1).mean()
+        if pred_logvar is not None:
+            logs["pred_fut_logvar_mean"] = pred_logvar.detach().mean()
+
+        if mi_type == "infonce":
+            loss = self._future_infonce(output, like)
+            logs["future_mi_valid"] = like.new_tensor(float(loss.detach().abs().item() > 0.0))
+            return loss, logs
+        if not valid_dist:
+            return zero, logs
+
+        target_tokens = env_fut_tokens.detach() if self.cfg.future_mi_detach_target else env_fut_tokens
+        nll = self._diag_gaussian_nll(target_tokens, pred_mu, pred_logvar).mean()
+        logs["env_fut_nll"] = nll.detach()
+        logs["future_mi_valid"] = like.new_tensor(1.0)
+        if mi_type == "ba_nll":
+            return nll, logs
+        if mi_type == "ba_kl":
+            if env_fut_mu is None or env_fut_logvar is None:
+                return nll, logs
+            true_mu = env_fut_mu.detach() if self.cfg.future_mi_detach_target else env_fut_mu
+            true_logvar = env_fut_logvar.detach() if self.cfg.future_mi_detach_target else env_fut_logvar
+            kl = self._diag_gaussian_kl(true_mu, true_logvar, pred_mu, pred_logvar).mean()
+            logs["env_fut_kl"] = kl.detach()
+            return kl, logs
+        if mi_type == "mse":
+            target = env_fut_mu.detach() if (env_fut_mu is not None and self.cfg.future_mi_detach_target) else (
+                env_fut_mu if env_fut_mu is not None else target_tokens
+            )
+            return F.mse_loss(pred_mu, target), logs
+        raise ValueError(f"Unsupported LOSS.future_mi_type={self.cfg.future_mi_type!r}")
+
+    def _project_for_sep(self, z_inv: torch.Tensor, env_hist: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = z_inv.reshape(-1, z_inv.shape[-1])
+        e = env_hist.reshape(-1, env_hist.shape[-1])
+        if self.sep_z_proj is not None:
+            z = self.sep_z_proj(z)
+        if self.sep_e_proj is not None:
+            e = self.sep_e_proj(e)
+        return z, e
+
+    def _cross_cov_projected(self, z_inv: torch.Tensor, env_hist: torch.Tensor) -> torch.Tensor:
+        z, e = self._project_for_sep(z_inv, env_hist)
+        if z.shape[0] <= 1:
+            return z.new_zeros(())
+        z = (z - z.mean(dim=0, keepdim=True)) / z.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+        e = (e - e.mean(dim=0, keepdim=True)) / e.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+        cross_cov = e.transpose(0, 1).matmul(z) / max(z.shape[0] - 1, 1)
+        return cross_cov.pow(2).mean()
+
+    def _hsic_loss(self, z_inv: torch.Tensor, env_hist: torch.Tensor) -> torch.Tensor:
+        z, e = self._project_for_sep(z_inv, env_hist)
+        if z.shape[0] <= 1:
+            return z.new_zeros(())
+        sample_size = int(self.cfg.hsic_sample_size or 0)
+        if sample_size > 0 and z.shape[0] > sample_size:
+            idx = torch.randperm(z.shape[0], device=z.device)[:sample_size]
+            z = z[idx]
+            e = e[idx]
+        z = z - z.mean(dim=0, keepdim=True)
+        e = e - e.mean(dim=0, keepdim=True)
+        n = z.shape[0]
+        if str(self.cfg.hsic_kernel) == "linear":
+            kz = z.matmul(z.transpose(0, 1))
+            ke = e.matmul(e.transpose(0, 1))
+        else:
+            dz = torch.cdist(z, z).pow(2)
+            de = torch.cdist(e, e).pow(2)
+            sig_z = dz.detach().median().clamp_min(1e-6)
+            sig_e = de.detach().median().clamp_min(1e-6)
+            kz = torch.exp(-dz / (2.0 * sig_z))
+            ke = torch.exp(-de / (2.0 * sig_e))
+        h = torch.eye(n, device=z.device, dtype=z.dtype) - (1.0 / n)
+        return (h.matmul(kz).matmul(h) * h.matmul(ke).matmul(h)).sum() / max((n - 1) ** 2, 1)
+
+    def _sep_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = self._zero(like)
+        type_map = {"cross_cov": 1.0, "club": 2.0, "hsic": 3.0}
+        sep_type = str(self.cfg.sep_mi_type or self.cfg.ind_type or "cross_cov")
+        env_hist = output.get("env_hist_bar")
+        if env_hist is None:
+            env_hist = output.get("env_hist")
+        if env_hist is None:
+            env_hist = output.get("env")
+        z_inv = output.get("z_inv")
+        logs = {
+            "sep_mi_type": like.new_tensor(type_map.get(sep_type, 0.0)),
+            "club_upper_bound": zero,
+            "club_fit_nll": zero,
+            "cross_cov_loss": zero,
+            "hsic_loss": zero,
+        }
+        if env_hist is None or z_inv is None:
+            return zero, logs
+        cross_cov = self._cross_cov_projected(z_inv, env_hist)
+        logs["cross_cov_loss"] = cross_cov.detach()
+        if sep_type == "cross_cov":
+            return cross_cov, logs
+        if sep_type == "club":
+            if self.club_estimator is None:
+                return cross_cov, logs
+            club = self.club_estimator(
+                env_hist,
+                z_inv,
+                detach_pair=bool(self.cfg.club_detach_pair),
+                negative_mode=str(self.cfg.club_negative_mode),
+            )
+            logs["club_upper_bound"] = club["club_upper_bound"].detach()
+            logs["club_fit_nll"] = club["club_fit_nll"].detach()
+            return club["club_upper_bound"] + float(self.cfg.lambda_club_fit) * club["club_fit_nll"], logs
+        if sep_type == "hsic":
+            hsic = self._hsic_loss(z_inv, env_hist)
+            logs["hsic_loss"] = hsic.detach()
+            return hsic, logs
+        raise ValueError(f"Unsupported LOSS.sep_mi_type={self.cfg.sep_mi_type!r}")
 
     def _fpem_swap_weight(
         self,
@@ -386,20 +617,14 @@ class NUESTGLoss(nn.Module):
         full_elem, elem_mask = self._channel_mean_error(prediction, y_true, targets_mask)
 
         env_fut = output.get("env_fut")
-        env_fut_pred = output.get("env_fut_pred")
-        envpred_loss_raw = zero
-        if env_fut is not None and env_fut_pred is not None:
-            env_fut_target = env_fut.detach()
-            if self.cfg.envpred_loss_type == "mse":
-                envpred_loss_raw = F.mse_loss(env_fut_pred, env_fut_target)
-            elif self.cfg.envpred_loss_type == "cosine":
-                envpred_loss_raw = 1.0 - F.cosine_similarity(env_fut_pred, env_fut_target, dim=-1).mean()
-            else:
-                raise ValueError(f"Unsupported envpred_loss_type={self.cfg.envpred_loss_type!r}")
-
-        future_mi_loss_raw = self._future_mi_loss(output.get("env_plus"), env_fut, prediction)
-        env_hist = output.get("env_hist", output.get("env"))
-        ind_loss_raw = self._independence_loss(output["z_inv"], env_hist) if env_hist is not None else zero
+        pred_fut_mu = output.get("pred_fut_mu")
+        pred_fut_logvar = output.get("pred_fut_logvar")
+        future_mi_loss_raw, future_mi_logs = self._future_mi_terms(output, prediction)
+        envpred_loss_raw = future_mi_logs["env_fut_nll"]
+        sep_loss_raw, sep_logs = self._sep_terms(output, prediction)
+        env_hist = output.get("env_hist_bar")
+        if env_hist is None:
+            env_hist = output.get("env_hist", output.get("env"))
         env_mu = output["env_mu"]
         env_logvar = output["env_logvar"]
         kl_loss_raw = self._kl_loss(env_mu, env_logvar)
@@ -447,12 +672,20 @@ class NUESTGLoss(nn.Module):
             swap_delta_mean = masked_mean((swap_elem - full_elem).detach(), elem_mask)
 
         rank_loss_raw = zero
-        env_fut_pred_minus = output.get("env_fut_pred_minus")
-        if env_fut is not None and env_fut_pred is not None and env_fut_pred_minus is not None:
-            env_fut_target = env_fut.detach()
-            s_plus = F.cosine_similarity(env_fut_pred, env_fut_target, dim=-1)
-            s_minus = F.cosine_similarity(env_fut_pred_minus, env_fut_target, dim=-1)
-            rank_loss_raw = F.relu(float(self.cfg.rank_margin) - s_plus + s_minus).mean()
+        pred_fut_mu_minus = output.get("pred_fut_mu_minus")
+        pred_fut_logvar_minus = output.get("pred_fut_logvar_minus")
+        env_fut_tokens = output.get("env_fut_tokens")
+        if (
+            env_fut_tokens is not None
+            and pred_fut_mu is not None
+            and pred_fut_logvar is not None
+            and pred_fut_mu_minus is not None
+            and pred_fut_logvar_minus is not None
+        ):
+            target = env_fut_tokens.detach()
+            nll_plus = self._diag_gaussian_nll(target, pred_fut_mu, pred_fut_logvar).mean(dim=-1)
+            nll_minus = self._diag_gaussian_nll(target, pred_fut_mu_minus, pred_fut_logvar_minus).mean(dim=-1)
+            rank_loss_raw = F.relu(float(self.cfg.rank_margin) + nll_plus - nll_minus).mean()
 
         pred_loss = pred_loss_raw
         inv_loss = inv_loss_raw if self.cfg.use_inv and self.cfg.lambda_inv != 0 else zero
@@ -460,10 +693,12 @@ class NUESTGLoss(nn.Module):
         future_mi_loss = future_mi_loss_raw if self.cfg.use_future_mi and self.cfg.lambda_future_mi != 0 else zero
         rank_loss = rank_loss_raw if self.cfg.use_rank and self.cfg.lambda_rank != 0 else zero
         sparse_enabled = self.cfg.use_mask_sparse or self.cfg.use_sparse
-        sparse_loss = sparse_loss_raw if sparse_enabled and self.cfg.lambda_sparse != 0 else zero
+        lambda_mask_sparse = self.cfg.lambda_sparse if self.cfg.lambda_mask_sparse is None else self.cfg.lambda_mask_sparse
+        sparse_loss = sparse_loss_raw if sparse_enabled and lambda_mask_sparse != 0 else zero
         effective_lambda_kl = self._effective_lambda_kl()
         kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
-        ind_loss = ind_loss_raw if self.cfg.use_ind and self.cfg.lambda_ind != 0 else zero
+        sep_lambda = self.cfg.lambda_ind if self.cfg.lambda_sep is None else self.cfg.lambda_sep
+        ind_loss = sep_loss_raw if self.cfg.use_ind and sep_lambda != 0 else zero
         swap_loss = swap_loss_raw if has_swap else zero
         swap_diff_loss = swap_diff_loss_raw if has_swap else zero
 
@@ -472,8 +707,8 @@ class NUESTGLoss(nn.Module):
             + self.cfg.lambda_inv * inv_loss
             + self.cfg.lambda_envpred * envpred_loss
             + self.cfg.lambda_future_mi * future_mi_loss
-            + self.cfg.lambda_ind * ind_loss
-            + self.cfg.lambda_sparse * sparse_loss
+            + sep_lambda * ind_loss
+            + lambda_mask_sparse * sparse_loss
             + self.cfg.lambda_swap * swap_loss
             + effective_lambda_kl * kl_loss
             + self.cfg.lambda_rank * rank_loss
@@ -495,6 +730,7 @@ class NUESTGLoss(nn.Module):
             "kl_loss": kl_loss.detach(),
             "effective_lambda_kl": prediction.new_tensor(effective_lambda_kl),
             "ind_loss": ind_loss.detach(),
+            "sep_loss": ind_loss.detach(),
             "sparse_loss": sparse_loss.detach(),
             "mask_sparse_loss": sparse_loss.detach(),
             "entropy_loss": zero,
@@ -538,10 +774,26 @@ class NUESTGLoss(nn.Module):
             "env_minus_norm": env_minus.detach().norm(dim=-1).mean() if env_minus is not None else zero,
             "env_hist_norm": env_hist.detach().norm(dim=-1).mean() if env_hist is not None else zero,
             "env_fut_norm": env_fut.detach().norm(dim=-1).mean() if env_fut is not None else zero,
-            "env_fut_pred_norm": env_fut_pred.detach().norm(dim=-1).mean() if env_fut_pred is not None else zero,
+            "env_fut_pred_norm": pred_fut_mu.detach().norm(dim=-1).mean() if pred_fut_mu is not None else zero,
+            "pred_fut_mu_norm": pred_fut_mu.detach().norm(dim=-1).mean() if pred_fut_mu is not None else zero,
             "fusion_gamma_abs_mean": fusion_gamma.detach().abs().mean() if fusion_gamma is not None else zero,
             "fusion_beta_abs_mean": fusion_beta.detach().abs().mean() if fusion_beta is not None else zero,
+            "timestamp_valid": prediction.new_tensor(float(bool(output.get("timestamp_valid", False)))),
+            "cur_time_emb_norm": (
+                output["cur_time_emb"].detach().norm(dim=-1).mean()
+                if output.get("cur_time_emb") is not None else zero
+            ),
+            "seq_time_emb_norm": (
+                output["seq_time_emb"].detach().norm(dim=-1).mean()
+                if output.get("seq_time_emb") is not None else zero
+            ),
+            "future_time_emb_norm": (
+                output["future_time_emb"].detach().norm(dim=-1).mean()
+                if output.get("future_time_emb") is not None else zero
+            ),
         }
+        logs.update({key: value.detach() for key, value in future_mi_logs.items()})
+        logs.update({key: value.detach() for key, value in sep_logs.items()})
         logs.update(self._separation_logs(output, prediction))
         self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
         return total_loss, logs

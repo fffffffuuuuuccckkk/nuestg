@@ -50,6 +50,18 @@ LOG_KEYS = [
     "persistence_mi_loss",
     "envpred_loss",
     "future_mi_loss",
+    "future_mi_type",
+    "env_fut_nll",
+    "env_fut_kl",
+    "pred_fut_logvar_mean",
+    "pred_fut_mu_norm",
+    "future_mi_valid",
+    "sep_loss",
+    "sep_mi_type",
+    "club_upper_bound",
+    "club_fit_nll",
+    "cross_cov_loss",
+    "hsic_loss",
     "rank_loss",
     "mask_sparse_loss",
     "effective_lambda_persistence_mi",
@@ -103,6 +115,10 @@ LOG_KEYS = [
     "env_fut_pred_norm",
     "fusion_gamma_abs_mean",
     "fusion_beta_abs_mean",
+    "timestamp_valid",
+    "cur_time_emb_norm",
+    "seq_time_emb_norm",
+    "future_time_emb_norm",
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae", "val_rmse", "val_mape"]
 
@@ -227,6 +243,8 @@ def finalize_config(cfg: Dict) -> Dict:
     model_cfg["swap"] = cfg.get("SWAP", {})
     model_cfg["swap_detach_inv"] = cfg.get("LOSS", {}).get("swap_detach_inv", True)
     cfg["LOSS"]["null_val"] = ds_cfg.get("null_val", cfg["LOSS"].get("null_val"))
+    cfg["LOSS"]["z_dim"] = representation_dim
+    cfg["LOSS"]["env_dim"] = int(model_cfg.get("env_dim", 32))
     return cfg
 
 
@@ -326,6 +344,23 @@ def to_device_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dic
     return out
 
 
+def get_time_kwargs(batch: Dict[str, torch.Tensor], cfg: Dict, include_future: bool) -> Dict[str, torch.Tensor]:
+    ds_cfg = cfg["DATASET"]
+    seq_key = ds_cfg.get("input_timestamp_key", "inputs_timestamps")
+    future_key = ds_cfg.get("target_timestamp_key", "targets_timestamps")
+    cur_key = ds_cfg.get("current_timestamp_key", "current_timestamps")
+    seq_time = batch.get(seq_key)
+    cur_time = batch.get(cur_key)
+    if cur_time is None and isinstance(seq_time, torch.Tensor) and seq_time.dim() == 3:
+        cur_time = seq_time[:, -1]
+    out = {"seq_time": seq_time, "cur_time": cur_time}
+    if include_future:
+        out["future_time"] = batch.get(future_key)
+    else:
+        out["future_time"] = None
+    return out
+
+
 def build_model_and_loss(cfg: Dict, device: torch.device) -> Tuple[NUESTG, NUESTGLoss]:
     model = NUESTG(NUESTGConfig(**cfg["MODEL"])).to(device)
     loss_fn = NUESTGLoss(**cfg["LOSS"]).to(device)
@@ -367,8 +402,12 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             "env_mu": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_logvar": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_tokens": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_hist_tokens": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_hist_mu_tokens": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_hist_logvar_tokens": (batch_size, input_len, num_nodes, cfg["MODEL"]["env_dim"]),
             "env": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_hist": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
+            "env_hist_bar": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_raw": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_plus": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
             "env_minus": (batch_size, num_nodes, cfg["MODEL"]["env_dim"]),
@@ -383,12 +422,18 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             assert_finite(value, key)
         for key in [
             "env_fut",
-            "env_fut_pred",
-            "env_fut_pred_minus",
+            "env_fut_tokens",
+            "env_fut_mu_tokens",
+            "env_fut_logvar_tokens",
+            "pred_fut_mu",
+            "pred_fut_logvar",
             "prediction_swap",
             "env_perm",
             "fusion_gamma",
             "fusion_beta",
+            "seq_time_emb",
+            "cur_time_emb",
+            "future_time_emb",
         ]:
             value = output.get(key)
             if value is None:
@@ -480,6 +525,14 @@ def debug_batch(cfg: Dict) -> None:
     print(f"{target_key}_scaled: {tuple(batch[target_key].shape)}")
     print(f"{input_key}: {tuple(batch[input_key].shape)}")
     print(f"{target_key}: {tuple(batch[target_key].shape)}")
+    print(f"batch_keys: {sorted(batch.keys())}")
+    for time_key in [
+        cfg["DATASET"].get("input_timestamp_key", "inputs_timestamps"),
+        cfg["DATASET"].get("target_timestamp_key", "targets_timestamps"),
+        cfg["DATASET"].get("current_timestamp_key", "current_timestamps"),
+    ]:
+        value = batch.get(time_key)
+        print(f"{time_key}: {tuple(value.shape) if isinstance(value, torch.Tensor) else None}")
     print(
         f"{input_key}_raw_mean={raw_batch[input_key].float().mean().item():.6f} "
         f"{input_key}_scaled_mean={batch[input_key].float().mean().item():.6f}"
@@ -491,7 +544,11 @@ def debug_batch(cfg: Dict) -> None:
     print(f"inputs_after_align: {tuple(batch[input_key].shape)}")
     print(f"targets_before_align: {tuple(batch[target_key].shape)}")
 
-    output = model(batch[input_key], y_true=batch[target_key])
+    output = model(
+        batch[input_key],
+        y_true=batch[target_key],
+        **get_time_kwargs(batch, cfg, include_future=True),
+    )
     check_output_shapes(output, batch[target_key], cfg)
     loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
     loss.backward()
@@ -527,7 +584,10 @@ def evaluate(
             break
         raw_batch = to_device_batch(batch, device)
         batch = preprocess_batch(raw_batch, cfg, data_scaler)
-        output = model(batch[input_key])
+        output = model(
+            batch[input_key],
+            **get_time_kwargs(batch, cfg, include_future=False),
+        )
         prediction = data_scaler.inverse_transform(output["prediction"])
         targets = raw_batch[target_key]
         values["mae"].append(float(masked_mae_value(prediction, targets, null_val).detach().cpu()))
@@ -626,7 +686,11 @@ def train_local(cfg: Dict) -> None:
             batch = preprocess_batch(raw_batch, cfg, data_scaler)
             optimizer.zero_grad(set_to_none=True)
             with autocast_ctx():
-                output = model(batch[input_key], y_true=batch[target_key])
+                output = model(
+                    batch[input_key],
+                    y_true=batch[target_key],
+                    **get_time_kwargs(batch, cfg, include_future=True),
+                )
                 loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
             scaler.scale(loss).backward()
             grad_clip = train_cfg.get("grad_clip")
