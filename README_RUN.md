@@ -67,11 +67,71 @@ Configs assume datasets are already prepared in BasicTS forecasting format:
 /data/OuXiaoyu/mystg/datasets/PEMS08
 /data/OuXiaoyu/mystg/datasets/METR-LA
 /data/OuXiaoyu/mystg/datasets/SD
+/data/OuXiaoyu/mystg/datasets/NewBike_Chicago
+/data/OuXiaoyu/mystg/datasets/Taxi_Chicago
+/data/OuXiaoyu/mystg/datasets/Speed_NYC
 ```
 
 Each dataset directory should contain `train_data.npy`, `val_data.npy`,
 `test_data.npy`, optional timestamp arrays, `meta.json`, and optionally
 `adj_mx.pkl`.
+
+### ST-OOD Dataset Conversion
+
+The local ST-OOD repository is expected at:
+
+```text
+/data/OuXiaoyu/mystg/datasets/ST-OOD
+```
+
+Convert the runnable ST-OOD datasets into this project's BasicTS split format:
+
+```bash
+cd /data/OuXiaoyu/mystg/nue_stg_project
+/data/OuXiaoyu/miniconda3/envs/basicts/bin/python scripts/prepare_stood_datasets.py \
+  --datasets newbike_chicago taxi_chicago speed_nyc
+```
+
+The converter writes:
+
+```text
+/data/OuXiaoyu/mystg/datasets/NewBike_Chicago
+/data/OuXiaoyu/mystg/datasets/Taxi_Chicago
+/data/OuXiaoyu/mystg/datasets/Speed_NYC
+```
+
+For each dataset, ST-OOD `his.npz` stores a normalized target channel plus
+`time_of_day` and `day_of_week` channels. The converter restores the target to
+raw scale using the official `mean/std`, saves `[T,N]` raw data, and saves
+timestamps as `[T,2]`. The NUE-STG local runner then fits its own z-score scaler
+on `train_data.npy`, matching the preprocessing used by the other datasets in
+this project.
+
+Official ST-OOD splits are preserved with the original idx files:
+
+- `train`: official in-distribution training idx.
+- `val`: official in-distribution validation idx.
+- `test`: official in-distribution test idx.
+- `shift`: official following-year OOD idx.
+
+Because BasicTS consumes contiguous split arrays, each output split stores the
+minimal contiguous time window from `idx[0] - input_len + 1` through
+`idx[-1] + output_len`. This makes BasicTS sample `0` match the first official
+ST-OOD sample exactly.
+
+Run all three ST-OOD debug batches:
+
+```bash
+bash scripts/run_stood_debug.sh
+```
+
+Individual configs:
+
+```bash
+python train.py --config configs/newbike_chicago_nuestg.py --debug_batch
+python train.py --config configs/taxi_chicago_nuestg.py --debug_batch
+python train.py --config configs/speed_nyc_nuestg.py --debug_batch
+```
 
 ## Debug Batch
 

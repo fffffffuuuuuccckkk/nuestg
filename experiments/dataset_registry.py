@@ -21,6 +21,33 @@ DATASET_REGISTRY: Dict[str, Dict] = {
         "setting": "traffic_forecasting",
         "notes": "Config scaffold is provided; runnability depends on local dataset availability.",
     },
+    "newbike_chicago": {
+        "name": "NewBike_Chicago",
+        "default_config": "configs/newbike_chicago_nuestg.py",
+        "input_len": 12,
+        "output_len": 12,
+        "num_nodes": 609,
+        "setting": "st_ood_bike_demand",
+        "notes": "Converted from ST-OOD NewBike_Chicago/2019 with official train/val/test/shift idx arrays.",
+    },
+    "taxi_chicago": {
+        "name": "Taxi_Chicago",
+        "default_config": "configs/taxi_chicago_nuestg.py",
+        "input_len": 12,
+        "output_len": 12,
+        "num_nodes": 77,
+        "setting": "st_ood_ride_hailing",
+        "notes": "Converted from ST-OOD Taxi_Chicago/2013 with official train/val/test/shift idx arrays.",
+    },
+    "speed_nyc": {
+        "name": "Speed_NYC",
+        "default_config": "configs/speed_nyc_nuestg.py",
+        "input_len": 12,
+        "output_len": 12,
+        "num_nodes": 139,
+        "setting": "st_ood_traffic_speed",
+        "notes": "Converted from ST-OOD Speed_NYC/2019 with official train/val/test/shift idx arrays.",
+    },
 }
 
 
