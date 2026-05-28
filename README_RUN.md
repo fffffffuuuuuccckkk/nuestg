@@ -213,6 +213,47 @@ batch statistics. Training losses in `train_log.csv` are normalized-unit losses;
 validation metrics, `best_metrics.json`, and `last_metrics.json` are original
 data-scale metrics.
 
+### PEMS Training Tricks
+
+The local runner includes the common PEMS traffic-forecasting details used by
+Graph WaveNet / AGCRN-style experiments:
+
+- Missing values are controlled by `DATASET.null_val` and mirrored to
+  `LOSS.null_val`. For PEMS ablations, use `--set DATASET.null_val=0.0`.
+- `LOSS.train_loss_scale=normalized` keeps the default normalized-space
+  training loss. `LOSS.train_loss_scale=original` inverse-transforms only the
+  main forecast paths (`prediction`, `y_inv`, `y_potential`, swap forecasts)
+  before masked MAE, while latent losses such as MI, separation, KL, mask
+  sparsity, and swap weights stay in latent/normalized space.
+- `TRAIN.lr_scheduler` supports `none`, `multistep`, `cosine`, and `plateau`.
+  Plateau scheduling monitors validation MAE; multistep uses
+  `TRAIN.lr_milestones` and `TRAIN.lr_gamma`.
+- `TRAIN.val_batches=None` or `-1` runs full validation for best-checkpoint
+  selection. Use a small integer only for quick debugging.
+- `TRAIN.drop_last_train=True` is enabled by default; validation and test keep
+  incomplete final batches.
+- If `DATASET.use_timestamps=True` and timestamp arrays are missing, the local
+  runner can generate `[time_of_day, day_of_week]` files from
+  `DATASET.frequency_minutes` and optional `start_time` metadata. PEMS defaults
+  to 5-minute intervals (`num_time_in_day=288`).
+- GraphWaveNet-style backbones default to
+  `MODEL.backbone.graph_wavenet.adjtype=doubletransition`, producing forward
+  and reverse random-walk supports from the static adjacency.
+- Auxiliary losses can be linearly warmed up with
+  `future_mi_warmup_epochs`, `swap_warmup_epochs`, `sep_warmup_epochs`, and
+  `mask_sparse_warmup_epochs`, so the first epochs can focus on main + inv
+  forecasting losses.
+- Evaluation logs and metrics JSON include horizon-wise MAE/RMSE/MAPE for
+  horizons 3, 6, 12 plus average over the first 12 horizons.
+
+Example PEMS commands:
+
+```bash
+python train.py --config configs/pems08_nuestg.py --set DATASET.null_val=0.0
+python train.py --config configs/pems08_nuestg.py --set LOSS.train_loss_scale=original
+python train.py --config configs/pems08_nuestg.py --set TRAIN.lr_scheduler=multistep
+```
+
 ## Override Parameters
 
 Use `--set KEY.SUBKEY=value` to override config values at runtime:

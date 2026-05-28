@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pickle
 import warnings
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -223,6 +224,89 @@ def masked_mape_value(
     return masked_mean(ape, mask)
 
 
+def generate_tod_dow_timestamps(
+    num_steps: int,
+    frequency_minutes: int,
+    start_time: str = "2000-01-03T00:00:00",
+) -> np.ndarray:
+    """Generate BasicTS-style [time_of_day, day_of_week] features.
+
+    Values are normalized to [0, 1): time_of_day is minute-of-day / 1440 and
+    day_of_week is Python weekday / 7. The default start date is a Monday.
+    """
+    start = datetime.fromisoformat(start_time)
+    freq = int(frequency_minutes)
+    timestamps = np.zeros((int(num_steps), 2), dtype=np.float32)
+    for step in range(int(num_steps)):
+        current = start + timedelta(minutes=freq * step)
+        timestamps[step, 0] = (current.hour * 60 + current.minute) / 1440.0
+        timestamps[step, 1] = current.weekday() / 7.0
+    return timestamps
+
+
+def maybe_generate_timestamp_file(
+    data_file_path: str | Path,
+    split: str,
+    dataset_cfg: Dict,
+) -> bool:
+    """Create missing BasicTS timestamp files from frequency/start metadata.
+
+    The function is intentionally local-runner scoped: it never edits BasicTS
+    package code. If timestamps already exist, no work is done.
+    """
+    if not dataset_cfg.get("use_timestamps", False):
+        return False
+    data_dir = Path(data_file_path)
+    timestamp_path = data_dir / f"{split}_timestamps.npy"
+    if timestamp_path.exists():
+        return False
+    if not dataset_cfg.get("auto_generate_timestamps", True):
+        return False
+    data_path = data_dir / f"{split}_data.npy"
+    if not data_path.exists():
+        return False
+
+    meta = {}
+    meta_path = data_dir / "meta.json"
+    if meta_path.exists():
+        try:
+            import json
+
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception as exc:  # pragma: no cover - metadata is optional
+            warnings.warn(f"Failed to read {meta_path}: {exc}; falling back to config metadata.", RuntimeWarning)
+
+    freq = (
+        dataset_cfg.get("frequency_minutes")
+        or dataset_cfg.get("freq_minutes")
+        or meta.get("frequency_minutes")
+        or meta.get("frequency (minutes)")
+        or meta.get("freq_minutes")
+        or 5
+    )
+    start_times = dataset_cfg.get("timestamp_start_times") or meta.get("timestamp_start_times") or {}
+    split_meta = (meta.get("splits") or {}).get(split, {}) if isinstance(meta.get("splits"), dict) else {}
+    start_time = (
+        start_times.get(split)
+        or split_meta.get("start_time")
+        or dataset_cfg.get("start_time")
+        or meta.get("start_time")
+    )
+    if start_time is None:
+        start_time = "2000-01-03T00:00:00"
+        warnings.warn(
+            f"{timestamp_path} is missing and no start_time metadata was found; "
+            f"generating relative timestamps from {start_time}.",
+            RuntimeWarning,
+        )
+
+    data = np.load(data_path, mmap_mode="r")
+    timestamps = generate_tod_dow_timestamps(data.shape[0], int(freq), str(start_time))
+    np.save(timestamp_path, timestamps)
+    return True
+
+
 def normalize_adjacency(adj: np.ndarray, adj_norm: str) -> np.ndarray:
     adj_norm = (adj_norm or "none").lower()
     if adj_norm == "none":
@@ -235,6 +319,67 @@ def normalize_adjacency(adj: np.ndarray, adj_norm: str) -> np.ndarray:
         degree_inv_sqrt = np.power(np.maximum(degree, 1e-6), -0.5)
         return (degree_inv_sqrt[:, None] * adj * degree_inv_sqrt[None, :]).astype(np.float32)
     raise ValueError(f"Unsupported adj_norm={adj_norm!r}; expected one of none,row,sym")
+
+
+def random_walk_matrix(adj: np.ndarray) -> np.ndarray:
+    row_sum = adj.sum(axis=-1, keepdims=True)
+    return (adj / np.maximum(row_sum, 1e-6)).astype(np.float32)
+
+
+def load_graph_supports(
+    adj_path: Optional[str],
+    num_nodes: int,
+    adjtype: str = "doubletransition",
+    add_self_loop: bool = False,
+) -> Optional[torch.Tensor]:
+    """Load Graph WaveNet static supports.
+
+    `doubletransition` returns forward and reverse random-walk matrices,
+    matching the common Graph WaveNet preprocessing trick.
+    """
+    if not adj_path:
+        return None
+    path = Path(adj_path)
+    if not path.exists():
+        warnings.warn(f"Adjacency file not found at {path}; GraphWaveNet static supports disabled.", RuntimeWarning)
+        return None
+    try:
+        if path.suffix == ".npy":
+            adj = np.load(path)
+        else:
+            with path.open("rb") as f:
+                adj = pickle.load(f)
+            if isinstance(adj, (list, tuple)):
+                candidates = [x for x in adj if hasattr(x, "shape") and len(x.shape) == 2]
+                adj = candidates[-1] if candidates else adj[0]
+        adj = np.asarray(adj, dtype=np.float32)
+        if adj.shape != (num_nodes, num_nodes):
+            warnings.warn(
+                f"Adjacency shape from {path} is {adj.shape}, expected {(num_nodes, num_nodes)}; "
+                "GraphWaveNet static supports disabled.",
+                RuntimeWarning,
+            )
+            return None
+        if add_self_loop:
+            adj = adj + np.eye(num_nodes, dtype=np.float32)
+        adjtype = str(adjtype or "doubletransition").lower()
+        if adjtype in {"doubletransition", "dual_random_walk", "double_transition"}:
+            supports = [random_walk_matrix(adj), random_walk_matrix(adj.T)]
+        elif adjtype in {"transition", "random_walk", "row"}:
+            supports = [random_walk_matrix(adj)]
+        elif adjtype in {"sym", "symadj", "symmetric"}:
+            supports = [normalize_adjacency(adj, "sym")]
+        elif adjtype in {"identity", "none"}:
+            supports = [np.eye(num_nodes, dtype=np.float32)]
+        else:
+            raise ValueError(
+                f"Unsupported GraphWaveNet adjtype={adjtype!r}; "
+                "expected doubletransition, transition, sym, identity, or none."
+            )
+        return torch.from_numpy(np.stack(supports, axis=0).astype(np.float32))
+    except Exception as exc:
+        warnings.warn(f"Failed to load GraphWaveNet supports from {path}: {exc}", RuntimeWarning)
+        return None
 
 
 def load_adjacency(

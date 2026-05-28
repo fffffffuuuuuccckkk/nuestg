@@ -21,6 +21,7 @@ class NUESTGLossConfig:
     loss_type: str = "mae"
     use_masked_mae: bool = True
     null_val: Optional[float] = None
+    train_loss_scale: str = "normalized"
     lambda_pred: float = 1.0
     use_inv: bool = True
     lambda_inv: float = 0.2
@@ -32,6 +33,7 @@ class NUESTGLossConfig:
     gate_bce_pos_weight: Optional[float] = None
     use_swap: bool = True
     lambda_swap: float = 0.1
+    swap_warmup_epochs: int = 0
     lambda_swap_diff: float = 1.0
     lambda_swap_same: float = 0.05
     swap_margin: float = 0.01
@@ -45,6 +47,7 @@ class NUESTGLossConfig:
     kl_free_bits: float = 0.0
     use_ind: bool = True
     lambda_ind: float = 1e-3
+    sep_warmup_epochs: int = 0
     ind_type: str = "cross_cov"
     sep_mi_type: str = "cross_cov"
     sep_use_full_env: bool = True
@@ -74,6 +77,7 @@ class NUESTGLossConfig:
     envpred_loss_type: str = "mse"
     use_future_mi: bool = False
     lambda_future_mi: float = 0.0
+    future_mi_warmup_epochs: int = 0
     future_mi_type: str = "ba_nll"
     future_mi_detach_target: bool = True
     future_mi_infonce_tau: float = 0.2
@@ -84,6 +88,7 @@ class NUESTGLossConfig:
     rank_margin: float = 0.1
     use_mask_sparse: bool = False
     lambda_mask_sparse: Optional[float] = None
+    mask_sparse_warmup_epochs: int = 0
     use_club: bool = False
     lambda_club: float = 1e-3
     lambda_club_fit: float = 1.0
@@ -126,6 +131,11 @@ class NUESTGLoss(nn.Module):
         "swap_same_loss",
         "kl_loss",
         "effective_lambda_kl",
+        "effective_lambda_envpred",
+        "effective_lambda_future_mi",
+        "effective_lambda_swap",
+        "effective_lambda_sep",
+        "effective_lambda_mask_sparse",
         "ind_loss",
         "sparse_loss",
         "entropy_loss",
@@ -237,6 +247,25 @@ class NUESTGLoss(nn.Module):
     def _zero(self, like: torch.Tensor) -> torch.Tensor:
         return like.new_zeros(())
 
+    def _forecast_pair(
+        self,
+        prediction: torch.Tensor,
+        y_true: torch.Tensor,
+        raw_y_true: Optional[torch.Tensor] = None,
+        data_scaler=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        scale = str(self.cfg.train_loss_scale or "normalized").lower()
+        if scale == "normalized":
+            return prediction, y_true
+        if scale != "original":
+            raise ValueError("LOSS.train_loss_scale must be 'normalized' or 'original'")
+        if raw_y_true is None or data_scaler is None:
+            raise ValueError(
+                "LOSS.train_loss_scale='original' requires raw_y_true and data_scaler "
+                "to be passed from the training loop."
+            )
+        return data_scaler.inverse_transform(prediction), raw_y_true
+
     def _mae_loss(
         self,
         prediction: torch.Tensor,
@@ -245,7 +274,8 @@ class NUESTGLoss(nn.Module):
     ) -> torch.Tensor:
         if self.cfg.loss_type != "mae":
             raise ValueError(f"Only loss_type='mae' is implemented, got {self.cfg.loss_type!r}")
-        abs_error, mask = masked_abs_error(prediction, targets, self.cfg.null_val, targets_mask)
+        null_val = None if targets_mask is not None else self.cfg.null_val
+        abs_error, mask = masked_abs_error(prediction, targets, null_val, targets_mask)
         return masked_mean(abs_error, mask if self.cfg.use_masked_mae else None)
 
     def _channel_mean_error(
@@ -255,7 +285,8 @@ class NUESTGLoss(nn.Module):
         targets_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         targets = align_target(targets, prediction)
-        mask = make_valid_mask(targets, self.cfg.null_val, targets_mask)
+        null_val = None if targets_mask is not None else self.cfg.null_val
+        mask = make_valid_mask(targets, null_val, targets_mask)
         abs_error = (prediction - torch.nan_to_num(targets, nan=0.0)).abs()
         if not self.cfg.use_masked_mae:
             return abs_error.mean(dim=-1, keepdim=True), torch.ones_like(abs_error[..., :1], dtype=torch.bool)
@@ -305,6 +336,17 @@ class NUESTGLoss(nn.Module):
         if warmup <= 0:
             return float(self.cfg.lambda_persistence_mi)
         return float(self.cfg.lambda_persistence_mi) * min(1.0, max(self.epoch, 0) / warmup)
+
+    def _warmup_factor(self, warmup_epochs: int) -> float:
+        warmup = int(warmup_epochs or 0)
+        if warmup <= 0:
+            return 1.0
+        return min(1.0, max(self.epoch - 1, 0) / warmup)
+
+    def _effective_aux_lambda(self, enabled: bool, value: float, warmup_epochs: int) -> float:
+        if not enabled or value == 0:
+            return 0.0
+        return float(value) * self._warmup_factor(warmup_epochs)
 
     def _persistence_terms(
         self,
@@ -609,14 +651,18 @@ class NUESTGLoss(nn.Module):
         output: Dict[str, torch.Tensor],
         y_true: torch.Tensor,
         targets_mask: Optional[torch.Tensor] = None,
+        raw_y_true: Optional[torch.Tensor] = None,
+        data_scaler=None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         prediction = output["prediction"]
         y_inv = output["y_inv"]
         zero = self._zero(prediction)
+        prediction_loss_view, y_loss_view = self._forecast_pair(prediction, y_true, raw_y_true, data_scaler)
+        y_inv_loss_view, _ = self._forecast_pair(y_inv, y_true, raw_y_true, data_scaler)
 
-        pred_loss_raw = self._mae_loss(prediction, y_true, targets_mask)
-        inv_loss_raw = self._mae_loss(y_inv, y_true, targets_mask)
-        full_elem, elem_mask = self._channel_mean_error(prediction, y_true, targets_mask)
+        pred_loss_raw = self._mae_loss(prediction_loss_view, y_loss_view, targets_mask)
+        inv_loss_raw = self._mae_loss(y_inv_loss_view, y_loss_view, targets_mask)
+        full_elem, elem_mask = self._channel_mean_error(prediction_loss_view, y_loss_view, targets_mask)
 
         env_fut = output.get("env_fut")
         pred_fut_mu = output.get("pred_fut_mu")
@@ -664,7 +710,8 @@ class NUESTGLoss(nn.Module):
         prediction_swap = output.get("prediction_swap")
         has_swap = self.cfg.use_swap and self.cfg.lambda_swap != 0 and prediction_swap is not None
         if has_swap:
-            swap_elem, _ = self._channel_mean_error(prediction_swap, y_true, targets_mask)
+            prediction_swap_loss_view, _ = self._forecast_pair(prediction_swap, y_true, raw_y_true, data_scaler)
+            swap_elem, _ = self._channel_mean_error(prediction_swap_loss_view, y_loss_view, targets_mask)
             swap_weight, swap_weight_mean = self._fpem_swap_weight(output, full_elem)
             swap_diff_loss_raw = masked_mean(
                 F.relu(float(self.cfg.swap_margin) + full_elem.detach() - swap_elem) * swap_weight,
@@ -691,27 +738,52 @@ class NUESTGLoss(nn.Module):
 
         pred_loss = pred_loss_raw
         inv_loss = inv_loss_raw if self.cfg.use_inv and self.cfg.lambda_inv != 0 else zero
-        envpred_loss = envpred_loss_raw if self.cfg.use_envpred and self.cfg.lambda_envpred != 0 else zero
-        future_mi_loss = future_mi_loss_raw if self.cfg.use_future_mi and self.cfg.lambda_future_mi != 0 else zero
-        rank_loss = rank_loss_raw if self.cfg.use_rank and self.cfg.lambda_rank != 0 else zero
+        effective_lambda_envpred = self._effective_aux_lambda(
+            self.cfg.use_envpred,
+            self.cfg.lambda_envpred,
+            self.cfg.future_mi_warmup_epochs,
+        )
+        effective_lambda_future_mi = self._effective_aux_lambda(
+            self.cfg.use_future_mi,
+            self.cfg.lambda_future_mi,
+            self.cfg.future_mi_warmup_epochs,
+        )
+        effective_lambda_swap = self._effective_aux_lambda(
+            has_swap,
+            self.cfg.lambda_swap,
+            self.cfg.swap_warmup_epochs,
+        )
+        sep_lambda = self.cfg.lambda_ind if self.cfg.lambda_sep is None else self.cfg.lambda_sep
+        effective_lambda_sep = self._effective_aux_lambda(
+            self.cfg.use_ind,
+            sep_lambda,
+            self.cfg.sep_warmup_epochs,
+        )
         sparse_enabled = self.cfg.use_mask_sparse or self.cfg.use_sparse
         lambda_mask_sparse = self.cfg.lambda_sparse if self.cfg.lambda_mask_sparse is None else self.cfg.lambda_mask_sparse
-        sparse_loss = sparse_loss_raw if sparse_enabled and lambda_mask_sparse != 0 else zero
+        effective_lambda_mask_sparse = self._effective_aux_lambda(
+            sparse_enabled,
+            lambda_mask_sparse,
+            self.cfg.mask_sparse_warmup_epochs,
+        )
+        envpred_loss = envpred_loss_raw if effective_lambda_envpred != 0 else zero
+        future_mi_loss = future_mi_loss_raw if effective_lambda_future_mi != 0 else zero
+        rank_loss = rank_loss_raw if self.cfg.use_rank and self.cfg.lambda_rank != 0 else zero
+        sparse_loss = sparse_loss_raw if effective_lambda_mask_sparse != 0 else zero
         effective_lambda_kl = self._effective_lambda_kl()
         kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
-        sep_lambda = self.cfg.lambda_ind if self.cfg.lambda_sep is None else self.cfg.lambda_sep
-        ind_loss = sep_loss_raw if self.cfg.use_ind and sep_lambda != 0 else zero
-        swap_loss = swap_loss_raw if has_swap else zero
-        swap_diff_loss = swap_diff_loss_raw if has_swap else zero
+        ind_loss = sep_loss_raw if effective_lambda_sep != 0 else zero
+        swap_loss = swap_loss_raw if effective_lambda_swap != 0 else zero
+        swap_diff_loss = swap_diff_loss_raw if effective_lambda_swap != 0 else zero
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
             + self.cfg.lambda_inv * inv_loss
-            + self.cfg.lambda_envpred * envpred_loss
-            + self.cfg.lambda_future_mi * future_mi_loss
-            + sep_lambda * ind_loss
-            + lambda_mask_sparse * sparse_loss
-            + self.cfg.lambda_swap * swap_loss
+            + effective_lambda_envpred * envpred_loss
+            + effective_lambda_future_mi * future_mi_loss
+            + effective_lambda_sep * ind_loss
+            + effective_lambda_mask_sparse * sparse_loss
+            + effective_lambda_swap * swap_loss
             + effective_lambda_kl * kl_loss
             + self.cfg.lambda_rank * rank_loss
         )
@@ -731,6 +803,11 @@ class NUESTGLoss(nn.Module):
             "swap_same_loss": swap_same_loss_raw.detach(),
             "kl_loss": kl_loss.detach(),
             "effective_lambda_kl": prediction.new_tensor(effective_lambda_kl),
+            "effective_lambda_envpred": prediction.new_tensor(effective_lambda_envpred),
+            "effective_lambda_future_mi": prediction.new_tensor(effective_lambda_future_mi),
+            "effective_lambda_swap": prediction.new_tensor(effective_lambda_swap),
+            "effective_lambda_sep": prediction.new_tensor(effective_lambda_sep),
+            "effective_lambda_mask_sparse": prediction.new_tensor(effective_lambda_mask_sparse),
             "ind_loss": ind_loss.detach(),
             "sep_loss": ind_loss.detach(),
             "sparse_loss": sparse_loss.detach(),
@@ -805,23 +882,28 @@ class NUESTGLoss(nn.Module):
         output: Dict[str, torch.Tensor],
         y_true: torch.Tensor,
         targets_mask: Optional[torch.Tensor] = None,
+        raw_y_true: Optional[torch.Tensor] = None,
+        data_scaler=None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if output.get("method_variant", "nue") == "fpem":
-            return self._forward_fpem(output, y_true, targets_mask)
+            return self._forward_fpem(output, y_true, targets_mask, raw_y_true=raw_y_true, data_scaler=data_scaler)
         prediction = output["prediction"]
         y_inv = output["y_inv"]
         y_potential = output["y_potential"]
         r_env = output["r_env"]
         rho = output["rho"]
         zero = self._zero(prediction)
+        prediction_loss_view, y_loss_view = self._forecast_pair(prediction, y_true, raw_y_true, data_scaler)
+        y_inv_loss_view, _ = self._forecast_pair(y_inv, y_true, raw_y_true, data_scaler)
+        y_potential_loss_view, _ = self._forecast_pair(y_potential, y_true, raw_y_true, data_scaler)
 
-        pred_loss_raw = self._mae_loss(prediction, y_true, targets_mask)
-        inv_loss_raw = self._mae_loss(y_inv, y_true, targets_mask)
-        potential_loss_raw = self._mae_loss(y_potential, y_true, targets_mask)
+        pred_loss_raw = self._mae_loss(prediction_loss_view, y_loss_view, targets_mask)
+        inv_loss_raw = self._mae_loss(y_inv_loss_view, y_loss_view, targets_mask)
+        potential_loss_raw = self._mae_loss(y_potential_loss_view, y_loss_view, targets_mask)
 
-        inv_elem, elem_mask = self._channel_mean_error(y_inv, y_true, targets_mask)
-        potential_elem, _ = self._channel_mean_error(y_potential, y_true, targets_mask)
-        full_elem, _ = self._channel_mean_error(prediction, y_true, targets_mask)
+        inv_elem, elem_mask = self._channel_mean_error(y_inv_loss_view, y_loss_view, targets_mask)
+        potential_elem, _ = self._channel_mean_error(y_potential_loss_view, y_loss_view, targets_mask)
+        full_elem, _ = self._channel_mean_error(prediction_loss_view, y_loss_view, targets_mask)
 
         delta_gain = inv_elem - potential_elem
         s_gain = torch.sigmoid((delta_gain - self.cfg.gate_eta) / max(self.cfg.gate_tau, 1e-6)).detach()
@@ -861,7 +943,8 @@ class NUESTGLoss(nn.Module):
         prediction_swap = output.get("prediction_swap")
         has_swap = self.cfg.use_swap and self.cfg.lambda_swap != 0 and prediction_swap is not None
         if has_swap:
-            swap_elem, _ = self._channel_mean_error(prediction_swap, y_true, targets_mask)
+            prediction_swap_loss_view, _ = self._forecast_pair(prediction_swap, y_true, raw_y_true, data_scaler)
+            swap_elem, _ = self._channel_mean_error(prediction_swap_loss_view, y_loss_view, targets_mask)
             loss_full_for_swap = full_elem.detach() if self.cfg.swap_detach_full else full_elem
             if self.cfg.swap_weight_mode == "sgain":
                 swap_weight = s_gain
@@ -873,9 +956,9 @@ class NUESTGLoss(nn.Module):
                 F.relu(self.cfg.swap_margin + loss_full_for_swap - swap_elem) * swap_weight,
                 elem_mask,
             )
-            same_target = prediction.detach() if self.cfg.swap_detach_full else prediction
+            same_target = prediction_loss_view.detach() if self.cfg.swap_detach_full else prediction_loss_view
             swap_same_loss_raw = masked_mean(
-                (1.0 - s_gain) * (prediction_swap - same_target).abs().mean(dim=-1, keepdim=True),
+                (1.0 - s_gain) * (prediction_swap_loss_view - same_target).abs().mean(dim=-1, keepdim=True),
                 elem_mask,
             )
             swap_loss_raw = (
@@ -892,9 +975,19 @@ class NUESTGLoss(nn.Module):
         pred_loss = pred_loss_raw
         inv_loss = inv_loss_raw if self.cfg.use_inv and self.cfg.lambda_inv != 0 else zero
         gate_loss = gate_loss_raw if self.cfg.use_gate and self.cfg.lambda_gate != 0 else zero
-        swap_loss = swap_loss_raw if has_swap else zero
-        swap_diff_loss = swap_diff_loss_raw if has_swap else zero
-        swap_same_loss = swap_same_loss_raw if has_swap else zero
+        effective_lambda_swap = self._effective_aux_lambda(
+            has_swap,
+            self.cfg.lambda_swap,
+            self.cfg.swap_warmup_epochs,
+        )
+        effective_lambda_sep = self._effective_aux_lambda(
+            self.cfg.use_ind,
+            self.cfg.lambda_ind,
+            self.cfg.sep_warmup_epochs,
+        )
+        swap_loss = swap_loss_raw if effective_lambda_swap != 0 else zero
+        swap_diff_loss = swap_diff_loss_raw if effective_lambda_swap != 0 else zero
+        swap_same_loss = swap_same_loss_raw if effective_lambda_swap != 0 else zero
         effective_lambda_kl = self._effective_lambda_kl()
         effective_lambda_persistence_mi = self._effective_lambda_persistence_mi()
         kl_loss = kl_loss_raw if effective_lambda_kl != 0 else zero
@@ -903,7 +996,7 @@ class NUESTGLoss(nn.Module):
             if effective_lambda_persistence_mi != 0 and persistence_logs["persistence_valid"].item() == 1.0
             else zero
         )
-        ind_loss = ind_loss_raw if self.cfg.use_ind and self.cfg.lambda_ind != 0 else zero
+        ind_loss = ind_loss_raw if effective_lambda_sep != 0 else zero
         sparse_loss = sparse_loss_raw if self.cfg.use_sparse and self.cfg.lambda_sparse != 0 else zero
         entropy_loss = entropy_loss_raw if self.cfg.use_entropy and self.cfg.lambda_entropy != 0 else zero
         residual_norm_loss = (
@@ -917,10 +1010,10 @@ class NUESTGLoss(nn.Module):
             self.cfg.lambda_pred * pred_loss
             + self.cfg.lambda_inv * inv_loss
             + self.cfg.lambda_gate * gate_loss
-            + self.cfg.lambda_swap * swap_loss
+            + effective_lambda_swap * swap_loss
             + effective_lambda_kl * kl_loss
             + effective_lambda_persistence_mi * persistence_mi_loss
-            + self.cfg.lambda_ind * ind_loss
+            + effective_lambda_sep * ind_loss
             + self.cfg.lambda_sparse * sparse_loss
             + self.cfg.lambda_entropy * entropy_loss
             + self.cfg.lambda_residual_norm * residual_norm_loss
@@ -937,6 +1030,11 @@ class NUESTGLoss(nn.Module):
             "swap_same_loss": swap_same_loss.detach(),
             "kl_loss": kl_loss.detach(),
             "effective_lambda_kl": prediction.new_tensor(effective_lambda_kl),
+            "effective_lambda_envpred": zero,
+            "effective_lambda_future_mi": zero,
+            "effective_lambda_swap": prediction.new_tensor(effective_lambda_swap),
+            "effective_lambda_sep": prediction.new_tensor(effective_lambda_sep),
+            "effective_lambda_mask_sparse": zero,
             "ind_loss": ind_loss.detach(),
             "sparse_loss": sparse_loss.detach(),
             "entropy_loss": entropy_loss.detach(),

@@ -33,7 +33,7 @@ CONFIG = deep_update(
             "use_day_of_week": True,
             "use_current_timestamp_for_z": True,
             "use_current_timestamp_for_env": True,
-            "required_timestamp": False,
+            "required_timestamp": True,
             "env_token_mode": True,
             "mask_hidden_dim": 64,
             "mask_dropout": 0.1,

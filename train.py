@@ -26,6 +26,7 @@ from utils import (
     masked_mape_value,
     masked_rmse_value,
     make_valid_mask,
+    maybe_generate_timestamp_file,
     resolve_cli_config,
     save_resolved_config,
     ZScoreDataScaler,
@@ -42,6 +43,11 @@ LOG_KEYS = [
     "swap_same_loss",
     "kl_loss",
     "effective_lambda_kl",
+    "effective_lambda_envpred",
+    "effective_lambda_future_mi",
+    "effective_lambda_swap",
+    "effective_lambda_sep",
+    "effective_lambda_mask_sparse",
     "ind_loss",
     "sparse_loss",
     "entropy_loss",
@@ -120,7 +126,26 @@ LOG_KEYS = [
     "seq_time_emb_norm",
     "future_time_emb_norm",
 ]
-CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, "val_mae", "val_rmse", "val_mape"]
+HORIZON_EVAL_STEPS = (3, 6, 12)
+METRIC_FIELDS = [
+    "val_mae",
+    "val_rmse",
+    "val_mape",
+    "val_mae_h3",
+    "val_rmse_h3",
+    "val_mape_h3",
+    "val_mae_h6",
+    "val_rmse_h6",
+    "val_mape_h6",
+    "val_mae_h12",
+    "val_rmse_h12",
+    "val_mape_h12",
+    "val_mae_avg12",
+    "val_rmse_avg12",
+    "val_mape_avg12",
+    "lr",
+]
+CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, *METRIC_FIELDS]
 
 BACKBONE_DESCRIPTIONS = {
     "stid_mlp": "lightweight STID-like temporal MLP + node embedding",
@@ -153,6 +178,22 @@ def finalize_config(cfg: Dict) -> Dict:
     scaler_cfg.setdefault("rescale", True)
     scaler_cfg.setdefault("eps", 1e-5)
     ds_cfg.setdefault("null_to_num", 0.0)
+    ds_cfg.setdefault("frequency_minutes", 5)
+    ds_cfg.setdefault("auto_generate_timestamps", True)
+    resolved_null_val = ds_cfg.get("null_val", None)
+    if resolved_null_val is None and loss_cfg.get("null_val", None) is not None:
+        resolved_null_val = loss_cfg.get("null_val")
+    if ds_cfg.get("null_val", None) is not None and loss_cfg.get("null_val", None) not in {None, ds_cfg.get("null_val")}:
+        warnings.warn(
+            f"DATASET.null_val={ds_cfg.get('null_val')!r} overrides LOSS.null_val={loss_cfg.get('null_val')!r}.",
+            RuntimeWarning,
+        )
+    ds_cfg["null_val"] = resolved_null_val
+    loss_cfg["null_val"] = resolved_null_val
+    train_loss_scale = str(loss_cfg.get("train_loss_scale", "normalized")).lower()
+    if train_loss_scale not in {"normalized", "original"}:
+        raise ValueError("LOSS.train_loss_scale must be 'normalized' or 'original'")
+    loss_cfg["train_loss_scale"] = train_loss_scale
 
     if model_cfg.get("use_time_embedding", False):
         raise NotImplementedError(
@@ -242,7 +283,6 @@ def finalize_config(cfg: Dict) -> Dict:
     model_cfg["hidden_dim"] = representation_dim
     model_cfg["swap"] = cfg.get("SWAP", {})
     model_cfg["swap_detach_inv"] = cfg.get("LOSS", {}).get("swap_detach_inv", True)
-    cfg["LOSS"]["null_val"] = ds_cfg.get("null_val", cfg["LOSS"].get("null_val"))
     cfg["LOSS"]["z_dim"] = representation_dim
     cfg["LOSS"]["env_dim"] = int(model_cfg.get("env_dim", 32))
     return cfg
@@ -257,6 +297,7 @@ def get_device(train_cfg: Dict) -> torch.device:
 
 def build_dataset(cfg: Dict, split: str) -> BasicTSForecastingDataset:
     ds_cfg = cfg["DATASET"]
+    maybe_generate_timestamp_file(ds_cfg["data_file_path"], split, ds_cfg)
     return BasicTSForecastingDataset(
         dataset_name=ds_cfg["name"],
         input_len=ds_cfg["input_len"],
@@ -270,12 +311,15 @@ def build_dataset(cfg: Dict, split: str) -> BasicTSForecastingDataset:
 
 def build_loader(cfg: Dict, split: str, shuffle: bool) -> DataLoader:
     train_cfg = cfg["TRAIN"]
+    drop_last_default = split == "train"
+    drop_last = bool(train_cfg.get(f"drop_last_{split}", drop_last_default))
     return DataLoader(
         build_dataset(cfg, split),
         batch_size=train_cfg["batch_size"],
         shuffle=shuffle,
         num_workers=train_cfg.get("num_workers", 0),
         pin_memory=train_cfg.get("pin_memory", True) and torch.cuda.is_available(),
+        drop_last=drop_last,
     )
 
 
@@ -379,6 +423,38 @@ def build_optimizer(cfg: Dict, model: torch.nn.Module) -> torch.optim.Optimizer:
     if optimizer_name == "adamw":
         return torch.optim.AdamW(model.parameters(), **params)
     raise ValueError(f"Unsupported optimizer={optimizer_name!r}")
+
+
+def build_lr_scheduler(cfg: Dict, optimizer: torch.optim.Optimizer):
+    train_cfg = cfg["TRAIN"]
+    name = str(train_cfg.get("lr_scheduler", "none") or "none").lower()
+    if name == "none":
+        return None
+    if name == "multistep":
+        return torch.optim.lr_scheduler.MultiStepLR(
+            optimizer,
+            milestones=list(train_cfg.get("lr_milestones", [30, 60, 80])),
+            gamma=float(train_cfg.get("lr_gamma", 0.3)),
+        )
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(train_cfg.get("epochs", 1)), 1),
+            eta_min=float(train_cfg.get("lr_min", 1e-5)),
+        )
+    if name == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(train_cfg.get("lr_gamma", 0.3)),
+            patience=int(train_cfg.get("lr_plateau_patience", 5)),
+            min_lr=float(train_cfg.get("lr_min", 1e-5)),
+        )
+    raise ValueError(f"Unsupported TRAIN.lr_scheduler={name!r}")
+
+
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    return float(optimizer.param_groups[0].get("lr", 0.0))
 
 
 def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, cfg: Dict) -> None:
@@ -550,7 +626,13 @@ def debug_batch(cfg: Dict) -> None:
         **get_time_kwargs(batch, cfg, include_future=True),
     )
     check_output_shapes(output, batch[target_key], cfg)
-    loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
+    loss, logs = loss_fn(
+        output,
+        batch[target_key],
+        batch.get("targets_mask"),
+        raw_y_true=raw_batch[target_key],
+        data_scaler=data_scaler,
+    )
     loss.backward()
     assert_finite(loss, "total_loss")
     assert_finite(output["rho"], "rho")
@@ -566,21 +648,57 @@ def debug_batch(cfg: Dict) -> None:
 
 
 @torch.no_grad()
+def compute_metric_dict(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val,
+    existing_mask: torch.Tensor | None = None,
+) -> Dict[str, float]:
+    metrics = {
+        "mae": float(masked_mae_value(prediction, targets, null_val, existing_mask).detach().cpu()),
+        "rmse": float(masked_rmse_value(prediction, targets, null_val, existing_mask).detach().cpu()),
+        "mape": float(masked_mape_value(prediction, targets, null_val, existing_mask).detach().cpu()),
+    }
+    horizon = prediction.shape[1]
+    eval_horizon = min(12, horizon)
+    avg_mask = existing_mask[:, :eval_horizon] if existing_mask is not None else None
+    metrics["mae_avg12"] = float(
+        masked_mae_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
+    )
+    metrics["rmse_avg12"] = float(
+        masked_rmse_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
+    )
+    metrics["mape_avg12"] = float(
+        masked_mape_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
+    )
+    for step in HORIZON_EVAL_STEPS:
+        if horizon >= step:
+            pred_h = prediction[:, step - 1 : step]
+            target_h = targets[:, step - 1 : step]
+            mask_h = existing_mask[:, step - 1 : step] if existing_mask is not None else None
+            metrics[f"mae_h{step}"] = float(masked_mae_value(pred_h, target_h, null_val, mask_h).detach().cpu())
+            metrics[f"rmse_h{step}"] = float(masked_rmse_value(pred_h, target_h, null_val, mask_h).detach().cpu())
+            metrics[f"mape_h{step}"] = float(masked_mape_value(pred_h, target_h, null_val, mask_h).detach().cpu())
+    return metrics
+
+
+@torch.no_grad()
 def evaluate(
     model: NUESTG,
     loader: DataLoader,
     device: torch.device,
     cfg: Dict,
-    max_batches: int,
+    max_batches,
     data_scaler: ZScoreDataScaler,
 ) -> Dict[str, float]:
     model.eval()
-    values = {"mae": [], "rmse": [], "mape": []}
+    values: Dict[str, list] = {}
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
     null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
+    full_eval = max_batches is None or int(max_batches) < 0
     for step, batch in enumerate(loader):
-        if step >= max_batches:
+        if not full_eval and step >= int(max_batches):
             break
         raw_batch = to_device_batch(batch, device)
         batch = preprocess_batch(raw_batch, cfg, data_scaler)
@@ -590,11 +708,11 @@ def evaluate(
         )
         prediction = data_scaler.inverse_transform(output["prediction"])
         targets = raw_batch[target_key]
-        values["mae"].append(float(masked_mae_value(prediction, targets, null_val).detach().cpu()))
-        values["rmse"].append(float(masked_rmse_value(prediction, targets, null_val).detach().cpu()))
-        values["mape"].append(float(masked_mape_value(prediction, targets, null_val).detach().cpu()))
+        batch_metrics = compute_metric_dict(prediction, targets, null_val, batch.get("targets_mask"))
+        for key, value in batch_metrics.items():
+            values.setdefault(key, []).append(value)
     model.train()
-    if not values["mae"]:
+    if not values.get("mae"):
         return {"mae": float("nan"), "rmse": float("nan"), "mape": float("nan")}
     return {key: float(np.mean(item_values)) for key, item_values in values.items()}
 
@@ -609,7 +727,7 @@ def build_metrics_payload(
 ) -> Dict:
     run_cfg = cfg.get("RUN", {})
     model_cfg = cfg["MODEL"]
-    return {
+    payload = {
         "dataset": cfg["DATASET"]["name"],
         "setting": run_cfg.get("setting", "forecasting"),
         "method": run_cfg.get("method", model_cfg.get("name", "NUE-STG")),
@@ -628,12 +746,33 @@ def build_metrics_payload(
         "status": run_cfg.get("status", "runnable"),
         "notes": run_cfg.get("notes", ""),
     }
+    for key, value in metrics.items():
+        if key not in payload:
+            payload[key] = value
+    return payload
 
 
 def save_metrics_json(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+def make_val_metric_row(metrics: Dict[str, float], lr: float | None = None) -> Dict[str, object]:
+    row = {
+        "val_mae": metrics.get("mae", ""),
+        "val_rmse": metrics.get("rmse", ""),
+        "val_mape": metrics.get("mape", ""),
+        "val_mae_avg12": metrics.get("mae_avg12", metrics.get("mae", "")),
+        "val_rmse_avg12": metrics.get("rmse_avg12", metrics.get("rmse", "")),
+        "val_mape_avg12": metrics.get("mape_avg12", metrics.get("mape", "")),
+        "lr": "" if lr is None else lr,
+    }
+    for step in HORIZON_EVAL_STEPS:
+        row[f"val_mae_h{step}"] = metrics.get(f"mae_h{step}", "")
+        row[f"val_rmse_h{step}"] = metrics.get(f"rmse_h{step}", "")
+        row[f"val_mape_h{step}"] = metrics.get(f"mape_h{step}", "")
+    return row
 
 
 def append_train_log(cfg: Dict, row: Dict) -> None:
@@ -653,8 +792,10 @@ def train_local(cfg: Dict) -> None:
     cfg["SCALER"]["stats"] = data_scaler.state_dict()
     train_loader = build_loader(cfg, "train", shuffle=True)
     val_loader = build_loader(cfg, "val", shuffle=False)
+    test_loader = build_loader(cfg, "test", shuffle=False)
     model, loss_fn = build_model_and_loss(cfg, device)
     optimizer = build_optimizer(cfg, model)
+    lr_scheduler = build_lr_scheduler(cfg, optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", False) and device.type == "cuda")
     autocast_ctx = (
         torch.cuda.amp.autocast
@@ -691,7 +832,13 @@ def train_local(cfg: Dict) -> None:
                     y_true=batch[target_key],
                     **get_time_kwargs(batch, cfg, include_future=True),
                 )
-                loss, logs = loss_fn(output, batch[target_key], batch.get("targets_mask"))
+                loss, logs = loss_fn(
+                    output,
+                    batch[target_key],
+                    batch.get("targets_mask"),
+                    raw_y_true=raw_batch[target_key],
+                    data_scaler=data_scaler,
+                )
             scaler.scale(loss).backward()
             grad_clip = train_cfg.get("grad_clip")
             if grad_clip:
@@ -708,9 +855,7 @@ def train_local(cfg: Dict) -> None:
                     "step": global_step,
                     "split": "train",
                     **scalar_logs,
-                    "val_mae": "",
-                    "val_rmse": "",
-                    "val_mape": "",
+                    **make_val_metric_row({}, lr=current_lr(optimizer)),
                 }
                 append_train_log(cfg, row)
                 print(f"epoch={epoch} step={global_step} {format_logs(scalar_logs, LOG_KEYS)}")
@@ -723,9 +868,7 @@ def train_local(cfg: Dict) -> None:
                 "step": global_step,
                 "split": "train_epoch",
                 **epoch_logs,
-                "val_mae": "",
-                "val_rmse": "",
-                "val_mape": "",
+                **make_val_metric_row({}, lr=current_lr(optimizer)),
             },
         )
 
@@ -734,6 +877,7 @@ def train_local(cfg: Dict) -> None:
                 {
                     "model": model.state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
                     "config": cfg,
                     "scaler": data_scaler.state_dict(),
                     "epoch": epoch,
@@ -753,17 +897,24 @@ def train_local(cfg: Dict) -> None:
             )
             print(
                 f"epoch={epoch} val_mae={val_metrics['mae']:.6f} "
-                f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f}"
+                f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f} "
+                f"val_mae_h3={val_metrics.get('mae_h3', float('nan')):.6f} "
+                f"val_mae_h6={val_metrics.get('mae_h6', float('nan')):.6f} "
+                f"val_mae_h12={val_metrics.get('mae_h12', float('nan')):.6f} "
+                f"lr={current_lr(optimizer):.8f}"
             )
+            if lr_scheduler is not None:
+                if str(train_cfg.get("lr_scheduler", "none")).lower() == "plateau":
+                    lr_scheduler.step(val_metrics["mae"])
+                else:
+                    lr_scheduler.step()
             append_train_log(
                 cfg,
                 {
                     "epoch": epoch,
                     "step": global_step,
                     "split": "val",
-                    "val_mae": val_metrics["mae"],
-                    "val_rmse": val_metrics["rmse"],
-                    "val_mape": val_metrics["mape"],
+                    **make_val_metric_row(val_metrics, lr=current_lr(optimizer)),
                 },
             )
             last_payload = build_metrics_payload(
@@ -785,6 +936,7 @@ def train_local(cfg: Dict) -> None:
                         {
                             "model": model.state_dict(),
                             "optimizer": optimizer.state_dict(),
+                            "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
                             "config": cfg,
                             "scaler": data_scaler.state_dict(),
                             "epoch": epoch,
@@ -804,6 +956,37 @@ def train_local(cfg: Dict) -> None:
                         split="val",
                     )
                     save_metrics_json(ckpt_dir / "best_metrics.json", best_payload)
+                    if train_cfg.get("eval_test_on_best", True):
+                        test_metrics = evaluate(
+                            model,
+                            test_loader,
+                            device,
+                            cfg,
+                            train_cfg.get("test_batches", None),
+                            data_scaler,
+                        )
+                        test_payload = build_metrics_payload(
+                            cfg,
+                            epoch,
+                            global_step,
+                            test_metrics,
+                            best_ckpt_path,
+                            split="test",
+                        )
+                        save_metrics_json(ckpt_dir / "best_test_metrics.json", test_payload)
+                        append_train_log(
+                            cfg,
+                            {
+                                "epoch": epoch,
+                                "step": global_step,
+                                "split": "test",
+                                **make_val_metric_row(test_metrics, lr=current_lr(optimizer)),
+                            },
+                        )
+                        print(
+                            f"best test_mae={test_metrics['mae']:.6f} "
+                            f"test_rmse={test_metrics['rmse']:.6f} test_mape={test_metrics['mape']:.6f}"
+                        )
                     print(f"saved best checkpoint: {best_ckpt_path}")
             else:
                 patience += 1

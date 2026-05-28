@@ -20,6 +20,7 @@ CONFIG = deep_update(
             "input_dim": 1,
             "output_dim": 1,
             "null_val": None,
+            "frequency_minutes": 5,
         },
         "MODEL": {
             "num_nodes": 170,

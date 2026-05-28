@@ -15,7 +15,7 @@ from models.env_mask import FuturePredictiveEnvMask
 from models.future_env_encoder import FutureEnvEncoder
 from models.separation import SeparationModule
 from models.time_embedding import TimestampEncoder
-from utils.tensor_ops import align_target, ensure_blnc, load_adjacency
+from utils.tensor_ops import align_target, ensure_blnc, load_adjacency, load_graph_supports
 
 
 @dataclass
@@ -392,6 +392,21 @@ class NUESTG(nn.Module):
         else:
             self.adj_norm = None
 
+        graph_supports = None
+        backbone_cfg = config.backbone or {}
+        gw_cfg = backbone_cfg.get("graph_wavenet", {}) if isinstance(backbone_cfg, dict) else {}
+        if config.use_adj and str(config.backbone_name).lower() in {"graphwavenet", "gwnet", "graph_wavenet"}:
+            graph_supports = load_graph_supports(
+                config.adj_path,
+                config.num_nodes,
+                adjtype=str(gw_cfg.get("adjtype", "doubletransition")),
+                add_self_loop=bool(gw_cfg.get("support_add_self_loop", False)),
+            )
+        if graph_supports is not None:
+            self.register_buffer("backbone_adj", graph_supports)
+        else:
+            self.backbone_adj = None
+
     @staticmethod
     def _make_persistence_head(in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> nn.Sequential:
         return nn.Sequential(
@@ -596,12 +611,13 @@ class NUESTG(nn.Module):
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size, input_len, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
+        backbone_adj = getattr(self, "backbone_adj", None)
         time_out = self._encode_time(x, seq_time, cur_time, future_time)
         seq_time_emb = time_out["seq_time_emb"] if self.use_current_timestamp_for_env else None
         cur_time_emb = time_out["cur_time_emb"] if self.use_current_timestamp_for_env else None
         future_time_emb = time_out["future_time_emb"]
 
-        backbone_out = self.backbone(x, adj=adj)
+        backbone_out = self.backbone(x, adj=backbone_adj if backbone_adj is not None else adj)
         z_raw = self._apply_time_to_z(backbone_out["z_inv"], time_out["cur_time_emb"])
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(
@@ -802,8 +818,9 @@ class NUESTG(nn.Module):
             )
         batch_size, _, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
+        backbone_adj = getattr(self, "backbone_adj", None)
 
-        backbone_out = self.backbone(x, adj=adj)
+        backbone_out = self.backbone(x, adj=backbone_adj if backbone_adj is not None else adj)
         z_raw = backbone_out["z_inv"]
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu, env_logvar, env_raw = self.env_encoder(x, adj)

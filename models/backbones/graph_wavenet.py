@@ -76,10 +76,12 @@ class GraphWaveNetBackbone(BaseBackbone):
         supports_len: int = 1,
         use_static_adj: bool = True,
         adj_norm: str = "sym",
+        adjtype: str = "doubletransition",
+        support_add_self_loop: bool = False,
         adaptive_embed_dim: int = 10,
     ) -> None:
         super().__init__(input_len, output_len, num_nodes, input_dim, output_dim, representation_dim)
-        del hidden_dim, aptinit, adj_norm
+        del hidden_dim, aptinit, adj_norm, support_add_self_loop
         self.dropout = float(dropout)
         self.blocks = int(blocks)
         self.layers = int(layers)
@@ -88,6 +90,7 @@ class GraphWaveNetBackbone(BaseBackbone):
         self.gcn_bool = bool(gcn_bool)
         self.addaptadj = bool(addaptadj)
         self.use_static_adj = bool(use_static_adj)
+        self.adjtype = str(adjtype or "doubletransition").lower()
 
         self.start_conv = nn.Conv2d(input_dim, residual_channels, kernel_size=(1, 1))
         self.filter_convs = nn.ModuleList()
@@ -97,7 +100,10 @@ class GraphWaveNetBackbone(BaseBackbone):
         self.gconvs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
-        max_supports = (1 if self.use_static_adj else 0) + (1 if self.addaptadj else 0)
+        static_supports_len = 0
+        if self.use_static_adj:
+            static_supports_len = 2 if self.adjtype in {"doubletransition", "dual_random_walk", "double_transition"} else 1
+        max_supports = static_supports_len + (1 if self.addaptadj else 0)
         max_supports = max(max_supports, int(supports_len or 0))
         self.max_supports = max_supports
 
@@ -144,10 +150,24 @@ class GraphWaveNetBackbone(BaseBackbone):
             self.nodevec1 = None
             self.nodevec2 = None
 
+    @staticmethod
+    def _random_walk(adj: torch.Tensor) -> torch.Tensor:
+        denom = adj.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return adj / denom
+
     def _supports(self, adj: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
         supports: List[torch.Tensor] = []
         if self.use_static_adj and adj is not None:
-            supports.append(adj.to(device=device, dtype=dtype))
+            adj = adj.to(device=device, dtype=dtype)
+            if adj.dim() == 3:
+                supports.extend([adj_i for adj_i in adj])
+            elif self.adjtype in {"doubletransition", "dual_random_walk", "double_transition"}:
+                supports.append(self._random_walk(adj))
+                supports.append(self._random_walk(adj.transpose(0, 1)))
+            elif self.adjtype in {"transition", "random_walk", "row"}:
+                supports.append(self._random_walk(adj))
+            else:
+                supports.append(adj)
         if self.addaptadj and self.nodevec1 is not None and self.nodevec2 is not None:
             adp = torch.softmax(torch.relu(self.nodevec1.matmul(self.nodevec2)), dim=1)
             supports.append(adp.to(device=device, dtype=dtype))
