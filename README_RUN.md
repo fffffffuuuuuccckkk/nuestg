@@ -444,14 +444,21 @@ that require official external code or imported results.
 
 Runnable forecasting baselines:
 
-- `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`. This is the local
-  lightweight temporal MLP plus node embedding, not the official STID code.
-- `GraphWaveNet-style`: `configs/baselines/pems08/graphwavenet.py`. This uses
-  the local Graph WaveNet-style backbone, not a line-by-line official
-  reproduction.
-- `AGCRN-style`: `configs/baselines/pems08/agcrn.py`. This uses the local
-  AGCRN-style adaptive recurrent backbone, not a line-by-line official
-  reproduction.
+- `STID`: `configs/baselines/pems08/stid.py`, `faithful_native`, adapted from
+  the official BasicTS/STID architecture with spatial identity, time-of-day,
+  day-of-week embeddings, and residual 1x1 MLP blocks.
+- `Graph WaveNet`: `configs/baselines/pems08/graphwavenet.py`,
+  `faithful_native`, adapted from official `model.py` / `util.py`.
+- `AGCRN`: `configs/baselines/pems08/agcrn.py`, `faithful_native`, adapted
+  from official `AGCN.py`, `AGCRNCell.py`, and `AGCRN.py`.
+- `STGCN`: `configs/baselines/pems08/stgcn.py`, `faithful_native`, adapted
+  from `hazdzz/STGCN`.
+- `ST-Norm`: `configs/baselines/pems08/stnorm.py`, `faithful_native`, adapted
+  from official `ST-Norm/models/Wavenet.py`. ST-Norm is model-internal
+  spatial/temporal normalization, not a replacement for the train-split scaler.
+- `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`, `simplified`.
+  This is retained only as a lightweight debug/ablation baseline and should
+  not be reported as official STID.
 
 All runnable forecasting baselines reuse `train.py` and disable NUE-STG
 environment mechanisms through the invariant-only `no_env` setup. Their
@@ -480,6 +487,12 @@ metadata configs and import templates under
 `train.py`. Do not claim this repository implements them unless a real adapter
 or implementation is added later.
 
+The full reference and architecture audit table is in
+`docs/BASELINE_REFERENCES.md`. It records official repo URLs, local reference
+files/classes read before implementation, `faithful_native` /
+`official_wrapper` / `simplified` / `external_required` status, deviations, and
+license notes. Simplified baselines are for debug or appendix use only.
+
 Useful commands:
 
 ```bash
@@ -489,6 +502,7 @@ bash scripts/run_ours_backbones.sh
 bash scripts/run_ablations.sh
 bash scripts/run_ood_baselines_placeholders.sh
 bash scripts/collect_all_results.sh
+python scripts/debug_all_baselines.py --dataset pems08 --dry_run
 ```
 
 The scripts accept environment variables:
@@ -765,15 +779,11 @@ history-similar/future-similar samples.
   concept-shift pair mining.
 - Future work can add Samen-style history-similar / future-different pair
   mining via the existing `SWAP.pair_mining` config slots.
-- `stid_mlp` is a lightweight STID-like temporal MLP plus node embedding, not
-  the full official STID implementation.
-- `graphwavenet` is Graph WaveNet-style, not a line-by-line copy of the
-  official repository.
-- `agcrn` is AGCRN-style with a simplified adaptive graph convolution, not a
-  line-by-line copy of the official repository.
-- Time embeddings are configured but not yet implemented in the backbone.
-- Stronger or official backbone implementations remain future work behind the
-  existing `BaseBackbone` interface.
+- `stid_mlp` is a lightweight simplified debug baseline; use `backbone_name=stid`
+  for the faithful native STID baseline.
+- D2STGNN, CaST, STONE, STOP, and the remaining ST-OOD baselines are not native
+  implementations in this repo. Use official code/result import unless a real
+  wrapper is added.
 - The current separation modes are computation-level constraints, not formal
   guarantees that Z contains every invariant factor and E contains only
   environment factors.

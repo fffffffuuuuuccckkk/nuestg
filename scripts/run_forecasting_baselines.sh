@@ -6,8 +6,21 @@ DATASET="${DATASET:-pems08}"
 SEEDS="${SEEDS:-2026}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+run_if_exists() {
+  local cfg="$1"
+  local seed="$2"
+  if [[ -f "$cfg" ]]; then
+    "$PYTHON" train.py --config "$cfg" --set "TRAIN.seed=${seed}" $EXTRA_ARGS
+  else
+    echo "skip missing config: $cfg"
+  fi
+}
+
 for seed in $SEEDS; do
-  "$PYTHON" train.py --config "configs/baselines/${DATASET}/stid_mlp.py" --set "TRAIN.seed=${seed}" $EXTRA_ARGS
-  "$PYTHON" train.py --config "configs/baselines/${DATASET}/graphwavenet.py" --set "TRAIN.seed=${seed}" $EXTRA_ARGS
-  "$PYTHON" train.py --config "configs/baselines/${DATASET}/agcrn.py" --set "TRAIN.seed=${seed}" $EXTRA_ARGS
+  run_if_exists "configs/baselines/${DATASET}/stid.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/graphwavenet.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/agcrn.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/stgcn.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/stnorm.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/stid_mlp.py" "$seed"
 done

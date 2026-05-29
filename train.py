@@ -148,13 +148,19 @@ METRIC_FIELDS = [
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, *METRIC_FIELDS]
 
 BACKBONE_DESCRIPTIONS = {
+    "stid": "faithful native STID backbone with spatial identity and TOD/DOW embeddings",
+    "official_stid": "faithful native STID backbone with spatial identity and TOD/DOW embeddings",
     "stid_mlp": "lightweight STID-like temporal MLP + node embedding",
     "mlp": "lightweight STID-like temporal MLP + node embedding",
     "stid_like": "lightweight STID-like temporal MLP + node embedding",
-    "graphwavenet": "Graph WaveNet-style invariant backbone",
-    "graph_wavenet": "Graph WaveNet-style invariant backbone",
-    "gwnet": "Graph WaveNet-style invariant backbone",
-    "agcrn": "AGCRN-style adaptive graph recurrent backbone",
+    "graphwavenet": "faithful native Graph WaveNet backbone adapted to the shared interface",
+    "graph_wavenet": "faithful native Graph WaveNet backbone adapted to the shared interface",
+    "gwnet": "faithful native Graph WaveNet backbone adapted to the shared interface",
+    "agcrn": "faithful native AGCRN backbone adapted to the shared interface",
+    "stgcn": "faithful native STGCN backbone adapted from hazdzz/STGCN",
+    "stnorm": "faithful native ST-Norm WaveNet backbone",
+    "st_norm": "faithful native ST-Norm WaveNet backbone",
+    "stnorm_wavenet": "faithful native ST-Norm WaveNet backbone",
 }
 
 
@@ -276,6 +282,10 @@ def finalize_config(cfg: Dict) -> Dict:
         backbone_key = "graph_wavenet"
     if backbone_key in {"mlp", "stid_like"}:
         backbone_key = "stid_mlp"
+    if backbone_key in {"official_stid"}:
+        backbone_key = "stid"
+    if backbone_key in {"st_norm", "stnorm"}:
+        backbone_key = "stnorm_wavenet"
     selected_cfg = backbone_cfg.get(backbone_key, {})
     if isinstance(selected_cfg, dict) and selected_cfg.get("representation_dim") is not None:
         representation_dim = int(selected_cfg["representation_dim"])

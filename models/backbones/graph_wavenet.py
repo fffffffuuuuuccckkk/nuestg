@@ -134,13 +134,9 @@ class GraphWaveNetBackbone(BaseBackbone):
                 self.residual_convs.append(nn.Conv2d(dilation_channels, residual_channels, kernel_size=(1, 1)))
                 self.norms.append(nn.BatchNorm2d(residual_channels))
 
-        self.skip_project = nn.Sequential(
-            nn.ReLU(),
-            nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1)),
-            nn.ReLU(),
-            nn.Conv2d(end_channels, residual_channels, kernel_size=(1, 1)),
-        )
-        self.representation_proj = nn.Linear(residual_channels, representation_dim)
+        self.end_conv_1 = nn.Conv2d(skip_channels, end_channels, kernel_size=(1, 1), bias=True)
+        self.end_conv_2 = nn.Conv2d(end_channels, output_len * output_dim, kernel_size=(1, 1), bias=True)
+        self.representation_proj = nn.Linear(end_channels, representation_dim)
         self.inv_head = nn.Linear(representation_dim, output_len * output_dim)
 
         if self.addaptadj:
@@ -202,10 +198,12 @@ class GraphWaveNetBackbone(BaseBackbone):
                 h = self.residual_convs[idx](h)
             h = self.norms[idx](h + residual[..., -h.size(-1) :])
 
-        if skip is not None:
-            h = h + self.skip_project(skip)
-        node_hidden = h.mean(dim=-1).transpose(1, 2)
+        if skip is None:
+            skip = h.new_zeros(batch_size, self.end_conv_1.in_channels, self.num_nodes, 1)
+        rep = F.relu(self.end_conv_1(F.relu(skip)))
+        out = self.end_conv_2(rep)[..., -1]
+        y_inv = out.view(batch_size, self.output_len, self.output_dim, self.num_nodes).permute(0, 1, 3, 2)
+        node_hidden = rep[..., -1].transpose(1, 2)
         z_inv = self.representation_proj(node_hidden)
-        y_inv = self.forecast_from_representation(z_inv)
         self._assert_outputs(z_inv, y_inv, batch_size)
         return {"z_inv": z_inv, "y_inv": y_inv}

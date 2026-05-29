@@ -11,15 +11,15 @@ deep_update(
     CONFIG,
     {
         "RUN": {
-            "method": "STID-like MLP",
+            "method": "ST-Norm",
             "category": "forecasting",
             "setting": "forecasting",
             "status": "runnable",
-            "reference_status": "simplified",
-            "notes": "Baseline-only lightweight STID-like MLP; not official STID.",
+            "reference_status": "faithful_native",
+            "notes": "Native ST-Norm WaveNet adapted from official ST-Norm Wavenet.py; uses local scaler/splits.",
         },
-        "MODEL": {"backbone_name": "stid_mlp", "backbone": {"name": "stid_mlp"}},
-        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_stid_mlp"},
+        "MODEL": {"backbone_name": "stnorm", "backbone": {"name": "stnorm"}},
+        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_stnorm"},
     },
 )
 apply_ablation(CONFIG, "no_env")

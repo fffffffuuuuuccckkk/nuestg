@@ -8,58 +8,64 @@ from torch import nn
 from models.backbones.base import BaseBackbone
 
 
-class AdaptiveGraphConv(nn.Module):
-    """Stable AGCRN-style adaptive graph convolution.
+class AVWGCN(nn.Module):
+    """AGCRN adaptive graph convolution with node-specific weight pools.
 
-    This first version uses node embeddings to build adaptive Chebyshev
-    supports, aggregates each support, concatenates the results, and applies a
-    shared linear projection. It keeps the AGCRN adaptive-graph recurrent shape
-    while avoiding the heavier per-node weight pool from the official model.
+    Reference: /data/OuXiaoyu/mystg/baselines/AGCRN/model/AGCN.py
     """
 
-    def __init__(self, input_dim: int, output_dim: int, cheb_k: int) -> None:
+    def __init__(self, input_dim: int, output_dim: int, cheb_k: int, embed_dim: int) -> None:
         super().__init__()
         self.cheb_k = max(1, int(cheb_k))
-        self.proj = nn.Linear(input_dim * self.cheb_k, output_dim)
+        self.weights_pool = nn.Parameter(torch.empty(embed_dim, self.cheb_k, input_dim, output_dim))
+        self.bias_pool = nn.Parameter(torch.empty(embed_dim, output_dim))
+        nn.init.xavier_uniform_(self.weights_pool)
+        nn.init.xavier_uniform_(self.bias_pool)
 
-    @staticmethod
-    def nconv(x: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-        return torch.einsum("bnc,nm->bmc", x, support)
-
-    def forward(self, x: torch.Tensor, supports: List[torch.Tensor]) -> torch.Tensor:
-        out = []
-        for support in supports[: self.cheb_k]:
-            out.append(self.nconv(x, support))
-        while len(out) < self.cheb_k:
-            out.append(torch.zeros_like(x))
-        return self.proj(torch.cat(out, dim=-1))
+    def forward(self, x: torch.Tensor, node_embeddings: torch.Tensor) -> torch.Tensor:
+        node_num = node_embeddings.shape[0]
+        supports = torch.softmax(torch.relu(node_embeddings.matmul(node_embeddings.transpose(0, 1))), dim=1)
+        support_set = [torch.eye(node_num, dtype=x.dtype, device=x.device), supports.to(dtype=x.dtype, device=x.device)]
+        for _ in range(2, self.cheb_k):
+            support_set.append(torch.matmul(2 * supports, support_set[-1]) - support_set[-2])
+        supports = torch.stack(support_set[: self.cheb_k], dim=0)
+        weights = torch.einsum("nd,dkio->nkio", node_embeddings, self.weights_pool)
+        bias = torch.matmul(node_embeddings, self.bias_pool)
+        x_g = torch.einsum("knm,bmc->bknc", supports, x)
+        x_g = x_g.permute(0, 2, 1, 3)
+        return torch.einsum("bnki,nkio->bno", x_g, weights) + bias
 
 
 class AGCRNCell(nn.Module):
-    """GRU-like recurrent cell using adaptive graph convolutions."""
+    """Official AGCRN recurrent cell.
 
-    def __init__(self, input_dim: int, hidden_dim: int, cheb_k: int) -> None:
+    Reference: /data/OuXiaoyu/mystg/baselines/AGCRN/model/AGCRNCell.py
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, cheb_k: int, embed_dim: int) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.gate = AdaptiveGraphConv(input_dim + hidden_dim, 2 * hidden_dim, cheb_k)
-        self.update = AdaptiveGraphConv(input_dim + hidden_dim, hidden_dim, cheb_k)
+        self.gate = AVWGCN(input_dim + hidden_dim, 2 * hidden_dim, cheb_k, embed_dim)
+        self.update = AVWGCN(input_dim + hidden_dim, hidden_dim, cheb_k, embed_dim)
 
-    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor, supports: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor, node_embeddings: torch.Tensor) -> torch.Tensor:
         gate_input = torch.cat([x_t, h_prev], dim=-1)
-        z_gate, r_gate = torch.sigmoid(self.gate(gate_input, supports)).chunk(2, dim=-1)
-        cand_input = torch.cat([x_t, r_gate * h_prev], dim=-1)
-        candidate = torch.tanh(self.update(cand_input, supports))
-        return z_gate * h_prev + (1.0 - z_gate) * candidate
+        z_gate, r_gate = torch.sigmoid(self.gate(gate_input, node_embeddings)).chunk(2, dim=-1)
+        cand_input = torch.cat([x_t, z_gate * h_prev], dim=-1)
+        candidate = torch.tanh(self.update(cand_input, node_embeddings))
+        return r_gate * h_prev + (1.0 - r_gate) * candidate
 
 
 class AGCRNBackbone(BaseBackbone):
-    """AGCRN-style adaptive graph recurrent backbone for NUE-STG.
+    """Faithful native AGCRN backbone adapted to the local BaseBackbone API.
 
-    It uses node embeddings to construct an adaptive adjacency, applies
-    Chebyshev-style adaptive graph convolutions inside GRU-like recurrent
-    cells, and returns the invariant node representation and invariant forecast
-    expected by NUE-STG. This is an AGCRN-style invariant branch, not a
-    line-by-line copy of the official implementation.
+    Reference files:
+      - /data/OuXiaoyu/mystg/baselines/AGCRN/model/AGCRN.py
+      - /data/OuXiaoyu/mystg/baselines/AGCRN/model/AGCN.py
+      - /data/OuXiaoyu/mystg/baselines/AGCRN/model/AGCRNCell.py
+
+    Adaptation: the official predictor is kept for y_inv; an additional
+    projection exposes z_inv for NUE-STG's shared backbone interface.
     """
 
     def __init__(
@@ -89,24 +95,11 @@ class AGCRNBackbone(BaseBackbone):
         cells = []
         for layer_idx in range(self.num_layers):
             layer_input_dim = input_dim if layer_idx == 0 else hidden_dim
-            cells.append(AGCRNCell(layer_input_dim, hidden_dim, self.cheb_k))
+            cells.append(AGCRNCell(layer_input_dim, hidden_dim, self.cheb_k, embed_dim))
         self.cells = nn.ModuleList(cells)
         self.representation_proj = nn.Linear(hidden_dim, representation_dim)
+        self.end_conv = nn.Conv2d(1, output_len * output_dim, kernel_size=(1, hidden_dim), bias=True)
         self.inv_head = nn.Linear(representation_dim, output_len * output_dim)
-
-    def _adaptive_adj(self) -> torch.Tensor:
-        return torch.softmax(torch.relu(self.node_embeddings.matmul(self.node_embeddings.transpose(0, 1))), dim=1)
-
-    def _supports(self, adj: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype) -> List[torch.Tensor]:
-        adp = self._adaptive_adj().to(device=device, dtype=dtype)
-        if self.use_static_adj and adj is not None:
-            static = adj.to(device=device, dtype=dtype)
-            adp = 0.5 * adp + 0.5 * static
-            adp = adp / adp.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        supports = [torch.eye(self.num_nodes, device=device, dtype=dtype), adp]
-        for _ in range(2, self.cheb_k):
-            supports.append(torch.matmul(supports[-1], adp))
-        return supports[: self.cheb_k]
 
     def forecast_from_representation(self, z_inv: torch.Tensor) -> torch.Tensor:
         batch_size, num_nodes, _ = z_inv.shape
@@ -114,9 +107,9 @@ class AGCRNBackbone(BaseBackbone):
         return y_inv.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
 
     def forward(self, x: torch.Tensor, adj: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, torch.Tensor]:
+        del adj, kwargs
         x = self._check_input(x)
         batch_size, input_len, num_nodes, _ = x.shape
-        supports = self._supports(adj, x.device, x.dtype)
         hidden_states = [
             x.new_zeros(batch_size, num_nodes, self.hidden_dim)
             for _ in range(self.num_layers)
@@ -125,10 +118,12 @@ class AGCRNBackbone(BaseBackbone):
         for t in range(input_len):
             layer_input = x[:, t]
             for layer_idx, cell in enumerate(self.cells):
-                hidden_states[layer_idx] = cell(layer_input, hidden_states[layer_idx], supports)
+                hidden_states[layer_idx] = cell(layer_input, hidden_states[layer_idx], self.node_embeddings)
                 layer_input = self.dropout(hidden_states[layer_idx])
 
         z_inv = self.representation_proj(hidden_states[-1])
-        y_inv = self.forecast_from_representation(z_inv)
+        output = self.end_conv(hidden_states[-1].unsqueeze(1))
+        output = output.squeeze(-1).reshape(batch_size, self.output_len, self.output_dim, num_nodes)
+        y_inv = output.permute(0, 1, 3, 2)
         self._assert_outputs(z_inv, y_inv, batch_size)
         return {"z_inv": z_inv, "y_inv": y_inv}

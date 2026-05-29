@@ -6,7 +6,10 @@ from typing import Any, Dict
 from models.backbones.agcrn import AGCRNBackbone
 from models.backbones.base import BaseBackbone
 from models.backbones.graph_wavenet import GraphWaveNetBackbone
+from models.backbones.stgcn import STGCNBackbone
+from models.backbones.stid import STIDBackbone
 from models.backbones.stid_mlp import STIDMLPBackbone
+from models.backbones.stnorm_wavenet import STNormWaveNetBackbone
 
 
 def _to_model_dict(cfg: Any) -> Dict:
@@ -43,6 +46,12 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             use_node_embedding=bool(stid_cfg.get("use_node_embedding", model_cfg.get("use_node_embedding", True))),
         )
 
+    if name in {"stid", "official_stid"}:
+        stid_cfg = dict(backbone_cfg.get("stid", {}) or {})
+        if "representation_dim" in stid_cfg:
+            common["representation_dim"] = int(stid_cfg.pop("representation_dim"))
+        return STIDBackbone(**common, **stid_cfg)
+
     if name in {"graphwavenet", "gwnet", "graph_wavenet"}:
         gw_cfg = dict(backbone_cfg.get("graph_wavenet", {}) or {})
         if "representation_dim" in gw_cfg:
@@ -55,9 +64,21 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             common["representation_dim"] = int(agcrn_cfg.pop("representation_dim"))
         return AGCRNBackbone(**common, **agcrn_cfg)
 
+    if name == "stgcn":
+        stgcn_cfg = dict(backbone_cfg.get("stgcn", {}) or {})
+        if "representation_dim" in stgcn_cfg:
+            common["representation_dim"] = int(stgcn_cfg.pop("representation_dim"))
+        return STGCNBackbone(**common, **stgcn_cfg)
+
+    if name in {"stnorm", "st_norm", "stnorm_wavenet"}:
+        stnorm_cfg = dict(backbone_cfg.get("stnorm_wavenet", {}) or {})
+        if "representation_dim" in stnorm_cfg:
+            common["representation_dim"] = int(stnorm_cfg.pop("representation_dim"))
+        return STNormWaveNetBackbone(**common, **stnorm_cfg)
+
     raise ValueError(
         f"Unsupported MODEL.backbone_name={name!r}; "
-        "expected one of stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn"
+        "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn, stgcn, stnorm"
     )
 
 
@@ -65,6 +86,9 @@ __all__ = [
     "AGCRNBackbone",
     "BaseBackbone",
     "GraphWaveNetBackbone",
+    "STGCNBackbone",
+    "STIDBackbone",
     "STIDMLPBackbone",
+    "STNormWaveNetBackbone",
     "build_backbone",
 ]

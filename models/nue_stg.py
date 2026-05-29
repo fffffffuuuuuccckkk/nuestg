@@ -617,7 +617,13 @@ class NUESTG(nn.Module):
         cur_time_emb = time_out["cur_time_emb"] if self.use_current_timestamp_for_env else None
         future_time_emb = time_out["future_time_emb"]
 
-        backbone_out = self.backbone(x, adj=backbone_adj if backbone_adj is not None else adj)
+        backbone_out = self.backbone(
+            x,
+            adj=backbone_adj if backbone_adj is not None else adj,
+            seq_time=seq_time,
+            cur_time=cur_time,
+            future_time=future_time,
+        )
         z_raw = self._apply_time_to_z(backbone_out["z_inv"], time_out["cur_time_emb"])
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(
@@ -820,7 +826,13 @@ class NUESTG(nn.Module):
         adj = getattr(self, "adj_norm", None)
         backbone_adj = getattr(self, "backbone_adj", None)
 
-        backbone_out = self.backbone(x, adj=backbone_adj if backbone_adj is not None else adj)
+        backbone_out = self.backbone(
+            x,
+            adj=backbone_adj if backbone_adj is not None else adj,
+            seq_time=seq_time,
+            cur_time=cur_time,
+            future_time=future_time,
+        )
         z_raw = backbone_out["z_inv"]
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu, env_logvar, env_raw = self.env_encoder(x, adj)

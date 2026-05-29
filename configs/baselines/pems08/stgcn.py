@@ -11,15 +11,15 @@ deep_update(
     CONFIG,
     {
         "RUN": {
-            "method": "STID-like MLP",
+            "method": "STGCN",
             "category": "forecasting",
             "setting": "forecasting",
             "status": "runnable",
-            "reference_status": "simplified",
-            "notes": "Baseline-only lightweight STID-like MLP; not official STID.",
+            "reference_status": "faithful_native",
+            "notes": "Native STGCN adapted from hazdzz/STGCN; uses local scaler/splits.",
         },
-        "MODEL": {"backbone_name": "stid_mlp", "backbone": {"name": "stid_mlp"}},
-        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_stid_mlp"},
+        "MODEL": {"backbone_name": "stgcn", "backbone": {"name": "stgcn"}},
+        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_stgcn"},
     },
 )
 apply_ablation(CONFIG, "no_env")
