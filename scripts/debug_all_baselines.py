@@ -15,23 +15,36 @@ from experiments.baseline_registry import iter_baselines
 def main() -> None:
     parser = argparse.ArgumentParser(description="Debug runnable baselines and print reference status.")
     parser.add_argument("--dataset", default="pems08")
-    parser.add_argument("--category", default="forecasting", choices=["forecasting", "plugin_ours", "all"])
+    parser.add_argument(
+        "--category",
+        default="all",
+        choices=["forecasting", "st_ood", "plugin_ours", "all"],
+        help=(
+            "Which registry category to print. `all` means baseline categories "
+            "(forecasting + st_ood); use plugin_ours explicitly for our method variants. "
+            "Runnable entries are debugged; external entries are reported and skipped."
+        ),
+    )
     parser.add_argument("--batch_size", default="4")
     parser.add_argument("--num_workers", default="0")
     parser.add_argument("--dry_run", action="store_true", help="Print commands and reference statuses without running.")
     args, extra = parser.parse_known_args()
 
-    categories = ["forecasting", "plugin_ours"] if args.category == "all" else [args.category]
+    categories = ["forecasting", "st_ood"] if args.category == "all" else [args.category]
     entries = []
     for category in categories:
-        entries.extend(iter_baselines(args.dataset, status="runnable", category=category))
+        entries.extend(iter_baselines(args.dataset, category=category))
 
     for entry in entries:
         ref_status = entry.get("reference_status", "unknown")
         impl_type = entry.get("implementation_type", ref_status)
-        print(f"[{entry['name']}] reference_status={ref_status} implementation_type={impl_type}")
+        status = entry.get("status", "unknown")
+        print(f"[{entry['name']}] status={status} reference_status={ref_status} implementation_type={impl_type}")
         print(f"  repo={entry.get('official_repo') or 'n/a'}")
         print(f"  files={', '.join(entry.get('referenced_files') or ['n/a'])}")
+        if status != "runnable":
+            print(f"  skip={entry.get('command', 'external result import required')}")
+            continue
         cmd = [
             sys.executable,
             "train.py",

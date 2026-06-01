@@ -121,6 +121,24 @@ baselines use the local `train.py` data split, scaler, masks, and metrics.
   components for LargeST/TrafficStream/KnowAir. Implemented here: no native
   model, only metadata and result import placeholders.
 
+## Reference File Audit Checklist
+
+These are the local public-repository files checked before marking a baseline
+as `faithful_native` or `external_required`. If a future implementation changes
+status, extend this checklist before adding the runnable config.
+
+| Baseline | README | Model / Layer Files | Config Files | Train / Evaluate Files |
+|---|---|---|---|---|
+| Graph WaveNet / GWNet | `README.md` | `model.py::gwnet/gcn/nconv`, `util.py::load_adj` | `train.py` CLI args, `util.py::load_adj` `adjtype` handling | `train.py` |
+| AGCRN | `readme.md` | `model/AGCRN.py`, `model/AGCN.py`, `model/AGCRNCell.py` | `model/PEMSD8_AGCRN.conf`, `model/PEMSD4_AGCRN.conf` | `model/Run.py`, `model/BasicTrainer.py`, `lib/dataloader.py` |
+| STID | `README.md` | `stid/arch/stid_arch.py`, `stid/arch/mlp.py` | `stid/PEMS08.py` | `experiments/train.py`, `experiments/evaluate.py`, `basicts/runners/base_tsf_runner.py` |
+| STGCN | `README.md` | `model/models.py`, `model/layers.py` | `script/opt.py` | `main.py`, `script/dataloader.py`, `script/utility.py` |
+| ST-Norm | `README.md` | `models/Wavenet.py`, `utils/math_utils.py` | `main.py` CLI args | `main.py`, `utils/tester.py`, `utils/data_utils.py` |
+| D2STGNN | `README.md` | `models/model.py`, `models/diffusion_block/dif_block.py`, `models/inherent_block/inh_block.py`, `models/dynamic_graph_conv/dy_graph_conv.py`, `models/decouple/estimation_gate.py`, `models/decouple/residual_decomp.py` | `configs/PEMS08.yaml`, `configs/METR-LA.yaml`, `configs/PEMS-BAY.yaml` | `main.py`, `models/trainer.py` |
+| CaST | `README.md` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/layers/cell.py`, `src/base/model.py` | `experiments/cast/main.py` args/data assumptions | `experiments/cast/main.py`, `src/base/trainer.py`, `src/trainers/cast_trainer.py` |
+| STONE | `README.md` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `src/utils/spatial_side_information.py` | `Knowair/config.yaml` | `experiments/stone/main.py`, `Knowair/train.py` |
+| STOP | `README.md` | `LargeST/src/models/stop.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py` | `KnowAir/src/utils/config.yaml` plus dataset-specific experiment args | `LargeST/experiments/stop/main.py`, `TrafficStream/experiments/stop/main.py`, `KnowAir/experiments/stop/main.py`, corresponding `src/engines/stop_engine.py` |
+
 ## Local Reference Checkouts Read
 
 ```text

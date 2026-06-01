@@ -505,6 +505,12 @@ bash scripts/collect_all_results.sh
 python scripts/debug_all_baselines.py --dataset pems08 --dry_run
 ```
 
+`debug_all_baselines.py` prints every registered forecasting/ST-OOD baseline's
+`reference_status`. Runnable baselines are executed unless `--dry_run` is set;
+`external_required` methods are reported with `skipped_external_missing` and
+skipped, so they cannot be mistaken for local implementations. Ours plug-in
+variants can be inspected separately with `--category plugin_ours`.
+
 The scripts accept environment variables:
 
 ```bash
