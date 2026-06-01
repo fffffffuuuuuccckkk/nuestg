@@ -22,5 +22,6 @@ for seed in $SEEDS; do
   run_if_exists "configs/baselines/${DATASET}/agcrn.py" "$seed"
   run_if_exists "configs/baselines/${DATASET}/stgcn.py" "$seed"
   run_if_exists "configs/baselines/${DATASET}/stnorm.py" "$seed"
+  run_if_exists "configs/baselines/${DATASET}/d2stgnn.py" "$seed"
   run_if_exists "configs/baselines/${DATASET}/stid_mlp.py" "$seed"
 done

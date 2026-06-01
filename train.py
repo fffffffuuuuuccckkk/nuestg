@@ -161,6 +161,10 @@ BACKBONE_DESCRIPTIONS = {
     "stnorm": "faithful native ST-Norm WaveNet backbone",
     "st_norm": "faithful native ST-Norm WaveNet backbone",
     "stnorm_wavenet": "faithful native ST-Norm WaveNet backbone",
+    "d2stgnn": "official-wrapper D2STGNN backbone adapted to the shared interface",
+    "cast": "fixed-node CaST native adapter; simplified relative to official PyG/ST-OOD pipeline",
+    "stone": "fixed-node STONE native adapter with learnable semantic fallback",
+    "stop": "faithful native STOP backbone adapted from the LargeST official code",
 }
 
 

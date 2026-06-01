@@ -456,6 +456,9 @@ Runnable forecasting baselines:
 - `ST-Norm`: `configs/baselines/pems08/stnorm.py`, `faithful_native`, adapted
   from official `ST-Norm/models/Wavenet.py`. ST-Norm is model-internal
   spatial/temporal normalization, not a replacement for the train-split scaler.
+- `D2STGNN`: `configs/baselines/pems08/d2stgnn.py`, `official_wrapper`, loads
+  the official local D2STGNN `models/model.py` and adapts local TOD/DOW,
+  scaler, splits, and metrics.
 - `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`, `simplified`.
   This is retained only as a lightweight debug/ablation baseline and should
   not be reported as official STID.
@@ -475,11 +478,28 @@ Runnable NUE-STG plug-in backbone experiments:
 These keep the unified NUE-STG environment utility module and only swap the
 invariant backbone that produces `z_inv` and `y_inv`.
 
-External-required forecasting and ST-OOD baselines:
+Runnable ST-OOD / fixed-node adapters:
 
-- Forecasting: `DGCRN`, `D2STGNN`, `STAEformer`.
-- ST-OOD / distribution shift: `CauSTG`, `CaST`, `STONE`, `Samen`, `CAN-ST`,
-  `STOP`, `DIDA`, `I-DIDA`, `EAGLE`.
+- `CaST-fixed-node-adapter`: `configs/baselines/pems08/cast.py`,
+  `simplified`. It keeps CaST temporal disentangling, environment codebook,
+  causal edge scoring, and message passing, but replaces official PyG graph
+  Data objects with dense fixed-node PyTorch adjacency because the current
+  environment lacks `torch_geometric`/`einops`.
+- `STONE-fixed-node-adapter`: `configs/baselines/pems08/stone.py`,
+  `simplified`. It keeps STONE-style temporal gated convolution, semantic
+  stream, adaptive interaction, graph aggregation, and gated fusion, but PEMS
+  lacks the official coordinates/meta side information, so semantic features
+  fall back to learnable node embeddings.
+- `STOP`: `configs/baselines/pems08/stop.py`, `faithful_native`, adapted from
+  official LargeST `src/models/stop.py` with local timestamps/scaler/splits.
+  The official SOOD node split/cross-year engine is not used in this fixed-node
+  baseline config.
+
+External-required baselines:
+
+- Forecasting: `DGCRN`, `STAEformer`.
+- ST-OOD / distribution shift: `CauSTG`, `Samen`, `CAN-ST`, `DIDA`,
+  `I-DIDA`, `EAGLE`.
 
 These are registered with `status=external_required`. The repository provides
 metadata configs and import templates under
@@ -507,9 +527,10 @@ python scripts/debug_all_baselines.py --dataset pems08 --dry_run
 
 `debug_all_baselines.py` prints every registered forecasting/ST-OOD baseline's
 `reference_status`. Runnable baselines are executed unless `--dry_run` is set;
-`external_required` methods are reported with `skipped_external_missing` and
-skipped, so they cannot be mistaken for local implementations. Ours plug-in
-variants can be inspected separately with `--category plugin_ours`.
+remaining `external_required` methods are reported with
+`skipped_external_missing` and skipped, so they cannot be mistaken for local
+implementations. Ours plug-in variants can be inspected separately with
+`--category plugin_ours`.
 
 The scripts accept environment variables:
 
@@ -787,9 +808,10 @@ history-similar/future-similar samples.
   mining via the existing `SWAP.pair_mining` config slots.
 - `stid_mlp` is a lightweight simplified debug baseline; use `backbone_name=stid`
   for the faithful native STID baseline.
-- D2STGNN, CaST, STONE, STOP, and the remaining ST-OOD baselines are not native
-  implementations in this repo. Use official code/result import unless a real
-  wrapper is added.
+- D2STGNN is now an official-model wrapper and STOP is a faithful native
+  fixed-node adapter. CaST and STONE are runnable fixed-node simplified
+  adapters, not full official ST-OOD reproductions. DGCRN, STAEformer, CauSTG,
+  Samen, CAN-ST, DIDA, I-DIDA, and EAGLE remain external-required.
 - The current separation modes are computation-level constraints, not formal
   guarantees that Z contains every invariant factor and E contains only
   environment factors.

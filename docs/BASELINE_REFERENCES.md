@@ -13,10 +13,10 @@ baselines use the local `train.py` data split, scaler, masks, and metrics.
 | AGCRN | 2020 NeurIPS | https://github.com/LeiBAI/AGCRN | `model/AGCRN.py::AGCRN/AVWDCRNN`, `model/AGCN.py::AVWGCN`, `model/AGCRNCell.py::AGCRNCell`, `lib/dataloader.py` | `faithful_native` | Native `AGCRNBackbone` keeps node embeddings, AVWGCN weights/bias pools, Chebyshev adaptive supports, recurrent encoder layers, official gate/update equations, and Conv2d output projection. It adds a representation projection for `z_inv`. | MIT license found locally. |
 | STGCN | 2018 IJCAI | https://github.com/hazdzz/STGCN | `model/models.py::STGCNChebGraphConv`, `model/layers.py::TemporalConvLayer/ChebGraphConv/STConvBlock/OutputBlock`, `main.py` | `faithful_native` | Native `STGCNBackbone` keeps temporal gated convolutions, Chebyshev graph convolution, ST-Conv blocks, layer norm, dropout, and final node-wise output mapping. It uses the local normalized adjacency and local scaler/splits. | LGPL-2.1 license found locally. |
 | ST-Norm | 2021 KDD | https://github.com/JLDeng/ST-Norm | `models/Wavenet.py::SNorm/TNorm/Wavenet`, `main.py` | `faithful_native` | Native `STNormWaveNetBackbone` keeps model-internal spatial normalization and temporal normalization inside a WaveNet backbone. It is not a replacement for the train-split z-score scaler. It exposes `z_inv` from the end hidden state. | No LICENSE file found in local checkout; verify upstream license before redistribution beyond this project. |
-| D2STGNN | 2022 VLDB | https://github.com/GestaltCogTeam/D2STGNN | `models/model.py::D2STGNN/DecoupleLayer`, `models/diffusion_block/dif_block.py::DifBlock`, `models/inherent_block/inh_block.py::InhBlock`, `models/dynamic_graph_conv/dy_graph_conv.py::DynamicGraphConstructor`, `models/decouple/estimation_gate.py::EstimationGate`, `models/decouple/residual_decomp.py::ResidualDecomp`, `configs/PEMS08.yaml`, `main.py` | `external_required` | Not reimplemented natively. Official code has decoupled diffusion/inherent branches, dynamic graph learning, estimation gate, residual decomposition, curriculum learning, and dataset-specific loaders. Use external wrapper/result import until a full adapter is written. | No LICENSE file found in local checkout; verify upstream license before use. |
-| CaST | 2023 NeurIPS | https://github.com/yutong-xia/CaST | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/base/trainer.py`, `experiments/cast/main.py`, `README.md` | `external_required` | Not reimplemented natively. Official CaST handles temporal OOD with causal treatment, dynamic spatial causation, HL deconfounder components, edge attributes, and dataset format assumptions. Current repo only provides external result import placeholders. | No LICENSE file found in local checkout; verify upstream license before use. |
-| STONE | 2024 KDD | https://github.com/PoorOtterBob/STONE-KDD-2024 | `README.md`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py` | `external_required` | Not reimplemented natively. Official STONE requires spatial/structural shift settings, Fréchet embedding, semantic graphs, graph perturbation, and coordinates/meta side information. Fixed-node PEMS without coordinates/meta should be treated as a fallback setting, not full STONE. | No LICENSE file found in local checkout; verify upstream license before use. |
-| STOP | 2025 ICML | https://github.com/PoorOtterBob/STOP | `README.md`, `LargeST/src/models/stop.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py`, `experiments/stop/main.py` | `external_required` | Not reimplemented natively. Official STOP depends on special OOD dataset objects for LargeST/TrafficStream/KnowAir and centralized interaction components. Add an adapter rather than changing the local BasicTS dataloader. | No LICENSE file found in local checkout; verify upstream license before use. |
+| D2STGNN | 2022 VLDB | https://github.com/GestaltCogTeam/D2STGNN | `models/model.py::D2STGNN/DecoupleLayer`, `models/diffusion_block/dif_block.py::DifBlock`, `models/inherent_block/inh_block.py::InhBlock`, `models/dynamic_graph_conv/dy_graph_conv.py::DynamicGraphConstructor`, `models/decouple/estimation_gate.py::EstimationGate`, `models/decouple/residual_decomp.py::ResidualDecomp`, `configs/PEMS08.yaml`, `main.py` | `official_wrapper` | `D2STGNNBackbone` loads the official `models/model.py` directly and adapts local `[B,L,N,C]` plus generated TOD/DOW to official value+time channels. It uses local scaler/splits/metrics and exposes an auxiliary `z_inv` projection for the common backbone API. | No LICENSE file found in local checkout; verify upstream license before use. |
+| CaST-fixed-node-adapter | 2023 NeurIPS | https://github.com/yutong-xia/CaST | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/layers/dilated_conv.py`, `src/utils/dataset.py`, `src/base/trainer.py`, `experiments/cast/main.py`, `README.md` | `simplified` | `CaSTBackbone` is runnable through local `train.py` and keeps temporal disentangling, environment codebook, causal edge scoring, node embeddings, and message passing. Because `torch_geometric`/`einops` are absent and local PEMS batches are fixed-node tensors rather than official graph Data objects, graph operations are dense PyTorch fixed-node adapters. Do not report as full official CaST ST-OOD reproduction. | No LICENSE file found in local checkout; verify upstream license before use. |
+| STONE-fixed-node-adapter | 2024 KDD | https://github.com/PoorOtterBob/STONE-KDD-2024 | `README.md`, `src/base/stone.py`, `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py` | `simplified` | `STONEBackbone` is runnable through local `train.py` and keeps STONE-style temporal gated convolution, semantic stream, adaptive interaction, graph aggregation, and gated fusion. PEMS fixed-node data lacks official coordinates/meta side information and the spatial/structural-shift protocol, so semantic features fall back to learnable node embeddings. Do not report as full official STONE. | No LICENSE file found in local checkout; verify upstream license before use. |
+| STOP | 2025 ICML | https://github.com/PoorOtterBob/STOP | `README.md`, `LargeST/src/models/stop.py::STOP/MLP`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py` | `faithful_native` | `STOPBackbone` keeps the official LargeST STOP model structure: decomposition MLP, TOD/DOW prompt embeddings, residual backcast branch, and decoder. It runs on local fixed-node PEMS splits/scaler/metrics; the special official SOOD node split protocol is not used by this baseline config. | No LICENSE file found in local checkout; verify upstream license before use. |
 | DGCRN | TBD, not audited | external official code required | Not read in this pass; no local official checkout was found under `/data/OuXiaoyu/mystg/baselines`. | `external_required` | Import externally reproduced results only. Do not claim this repo implements DGCRN. | Verify upstream license. |
 | STAEformer | TBD, not audited | external official code required | Not read in this pass; no local official checkout was found under `/data/OuXiaoyu/mystg/baselines`. | `external_required` | Import externally reproduced results only. Do not claim this repo implements STAEformer. | Verify upstream license. |
 | CauSTG | TBD, not audited | external official code required | Not read in this pass; no local official checkout was found under `/data/OuXiaoyu/mystg/baselines`. | `external_required` | Import externally reproduced results only unless official code is added and inspected. | Verify upstream license. |
@@ -31,8 +31,8 @@ baselines use the local `train.py` data split, scaler, masks, and metrics.
 - `faithful_native`: runnable through local `train.py`; architecture was checked
   against the listed public repository files and adapted only at the
   input/output interface.
-- `official_wrapper`: reserved for future adapters that call official model
-  code directly.
+- `official_wrapper`: runnable adapter that calls official model code directly while
+  keeping this repository's scaler, split, metric, and input/output interface.
 - `simplified`: runnable only for debugging or appendix experiments; not a
   main-paper official baseline.
 - `external_required`: not trained by local `train.py`; use the CSV import
@@ -105,21 +105,60 @@ baselines use the local `train.py` data split, scaler, masks, and metrics.
   does not replace the train-split scaler. `z_inv` is projected from the final
   hidden state for the shared interface.
 
-### External-Required ST-OOD / Complex Baselines
+### D2STGNN
 
-- D2STGNN expected modules: decoupled diffusion and inherent branches, dynamic
-  graph constructor, estimation gate, residual decomposition, and official
-  curriculum/data handling. Implemented here: no native model, only metadata
-  and result import placeholders.
-- CaST expected modules: temporal OOD treatment, dynamic spatial causation,
-  causal/deconfounder components, and official data assumptions. Implemented
-  here: no native model, only metadata and result import placeholders.
-- STONE expected modules: spatial/structural shift protocol, Fréchet embedding,
-  semantic graph, coordinates/meta side information. Implemented here: no
-  native model, only metadata and result import placeholders.
-- STOP expected modules: official OOD dataset objects and STOP interaction
-  components for LargeST/TrafficStream/KnowAir. Implemented here: no native
-  model, only metadata and result import placeholders.
+- Expected from reference: decoupled diffusion and inherent branches, dynamic
+  graph constructor, estimation gate, residual decomposition, adaptive/static
+  graph usage, and value+TOD+DOW input convention.
+- Implemented here:
+  `models/backbones/d2stgnn.py::D2STGNNBackbone` loads official
+  `/data/OuXiaoyu/mystg/baselines/D2STGNN/models/model.py` directly while
+  isolating the official `models` and `utils` namespaces from this repository.
+- Missing/different: local `train.py` replaces official trainer, curriculum
+  learning, and min-max traffic-flow postprocessing. `z_inv` is an adapter
+  projection of local input history because official D2STGNN returns forecast
+  only.
+
+### CaST-Fixed-Node-Adapter
+
+- Expected from reference: temporal entity/environment disentangling,
+  environment codebook, edge causal scoring, Hodge/Laguerre edge convolution,
+  node message passing, and official graph Data objects with edge attributes.
+- Implemented here: `models/backbones/cast.py::CaSTBackbone` keeps the
+  temporal disentangler, codebook, node embeddings, causal edge score MLP, and
+  message passing under dense PyTorch fixed-node adjacency.
+- Missing/different: no `torch_geometric`, no official graph Data dataset
+  object, no full temporal OOD graph preprocessing. This is `simplified` and
+  should be used for debug/appendix unless a full official adapter is added.
+
+### STONE-Fixed-Node-Adapter
+
+- Expected from reference: spatial/structural-shift setting, Fréchet spatial
+  embedding, semantic graph and coordinates/meta side information, temporal
+  gated convolution, adaptive interaction, and gated fusion.
+- Implemented here: `models/backbones/stone.py::STONEBackbone` keeps temporal
+  gated convolution, semantic stream, adaptive interaction, graph aggregation,
+  and gated fusion.
+- Missing/different: PEMS fixed-node setting lacks official coordinates/meta
+  and new-node shift side information; semantic features fall back to learnable
+  node embeddings. This is `simplified` and should not be reported as full
+  official STONE.
+
+### STOP
+
+- Expected from reference: LargeST STOP base MLP with series decomposition,
+  TOD/DOW prompt embeddings, residual backcast branch, optional core adaptive
+  interaction, and decoder.
+- Implemented here: `models/backbones/stop.py::STOPBackbone` keeps the
+  decomposition MLP, prompt embeddings, residual backcast branch, and decoder.
+- Missing/different: local fixed-node config does not run the official SOOD
+  node increase/decrease split or cross-year OOD engine.
+
+### External-Required Baselines Still Not In Local Checkouts
+
+- DGCRN, STAEformer, CauSTG, Samen, CAN-ST, DIDA, I-DIDA, and EAGLE remain
+  `external_required` unless official code is added under
+  `/data/OuXiaoyu/mystg/baselines` and audited.
 
 ## Reference File Audit Checklist
 

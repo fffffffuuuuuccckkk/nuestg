@@ -5,11 +5,15 @@ from typing import Any, Dict
 
 from models.backbones.agcrn import AGCRNBackbone
 from models.backbones.base import BaseBackbone
+from models.backbones.cast import CaSTBackbone
+from models.backbones.d2stgnn import D2STGNNBackbone
 from models.backbones.graph_wavenet import GraphWaveNetBackbone
 from models.backbones.stgcn import STGCNBackbone
 from models.backbones.stid import STIDBackbone
 from models.backbones.stid_mlp import STIDMLPBackbone
 from models.backbones.stnorm_wavenet import STNormWaveNetBackbone
+from models.backbones.stone import STONEBackbone
+from models.backbones.stop import STOPBackbone
 
 
 def _to_model_dict(cfg: Any) -> Dict:
@@ -76,19 +80,48 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             common["representation_dim"] = int(stnorm_cfg.pop("representation_dim"))
         return STNormWaveNetBackbone(**common, **stnorm_cfg)
 
+    if name == "d2stgnn":
+        d2_cfg = dict(backbone_cfg.get("d2stgnn", {}) or {})
+        if "representation_dim" in d2_cfg:
+            common["representation_dim"] = int(d2_cfg.pop("representation_dim"))
+        return D2STGNNBackbone(**common, **d2_cfg)
+
+    if name == "cast":
+        cast_cfg = dict(backbone_cfg.get("cast", {}) or {})
+        if "representation_dim" in cast_cfg:
+            common["representation_dim"] = int(cast_cfg.pop("representation_dim"))
+        return CaSTBackbone(**common, **cast_cfg)
+
+    if name == "stone":
+        stone_cfg = dict(backbone_cfg.get("stone", {}) or {})
+        if "representation_dim" in stone_cfg:
+            common["representation_dim"] = int(stone_cfg.pop("representation_dim"))
+        return STONEBackbone(**common, **stone_cfg)
+
+    if name == "stop":
+        stop_cfg = dict(backbone_cfg.get("stop", {}) or {})
+        if "representation_dim" in stop_cfg:
+            common["representation_dim"] = int(stop_cfg.pop("representation_dim"))
+        return STOPBackbone(**common, **stop_cfg)
+
     raise ValueError(
         f"Unsupported MODEL.backbone_name={name!r}; "
-        "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn, stgcn, stnorm"
+        "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn, "
+        "stgcn, stnorm, d2stgnn, cast, stone, stop"
     )
 
 
 __all__ = [
     "AGCRNBackbone",
     "BaseBackbone",
+    "CaSTBackbone",
+    "D2STGNNBackbone",
     "GraphWaveNetBackbone",
     "STGCNBackbone",
     "STIDBackbone",
     "STIDMLPBackbone",
     "STNormWaveNetBackbone",
+    "STONEBackbone",
+    "STOPBackbone",
     "build_backbone",
 ]
