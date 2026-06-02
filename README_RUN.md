@@ -277,11 +277,11 @@ Main-table-safe or relatively safe:
 - `D2STGNN`: `official_local_wrapper` when the local official repo is found
 - `STID`: `faithful_native_adapter`
 
-Adapter/simplified:
+Faithful architecture adapters under the fixed-node PEMS08 runner:
 
-- `CaST-adapter`: `cast_fixed_node_simplified_adapter`
-- `STONE-adapter`: `stone_fixed_node_simplified_adapter`
-- `STOP-adapter`: `stop_architecture_adapter_without_sood_protocol`
+- `CaST-faithful-pytorch-adapter`: `cast_faithful_pytorch_adapter_with_official_aux_loss`
+- `STONE-faithful-pytorch-adapter`: `stone_faithful_pytorch_adapter_without_spatial_side_info`
+- `STOP-faithful-architecture-adapter`: `stop_faithful_architecture_adapter_without_sood_protocol`
 
 Official wrapper checks:
 
@@ -289,7 +289,7 @@ Official wrapper checks:
 - `STONE-official`: `configs/baselines/pems08/stone_official.py`
 - `STOP-official`: `configs/baselines/pems08/stop_official.py`
 
-CaST/STONE/STOP adapters remain separate from official wrapper checks. The
+CaST/STONE/STOP faithful adapters remain separate from official wrapper checks. The
 official configs use the local official repositories when present; otherwise
 they report `skipped_local_repo_missing`. They never fall back to the adapters.
 On the current PEMS08 BasicTS fixed-node data, the official checks skip with
@@ -304,7 +304,7 @@ are missing:
   pipeline, and Core_Adaptive centralized interaction training.
 
 Skipped official checks are not failures, but their skipped status means no
-adapter result can be claimed as full official CaST/STONE/STOP. ST-Norm is
+fixed-node adapter result can be claimed as full official CaST/STONE/STOP. ST-Norm is
 model-internal normalization; the data scaler is the shared train-split
 preprocessing scaler, and the two are not the same thing.
 
@@ -551,20 +551,21 @@ invariant backbone that produces `z_inv` and `y_inv`.
 
 Runnable ST-OOD / fixed-node adapters:
 
-- `CaST-fixed-node-adapter`: `configs/baselines/pems08/cast.py`,
-  `cast_fixed_node_simplified_adapter`. It keeps CaST temporal disentangling, environment codebook,
-  causal edge scoring, and message passing, but replaces official PyG graph
-  Data objects with dense fixed-node PyTorch adjacency because the current
-  environment lacks `torch_geometric`/`einops`.
-- `STONE-fixed-node-adapter`: `configs/baselines/pems08/stone.py`,
-  `stone_fixed_node_simplified_adapter`. It keeps STONE-style temporal gated convolution, semantic
-  stream, adaptive interaction, graph aggregation, and gated fusion, but PEMS
-  lacks the official coordinates/meta side information, so semantic features
-  fall back to learnable node embeddings.
-- `STOP`: `configs/baselines/pems08/stop.py`, `stop_architecture_adapter_without_sood_protocol`, adapted from
-  official LargeST `src/models/stop.py` with local timestamps/scaler/splits.
-  The official SOOD node split/cross-year engine is not used in this fixed-node
-  baseline config.
+- `CaST-faithful-pytorch-adapter`: `configs/baselines/pems08/cast.py`,
+  `cast_faithful_pytorch_adapter_with_official_aux_loss`. It keeps CaST
+  temporal disentangling, environment codebook, Hodge Laguerre edge
+  convolution, directed causal GCN message passing, node embeddings, predictor,
+  and the official VQ/commitment/MI auxiliary losses. It uses dense PyTorch
+  graph tensors because `basicts` has no `torch_geometric`/`einops`.
+- `STONE-faithful-pytorch-adapter`: `configs/baselines/pems08/stone.py`,
+  `stone_faithful_pytorch_adapter_without_spatial_side_info`. It follows the
+  official STONE `STBlock`, `STAggBlock`, and `GatedFusionBlock` architecture,
+  while PEMS semantic side information falls back to learnable node embeddings.
+- `STOP-faithful-architecture-adapter`: `configs/baselines/pems08/stop.py`,
+  `stop_faithful_architecture_adapter_without_sood_protocol`, adapted from
+  official LargeST `src/models/stop.py` with MLP decomposition/prompt encoder
+  and Core_Adaptive backcast. The official SOOD node split/cross-year engine is
+  not used in this fixed-node baseline config.
 
 External-required baselines:
 
@@ -581,7 +582,7 @@ or implementation is added later.
 The full reference and architecture audit table is in
 `docs/BASELINE_REFERENCES.md`. It records local reference paths, files/classes
 read before implementation, exact `reference_status`, deviations, main-table
-safety, adapter/simplified flags, and wrapper requirements.
+safety, adapter flags, and wrapper requirements.
 
 Useful commands:
 
@@ -880,7 +881,7 @@ history-similar/future-similar samples.
 - `stid_mlp` is a lightweight style-native debug baseline; use `backbone_name=stid`
   for the `faithful_native_adapter` STID baseline.
 - D2STGNN is now an official local wrapper. CaST, STONE, and STOP have runnable
-  fixed-node adapters plus separate official wrapper checks; under the current
+  faithful fixed-node architecture adapters plus separate official wrapper checks; under the current
   PEMS08 fixed-node config the official checks skip because the required
   official graph/spatial/SOOD protocols are missing. DGCRN, STAEformer, CauSTG,
   Samen, CAN-ST, DIDA, I-DIDA, and EAGLE remain external-required.

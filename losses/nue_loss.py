@@ -89,6 +89,8 @@ class NUESTGLossConfig:
     use_mask_sparse: bool = False
     lambda_mask_sparse: Optional[float] = None
     mask_sparse_warmup_epochs: int = 0
+    use_backbone_aux: bool = True
+    lambda_backbone_aux: float = 1.0
     use_club: bool = False
     lambda_club: float = 1e-3
     lambda_club_fit: float = 1.0
@@ -213,6 +215,10 @@ class NUESTGLoss(nn.Module):
         "cur_time_emb_norm",
         "seq_time_emb_norm",
         "future_time_emb_norm",
+        "backbone_aux_loss",
+        "cast_vq_loss",
+        "cast_commit_loss",
+        "cast_mi_loss",
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -347,6 +353,30 @@ class NUESTGLoss(nn.Module):
         if not enabled or value == 0:
             return 0.0
         return float(value) * self._warmup_factor(warmup_epochs)
+
+    def _backbone_aux_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        zero = self._zero(like)
+        logs = {
+            "backbone_aux_loss": zero,
+            "cast_vq_loss": zero,
+            "cast_commit_loss": zero,
+            "cast_mi_loss": zero,
+        }
+        aux_losses = output.get("backbone_aux_losses") or {}
+        aux_weights = output.get("backbone_aux_weights") or {}
+        total = zero
+        for name, value in aux_losses.items():
+            if not isinstance(value, torch.Tensor):
+                value = like.new_tensor(float(value))
+            weight = float(aux_weights.get(name, 1.0))
+            total = total + weight * value
+            logs[name] = value
+        logs["backbone_aux_loss"] = total
+        return total, logs
 
     def _persistence_terms(
         self,
@@ -775,6 +805,12 @@ class NUESTGLoss(nn.Module):
         ind_loss = sep_loss_raw if effective_lambda_sep != 0 else zero
         swap_loss = swap_loss_raw if effective_lambda_swap != 0 else zero
         swap_diff_loss = swap_diff_loss_raw if effective_lambda_swap != 0 else zero
+        backbone_aux_raw, backbone_aux_logs = self._backbone_aux_terms(output, prediction)
+        backbone_aux_loss = (
+            backbone_aux_raw
+            if self.cfg.use_backbone_aux and self.cfg.lambda_backbone_aux != 0
+            else zero
+        )
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
@@ -786,6 +822,7 @@ class NUESTGLoss(nn.Module):
             + effective_lambda_swap * swap_loss
             + effective_lambda_kl * kl_loss
             + self.cfg.lambda_rank * rank_loss
+            + self.cfg.lambda_backbone_aux * backbone_aux_loss
         )
 
         rho = output.get("rho")
@@ -873,6 +910,7 @@ class NUESTGLoss(nn.Module):
         }
         logs.update({key: value.detach() for key, value in future_mi_logs.items()})
         logs.update({key: value.detach() for key, value in sep_logs.items()})
+        logs.update({key: value.detach() for key, value in backbone_aux_logs.items()})
         logs.update(self._separation_logs(output, prediction))
         self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
         return total_loss, logs
@@ -1005,6 +1043,12 @@ class NUESTGLoss(nn.Module):
             else zero
         )
         env_consistency_loss = env_consistency_loss_raw if has_env_consistency else zero
+        backbone_aux_raw, backbone_aux_logs = self._backbone_aux_terms(output, prediction)
+        backbone_aux_loss = (
+            backbone_aux_raw
+            if self.cfg.use_backbone_aux and self.cfg.lambda_backbone_aux != 0
+            else zero
+        )
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
@@ -1018,6 +1062,7 @@ class NUESTGLoss(nn.Module):
             + self.cfg.lambda_entropy * entropy_loss
             + self.cfg.lambda_residual_norm * residual_norm_loss
             + self.cfg.lambda_env_consistency * env_consistency_loss
+            + self.cfg.lambda_backbone_aux * backbone_aux_loss
         )
 
         logs = {
@@ -1062,6 +1107,7 @@ class NUESTGLoss(nn.Module):
             "y_hat_mae": pred_loss_raw.detach(),
         }
         logs.update({key: value.detach() for key, value in persistence_logs.items()})
+        logs.update({key: value.detach() for key, value in backbone_aux_logs.items()})
         logs.update(self._separation_logs(output, prediction))
         self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
         return total_loss, logs

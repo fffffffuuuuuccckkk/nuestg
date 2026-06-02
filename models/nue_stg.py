@@ -813,6 +813,8 @@ class NUESTG(nn.Module):
             "future_time_emb": time_out["future_time_emb"],
             "timestamp_valid": time_out["timestamp_valid"],
             "time_encoding_type_id": time_out["time_encoding_type_id"],
+            "backbone_aux_losses": backbone_out.get("backbone_aux_losses", {}),
+            "backbone_aux_weights": backbone_out.get("backbone_aux_weights", {}),
         }
 
     def forward(
@@ -941,4 +943,6 @@ class NUESTG(nn.Module):
             "rho_swap": rho_swap,
             "env_perm": env_perm,
             "env_perm_index": None,
+            "backbone_aux_losses": backbone_out.get("backbone_aux_losses", {}),
+            "backbone_aux_weights": backbone_out.get("backbone_aux_weights", {}),
         }

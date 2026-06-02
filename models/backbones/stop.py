@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -34,6 +35,54 @@ class _FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x) + x
+
+
+class _CoreAdaptive(nn.Module):
+    """Official STOP `Core_Adaptive` module from LargeST `src/models/stop.py`."""
+
+    def __init__(
+        self,
+        d_in: int,
+        d_core: int,
+        d_out: int,
+        core_num: int,
+        head: int = 4,
+        nndropout: float = 0.3,
+    ) -> None:
+        super().__init__()
+        if core_num <= 0:
+            raise ValueError("core_num must be positive when Core_Adaptive is enabled")
+        if head <= 0 or d_core % head != 0:
+            raise ValueError(f"d_core={d_core} must be divisible by head={head}")
+        self.head_dim = d_core // head
+        self.cores = nn.Parameter(torch.randn((head, core_num, self.head_dim)))
+        self.value = nn.Conv2d(d_in, d_core, kernel_size=(1, 1))
+        self.ffn = nn.Sequential(
+            nn.Conv2d(d_in + d_core, 4 * (d_in + d_core), kernel_size=(1, 1)),
+            nn.GELU(),
+            nn.Dropout(nndropout),
+            nn.Conv2d(4 * (d_in + d_core), d_out, kernel_size=(1, 1)),
+        )
+        self.norm = nn.BatchNorm2d(d_out)
+        self.head = int(head)
+
+    def forward(self, x: torch.Tensor, ssie: Optional[torch.Tensor] = None, adj: Optional[torch.Tensor] = None) -> torch.Tensor:
+        del ssie, adj
+        x_in = x.permute(0, 3, 1, 2)
+        batch_size, channels, steps, nodes = x_in.shape
+        q = self.value(x_in)
+        q = torch.stack(torch.split(q, self.head_dim, dim=1), dim=1)
+        affiliation = torch.einsum("hcd,bhdtn->bhctn", self.cores, q).transpose(-2, -3) / math.sqrt(self.head_dim)
+        node_to_core = torch.softmax(affiliation, dim=-1)
+        core_to_node = torch.softmax(affiliation, dim=-2)
+        v = torch.stack(torch.split(x_in, self.head_dim, dim=1), dim=1)
+        v = torch.einsum("bhftn,bhtcn->bhftc", v, node_to_core)
+        v = torch.einsum("bhftc,bhtcn->bhftn", v, core_to_node)
+        v = v.transpose(0, 1).reshape(batch_size, channels, steps, nodes)
+        out = torch.cat([x_in - v, v], dim=1)
+        out = self.ffn(out)
+        out = self.norm(out + x_in)
+        return out.permute(0, 2, 3, 1)
 
 
 class _STOPBaseMLP(nn.Module):
@@ -119,6 +168,9 @@ class STOPBackbone(BaseBackbone):
         tod_size: int = 288,
         extra_type: bool = True,
         same: bool = False,
+        core: int = 8,
+        head: int = 4,
+        core_dropout: float = 0.3,
         num_time_in_day: int = 288,
         num_day_in_week: int = 7,
     ) -> None:
@@ -130,7 +182,18 @@ class STOPBackbone(BaseBackbone):
         self.stmodel = _STOPBaseMLP(input_len, output_len, output_dim, num_layer, model_dim, prompt_dim, tod_size, kernel_size)
         hidden_dim = model_dim + 2 * prompt_dim
         self.stmodel_detach = _STOPBaseMLP(input_len, output_len, output_dim, num_layer, model_dim, prompt_dim, tod_size, kernel_size)
-        self.backcast = nn.Sequential(nn.Linear(hidden_dim, 4 * hidden_dim), nn.GELU(), nn.Linear(4 * hidden_dim, hidden_dim))
+        self.use_core_adaptive = int(core) > 0
+        if self.use_core_adaptive:
+            self.backcast = _CoreAdaptive(
+                hidden_dim,
+                hidden_dim,
+                hidden_dim,
+                core_num=int(core),
+                head=int(head),
+                nndropout=float(core_dropout),
+            )
+        else:
+            self.backcast = nn.Sequential(nn.Linear(hidden_dim, 4 * hidden_dim), nn.GELU(), nn.Linear(4 * hidden_dim, hidden_dim))
         self.decoder = nn.Sequential(nn.Linear(hidden_dim, hid_dim), nn.GELU(), nn.Linear(hid_dim, output_len))
         self.representation_proj = nn.Linear(hidden_dim, representation_dim)
         self.inv_head = nn.Linear(representation_dim, output_len * output_dim)
@@ -152,7 +215,7 @@ class STOPBackbone(BaseBackbone):
         history = append_normalized_time_features(x, seq_time, self.num_time_in_day, self.num_day_in_week)
         h, z, y = self.stmodel(history)
         if self.extra_type:
-            h_res = self.backcast(z)
+            h_res = self.backcast(z, None) if self.use_core_adaptive else self.backcast(z)
             residual_encoder = self.stmodel if self.same else self.stmodel_detach
             z_res = residual_encoder.module(h - h_res)
             y = y + self.decoder(z_res).transpose(1, -1)

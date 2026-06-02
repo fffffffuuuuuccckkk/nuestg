@@ -15,6 +15,9 @@ ADAPTER_STATUSES = {
     "cast_fixed_node_simplified_adapter",
     "stone_fixed_node_simplified_adapter",
     "stop_architecture_adapter_without_sood_protocol",
+    "cast_faithful_pytorch_adapter_with_official_aux_loss",
+    "stone_faithful_pytorch_adapter_without_spatial_side_info",
+    "stop_faithful_architecture_adapter_without_sood_protocol",
 }
 
 MAIN_TABLE_SAFE_STATUSES = {

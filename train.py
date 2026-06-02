@@ -126,6 +126,10 @@ LOG_KEYS = [
     "cur_time_emb_norm",
     "seq_time_emb_norm",
     "future_time_emb_norm",
+    "backbone_aux_loss",
+    "cast_vq_loss",
+    "cast_commit_loss",
+    "cast_mi_loss",
 ]
 HORIZON_EVAL_STEPS = (3, 6, 12)
 METRIC_FIELDS = [
@@ -163,14 +167,14 @@ BACKBONE_DESCRIPTIONS = {
     "st_norm": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
     "stnorm_wavenet": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
     "d2stgnn": "official_local_wrapper D2STGNN backbone adapted to the shared interface",
-    "cast": "cast_fixed_node_simplified_adapter; not full official PyG/ST-OOD pipeline",
-    "cast_adapter": "cast_fixed_node_simplified_adapter; not full official PyG/ST-OOD pipeline",
+    "cast": "cast_faithful_pytorch_adapter_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
+    "cast_adapter": "cast_faithful_pytorch_adapter_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
     "cast_official": "official_local_wrapper gate for full CaST; skips when official PyG/data/loss protocol is unavailable",
-    "stone": "stone_fixed_node_simplified_adapter with learnable semantic fallback",
-    "stone_adapter": "stone_fixed_node_simplified_adapter with learnable semantic fallback",
+    "stone": "stone_faithful_pytorch_adapter_without_spatial_side_info with learnable semantic fallback",
+    "stone_adapter": "stone_faithful_pytorch_adapter_without_spatial_side_info with learnable semantic fallback",
     "stone_official": "official_local_wrapper gate for full STONE; skips when spatial side information is unavailable",
-    "stop": "stop_architecture_adapter_without_sood_protocol adapted from STOP architecture",
-    "stop_adapter": "stop_architecture_adapter_without_sood_protocol adapted from STOP architecture",
+    "stop": "stop_faithful_architecture_adapter_without_sood_protocol adapted from STOP architecture",
+    "stop_adapter": "stop_faithful_architecture_adapter_without_sood_protocol adapted from STOP architecture",
     "stop_official": "official_local_wrapper gate for full STOP; skips when official SOOD protocol is unavailable",
 }
 

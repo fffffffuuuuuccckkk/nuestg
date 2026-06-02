@@ -25,15 +25,15 @@ Reference statuses used by the PEMS08 baseline configs:
 - `faithful_native_adapter`
 - `stnorm_wavenet_adapter`
 - `official_local_wrapper`
-- `cast_fixed_node_simplified_adapter`
-- `stone_fixed_node_simplified_adapter`
-- `stop_architecture_adapter_without_sood_protocol`
+- `cast_faithful_pytorch_adapter_with_official_aux_loss`
+- `stone_faithful_pytorch_adapter_without_spatial_side_info`
+- `stop_faithful_architecture_adapter_without_sood_protocol`
 - `skipped_local_repo_missing`
 - `unsupported_current_dataset`
 
 ## Summary Table
 
-| Baseline | Year / Venue | Local repo path | Files checked | NUE-STG implementation | reference_status | Main-table safe | Adapter / simplified | Wrapper required |
+| Baseline | Year / Venue | Local repo path | Files checked | NUE-STG implementation | reference_status | Main-table safe | Adapter | Wrapper required |
 |---|---|---|---|---|---|---|---|---|
 | STGCN | 2018 IJCAI | `/data/OuXiaoyu/mystg/baselines/stgcn` | `model/layers.py`, `model/models.py`, `main.py`, `script/utility.py` | `models/backbones/stgcn.py` | `reference_native` | Yes | No | No |
 | Graph WaveNet / GWNet | 2019 IJCAI | `/data/OuXiaoyu/mystg/baselines/Graph-WaveNet` | `model.py`, `util.py`, `train.py` | `models/backbones/graph_wavenet.py` | `graphwavenet_native_adapter` | Yes | Adapter to local interface | No |
@@ -41,11 +41,11 @@ Reference statuses used by the PEMS08 baseline configs:
 | ST-Norm | 2021 KDD | `/data/OuXiaoyu/mystg/baselines/ST-Norm` | `models/Wavenet.py`, `main.py`, `utils/data_utils.py` | `models/backbones/stnorm_wavenet.py` | `stnorm_wavenet_adapter` | Relatively safe | Adapter to local interface | No |
 | D2STGNN | 2022 VLDB | `/data/OuXiaoyu/mystg/baselines/D2STGNN` | `models/model.py`, `models/diffusion_block/dif_block.py`, `models/inherent_block/inh_block.py`, `models/dynamic_graph_conv/dy_graph_conv.py`, `models/decouple/estimation_gate.py`, `models/decouple/residual_decomp.py`, `configs/PEMS08.yaml`, `main.py` | `models/backbones/d2stgnn.py` | `official_local_wrapper` | Yes if local wrapper loads | No | Yes, local path required |
 | STID | 2022 CIKM | `/data/OuXiaoyu/mystg/baselines/STID` | `stid/arch/stid_arch.py`, `stid/arch/mlp.py`, `stid/PEMS08.py` | `models/backbones/stid.py` | `faithful_native_adapter` | Yes | Adapter to local timestamp arrays | No |
-| CaST-adapter | 2023 NeurIPS | `/data/OuXiaoyu/mystg/baselines/CaST` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/base/trainer.py`, `experiments/cast/main.py`, `README.md` | `models/backbones/cast.py` | `cast_fixed_node_simplified_adapter` | No | Yes | No |
+| CaST-faithful-pytorch-adapter | 2023 NeurIPS | `/data/OuXiaoyu/mystg/baselines/CaST` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/trainers/cast_trainer.py`, `src/utils/dataset.py`, `experiments/cast/main.py`, `README.md` | `models/backbones/cast.py` | `cast_faithful_pytorch_adapter_with_official_aux_loss` | No | Yes | No |
 | CaST-official | 2023 NeurIPS | `/data/OuXiaoyu/mystg/baselines/CaST` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/utils/dataset.py`, `src/trainers/cast_trainer.py` | `models/backbones/cast_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
-| STONE-adapter | 2024 KDD | `/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py`, `README.md` | `models/backbones/stone.py` | `stone_fixed_node_simplified_adapter` | No | Yes | No |
+| STONE-faithful-pytorch-adapter | 2024 KDD | `/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py`, `README.md` | `models/backbones/stone.py` | `stone_faithful_pytorch_adapter_without_spatial_side_info` | No | Yes | No |
 | STONE-official | 2024 KDD | `/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py`, `src/base/stone.py`, `src/base/stone_engine.py` | `models/backbones/stone_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
-| STOP-adapter | 2025 ICML | `/data/OuXiaoyu/mystg/baselines/STOP` | `LargeST/src/models/stop.py`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py`, `README.md` | `models/backbones/stop.py` | `stop_architecture_adapter_without_sood_protocol` | No | Yes | No |
+| STOP-faithful-architecture-adapter | 2025 ICML | `/data/OuXiaoyu/mystg/baselines/STOP` | `LargeST/src/models/stop.py`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py`, `README.md` | `models/backbones/stop.py` | `stop_faithful_architecture_adapter_without_sood_protocol` | No | Yes | No |
 | STOP-official | 2025 ICML | `/data/OuXiaoyu/mystg/baselines/STOP` | `LargeST/src/models/stop.py`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `KnowAir/src/models/stop.py`, `TrafficStream/src/models/stop.py` | `models/backbones/stop_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
 
 ## Main-Table Safety Under Current PEMS08
@@ -58,9 +58,9 @@ Reference statuses used by the PEMS08 baseline configs:
 | ST-Norm | `stnorm_wavenet_adapter` | Yes, with note | Model-internal ST-Norm is separate from the shared train-split scaler. |
 | STID | `faithful_native_adapter` | Yes | Uses local timestamp arrays for official TOD/DOW inputs. |
 | D2STGNN | `official_local_wrapper` | Yes if wrapper passes | Uses the local official repo; TOD must be normalized `[0,1]`, DOW integer `0..6`. |
-| CaST-adapter | `cast_fixed_node_simplified_adapter` | No as official | Runnable adapter only; may be appendix/related-work evidence if labeled as adapter. |
-| STONE-adapter | `stone_fixed_node_simplified_adapter` | No as official | Runnable adapter only; lacks official spatial-shift side information. |
-| STOP-adapter | `stop_architecture_adapter_without_sood_protocol` | No as official | Runnable adapter only; lacks official SOOD/OOD protocol. |
+| CaST-faithful-pytorch-adapter | `cast_faithful_pytorch_adapter_with_official_aux_loss` | No as official | Runnable faithful architecture adapter; may be appendix/related-work evidence if labeled as fixed-node adapter. |
+| STONE-faithful-pytorch-adapter | `stone_faithful_pytorch_adapter_without_spatial_side_info` | No as official | Runnable faithful architecture adapter; lacks official spatial-shift side information. |
+| STOP-faithful-architecture-adapter | `stop_faithful_architecture_adapter_without_sood_protocol` | No as official | Runnable faithful architecture adapter; lacks official SOOD/OOD protocol. |
 | CaST-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required official CaST graph/loss protocol. |
 | STONE-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required STONE spatial side info and shift metadata. |
 | STOP-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required STOP SOOD/OOD protocol. |
@@ -143,18 +143,19 @@ Reference statuses used by the PEMS08 baseline configs:
 - Deviations: the official `history_data[...,1:3]` convention is represented by
   separate `inputs_timestamps`/`targets_timestamps` arrays in the local loader.
 
-### CaST-adapter
+### CaST-faithful-pytorch-adapter
 
 - Official core modules expected: PyTorch Geometric `Data` objects, temporal
   OoD treatment, disentanglement block, invariant parts and temporal
   environments, dynamic spatial causation, Hodge-Laplacian/edge-level
   convolution, causal treatment components, and graph-specific preprocessing.
-- Implemented in NUE-STG: fixed-node dense PyTorch adapter with temporal
-  disentangling, environment codebook, causal edge scoring, node embeddings,
-  and message passing.
-- Deviations: no official PyG `Data` object pipeline, graph-specific CaST
-  preprocessing, or full temporal OoD protocol. Report as `CaST-adapter`, not
-  official CaST.
+- Implemented in NUE-STG: fixed-node dense PyTorch adapter with CaST temporal
+  disentangling, environment codebook, Hodge Laguerre edge convolution,
+  directed causal GCN message passing, node embeddings, predictor, and
+  official VQ/commitment/MI auxiliary losses.
+- Deviations: no official PyG `PairData` object pipeline, graph-specific CaST
+  preprocessing, or full temporal OoD protocol. Report as
+  `CaST-faithful-pytorch-adapter`, not full official CaST.
 
 ### CaST-official
 
@@ -167,16 +168,17 @@ Reference statuses used by the PEMS08 baseline configs:
   edge graph structures, official preprocessing, and the official prediction +
   VQ/commitment/MI loss path. The current BasicTS fixed-node batch does not
   contain that protocol.
-- Fallback rule: never use `CaST-adapter` as the official result.
+- Fallback rule: never use the fixed-node CaST adapter as the official result.
 
-### STONE-adapter
+### STONE-faithful-pytorch-adapter
 
 - Official core modules expected: ST-OOD spatial/structural shift plus temporal
   shift, Frechet embedding, spatial heterogeneity modeling, temporal semantic
   graph, spatial semantic graph, and coordinate/meta/spatial side information.
-- Implemented in NUE-STG: fixed-node dense adapter with temporal gated
-  convolution, semantic stream, adaptive interaction, graph aggregation, and
-  gated fusion.
+- Implemented in NUE-STG: fixed-node dense PyTorch adapter with official
+  STONE `STBlock`, semantic attention MLP, dilated gated temporal convolutions,
+  `STAggBlock`, adaptive interaction graph construction, graph convolution, and
+  `GatedFusionBlock`.
 - Deviations: PEMS fixed-node cross-year data lacks the official STONE
   coordinate/meta/spatial-shift side information, so the current version is not
   full official STONE and must not be used as a main-table official baseline.
@@ -192,19 +194,19 @@ Reference statuses used by the PEMS08 baseline configs:
   information, Frechet/spatial-side features, observed/unobserved spatial
   splits, and structural-shift metadata. The current PEMS08 fixed-node setup
   does not provide those inputs.
-- Fallback rule: never use `STONE-adapter` as the official result.
+- Fallback rule: never use the fixed-node STONE adapter as the official result.
 
-### STOP-adapter
+### STOP-faithful-architecture-adapter
 
 - Official core modules expected: ICML 2025 ST-OOD/SOOD data protocol,
   robust spatio-temporal centralized interaction, decomposition/prompt/
   interaction/adaptive components, and LargeST/KnowAir/TrafficStream protocol.
-- Implemented in NUE-STG: STOP architecture adapter with series decomposition,
-  TOD/DOW prompt embeddings, residual MLP encoder, backcast residual branch,
-  and decoder.
+- Implemented in NUE-STG: STOP architecture adapter with official MLP series
+  decomposition, TOD/DOW prompt embeddings, residual MLP encoder,
+  Core_Adaptive backcast, detached residual encoder option, and decoder.
 - Deviations: the official SOOD/OOD data protocol, centralized interaction
   training protocol, and dataset protocols are not reproduced. Report as
-  `STOP-adapter`, not a full faithful official baseline.
+  `STOP-faithful-architecture-adapter`, not a full official baseline.
 
 ### STOP-official
 
@@ -217,7 +219,7 @@ Reference statuses used by the PEMS08 baseline configs:
   LargeST/KnowAir/TrafficStream data protocol plus Core_Adaptive centralized
   interaction training. The current PEMS08 fixed-node config does not provide
   that protocol.
-- Fallback rule: never use `STOP-adapter` as the official result.
+- Fallback rule: never use the fixed-node STOP adapter as the official result.
 
 ## Debug Commands
 

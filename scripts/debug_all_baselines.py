@@ -57,17 +57,17 @@ TARGET_BASELINES: List[Dict] = [
         "aliases": ["STID"],
     },
     {
-        "name": "CaST-adapter",
+        "name": "CaST-faithful-pytorch-adapter",
         "config": "configs/baselines/pems08/cast.py",
         "aliases": ["CaST", "CAST"],
     },
     {
-        "name": "STONE-adapter",
+        "name": "STONE-faithful-pytorch-adapter",
         "config": "configs/baselines/pems08/stone.py",
         "aliases": ["STONE-KDD-2024", "STONE"],
     },
     {
-        "name": "STOP-adapter",
+        "name": "STOP-faithful-architecture-adapter",
         "config": "configs/baselines/pems08/stop.py",
         "aliases": ["STOP"],
     },
