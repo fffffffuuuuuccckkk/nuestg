@@ -6,6 +6,7 @@ from typing import Any, Dict
 from models.backbones.agcrn import AGCRNBackbone
 from models.backbones.base import BaseBackbone
 from models.backbones.cast import CaSTBackbone
+from models.backbones.cast_official import CaSTOfficialBackbone
 from models.backbones.d2stgnn import D2STGNNBackbone
 from models.backbones.graph_wavenet import GraphWaveNetBackbone
 from models.backbones.stgcn import STGCNBackbone
@@ -13,7 +14,9 @@ from models.backbones.stid import STIDBackbone
 from models.backbones.stid_mlp import STIDMLPBackbone
 from models.backbones.stnorm_wavenet import STNormWaveNetBackbone
 from models.backbones.stone import STONEBackbone
+from models.backbones.stone_official import STONEOfficialBackbone
 from models.backbones.stop import STOPBackbone
+from models.backbones.stop_official import STOPOfficialBackbone
 
 
 def _to_model_dict(cfg: Any) -> Dict:
@@ -86,28 +89,56 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             common["representation_dim"] = int(d2_cfg.pop("representation_dim"))
         return D2STGNNBackbone(**common, **d2_cfg)
 
-    if name == "cast":
+    if name in {"cast", "cast_adapter"}:
         cast_cfg = dict(backbone_cfg.get("cast", {}) or {})
         if "representation_dim" in cast_cfg:
             common["representation_dim"] = int(cast_cfg.pop("representation_dim"))
         return CaSTBackbone(**common, **cast_cfg)
 
-    if name == "stone":
+    if name == "cast_official":
+        cast_cfg = dict(backbone_cfg.get("cast_official", {}) or {})
+        cast_cfg.setdefault("external_path", model_cfg.get("external_path", ""))
+        cast_cfg.setdefault("official_requires_special_data", model_cfg.get("official_requires_special_data", True))
+        cast_cfg.setdefault("unsupported_reason", model_cfg.get("unsupported_reason", ""))
+        if "representation_dim" in cast_cfg:
+            common["representation_dim"] = int(cast_cfg.pop("representation_dim"))
+        return CaSTOfficialBackbone(**common, **cast_cfg)
+
+    if name in {"stone", "stone_adapter"}:
         stone_cfg = dict(backbone_cfg.get("stone", {}) or {})
         if "representation_dim" in stone_cfg:
             common["representation_dim"] = int(stone_cfg.pop("representation_dim"))
         return STONEBackbone(**common, **stone_cfg)
 
-    if name == "stop":
+    if name == "stone_official":
+        stone_cfg = dict(backbone_cfg.get("stone_official", {}) or {})
+        stone_cfg.setdefault("external_path", model_cfg.get("external_path", ""))
+        stone_cfg.setdefault("official_requires_special_data", model_cfg.get("official_requires_special_data", True))
+        stone_cfg.setdefault("unsupported_reason", model_cfg.get("unsupported_reason", ""))
+        if "representation_dim" in stone_cfg:
+            common["representation_dim"] = int(stone_cfg.pop("representation_dim"))
+        return STONEOfficialBackbone(**common, **stone_cfg)
+
+    if name in {"stop", "stop_adapter"}:
         stop_cfg = dict(backbone_cfg.get("stop", {}) or {})
         if "representation_dim" in stop_cfg:
             common["representation_dim"] = int(stop_cfg.pop("representation_dim"))
         return STOPBackbone(**common, **stop_cfg)
 
+    if name == "stop_official":
+        stop_cfg = dict(backbone_cfg.get("stop_official", {}) or {})
+        stop_cfg.setdefault("external_path", model_cfg.get("external_path", ""))
+        stop_cfg.setdefault("official_requires_special_data", model_cfg.get("official_requires_special_data", True))
+        stop_cfg.setdefault("unsupported_reason", model_cfg.get("unsupported_reason", ""))
+        if "representation_dim" in stop_cfg:
+            common["representation_dim"] = int(stop_cfg.pop("representation_dim"))
+        return STOPOfficialBackbone(**common, **stop_cfg)
+
     raise ValueError(
         f"Unsupported MODEL.backbone_name={name!r}; "
         "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn, "
-        "stgcn, stnorm, d2stgnn, cast, stone, stop"
+        "stgcn, stnorm, d2stgnn, cast/cast_adapter/cast_official, "
+        "stone/stone_adapter/stone_official, stop/stop_adapter/stop_official"
     )
 
 
@@ -115,6 +146,7 @@ __all__ = [
     "AGCRNBackbone",
     "BaseBackbone",
     "CaSTBackbone",
+    "CaSTOfficialBackbone",
     "D2STGNNBackbone",
     "GraphWaveNetBackbone",
     "STGCNBackbone",
@@ -122,6 +154,8 @@ __all__ = [
     "STIDMLPBackbone",
     "STNormWaveNetBackbone",
     "STONEBackbone",
+    "STONEOfficialBackbone",
     "STOPBackbone",
+    "STOPOfficialBackbone",
     "build_backbone",
 ]

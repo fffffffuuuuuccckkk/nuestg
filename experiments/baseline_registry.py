@@ -12,8 +12,11 @@ LOCAL_REPO_PATHS = {
     "ST-Norm": "/data/OuXiaoyu/mystg/baselines/ST-Norm",
     "D2STGNN": "/data/OuXiaoyu/mystg/baselines/D2STGNN",
     "CaST-fixed-node-adapter": "/data/OuXiaoyu/mystg/baselines/CaST",
+    "CaST-official": "/data/OuXiaoyu/mystg/baselines/CaST",
     "STONE-fixed-node-adapter": "/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024",
+    "STONE-official": "/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024",
     "STOP": "/data/OuXiaoyu/mystg/baselines/STOP",
+    "STOP-official": "/data/OuXiaoyu/mystg/baselines/STOP",
 }
 
 
@@ -233,6 +236,23 @@ def _pems08_entries() -> List[Dict]:
             "official_repo": official_repo,
             "local_repo_path": LOCAL_REPO_PATHS.get(name, ""),
             "referenced_files": referenced_files,
+            "display_name": name,
+            "is_adapter": reference_status
+            in {
+                "cast_fixed_node_simplified_adapter",
+                "stone_fixed_node_simplified_adapter",
+                "stop_architecture_adapter_without_sood_protocol",
+            },
+            "is_official": reference_status == "official_local_wrapper",
+            "main_table_safe": reference_status
+            in {
+                "reference_native",
+                "graphwavenet_native_adapter",
+                "faithful_native_adapter",
+                "stnorm_wavenet_adapter",
+                "official_local_wrapper",
+            }
+            and name not in {"CaST-fixed-node-adapter", "STONE-fixed-node-adapter", "STOP"},
             "architecture_check": {
                 "expected": note,
                 "implemented": f"Backbone={backbone}, shared local scaler/splits/metrics.",
@@ -249,6 +269,69 @@ def _pems08_entries() -> List[Dict]:
         }
         for name, category, config, note, backbone, reference_status, official_repo, referenced_files in runnable
     ]
+    official_checks = [
+        {
+            "name": "CaST-official",
+            "display_name": "CaST-official",
+            "category": "st_ood",
+            "status": "official_check",
+            "config": "configs/baselines/pems08/cast_official.py",
+            "command": _train_command("configs/baselines/pems08/cast_official.py"),
+            "paper_note": "Full official CaST check; skips on PEMS08 because PyG graph Data, Hodge edge graph, preprocessing, and VQ/MI loss protocol are not available in the unified fixed-node batch.",
+            "expected_outputs": ["SKIP or official metrics"],
+            "reference_status": "official_local_wrapper",
+            "implementation_type": "official_local_wrapper",
+            "official_repo": "https://github.com/yutong-xia/CaST",
+            "local_repo_path": LOCAL_REPO_PATHS["CaST-official"],
+            "referenced_files": ["src/models/cast.py", "src/layers/cast_cell.py", "src/utils/dataset.py", "src/trainers/cast_trainer.py"],
+            "is_adapter": False,
+            "is_official": False,
+            "main_table_safe": False,
+            "unsupported_reason": "PEMS08 BasicTS fixed-node config cannot provide the full official CaST graph/loss/preprocessing protocol.",
+            "backbone": "cast_official",
+        },
+        {
+            "name": "STONE-official",
+            "display_name": "STONE-official",
+            "category": "st_ood",
+            "status": "official_check",
+            "config": "configs/baselines/pems08/stone_official.py",
+            "command": _train_command("configs/baselines/pems08/stone_official.py"),
+            "paper_note": "Full official STONE check; skips on PEMS08 because spatial side information and structural-shift metadata are required.",
+            "expected_outputs": ["SKIP or official metrics"],
+            "reference_status": "official_local_wrapper",
+            "implementation_type": "official_local_wrapper",
+            "official_repo": "https://github.com/PoorOtterBob/STONE-KDD-2024",
+            "local_repo_path": LOCAL_REPO_PATHS["STONE-official"],
+            "referenced_files": ["Knowair/model/STONE.py", "Knowair/frechet.py", "Knowair/spatial_side_information.py", "src/base/stone_engine.py"],
+            "is_adapter": False,
+            "is_official": False,
+            "main_table_safe": False,
+            "unsupported_reason": "PEMS08 fixed-node config lacks STONE coordinate/meta/spatial-shift side information.",
+            "backbone": "stone_official",
+        },
+        {
+            "name": "STOP-official",
+            "display_name": "STOP-official",
+            "category": "st_ood",
+            "status": "official_check",
+            "config": "configs/baselines/pems08/stop_official.py",
+            "command": _train_command("configs/baselines/pems08/stop_official.py"),
+            "paper_note": "Full official STOP check; skips on PEMS08 because the SOOD/LargeST/KnowAir/TrafficStream protocol is required.",
+            "expected_outputs": ["SKIP or official metrics"],
+            "reference_status": "official_local_wrapper",
+            "implementation_type": "official_local_wrapper",
+            "official_repo": "https://github.com/PoorOtterBob/STOP",
+            "local_repo_path": LOCAL_REPO_PATHS["STOP-official"],
+            "referenced_files": ["LargeST/src/models/stop.py", "LargeST/src/engines/stop_engine.py", "KnowAir/src/models/stop.py", "TrafficStream/src/models/stop.py"],
+            "is_adapter": False,
+            "is_official": False,
+            "main_table_safe": False,
+            "unsupported_reason": "PEMS08 fixed-node config lacks the official STOP SOOD/OOD protocol.",
+            "backbone": "stop_official",
+        },
+    ]
+    entries.extend(official_checks)
     external_forecasting = [
         ("DGCRN", "Requires official or independently verified implementation."),
         ("STAEformer", "Requires official or independently verified implementation."),

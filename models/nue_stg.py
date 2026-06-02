@@ -54,6 +54,9 @@ class NUESTGConfig(BasicTSModelConfig):
     backbone: Dict = field(default_factory=dict)
     GWNET: Dict = field(default_factory=dict)
     STNORM: Dict = field(default_factory=dict)
+    external_path: str = ""
+    official_requires_special_data: bool = False
+    unsupported_reason: str = ""
     method_variant: str = "nue"
     separation: Dict = field(default_factory=dict)
     use_separated_z_for_y_inv: bool = True

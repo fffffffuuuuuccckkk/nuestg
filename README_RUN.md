@@ -283,11 +283,39 @@ Adapter/simplified:
 - `STONE-adapter`: `stone_fixed_node_simplified_adapter`
 - `STOP-adapter`: `stop_architecture_adapter_without_sood_protocol`
 
-CaST/STONE/STOP adapters are not full official baselines unless an official
-local wrapper and the required data/protocol are enabled. STOP-adapter does not
-reproduce the full official SOOD protocol unless official wrapper support is
-enabled. ST-Norm is model-internal normalization; the data scaler is the shared
-train-split preprocessing scaler, and the two are not the same thing.
+Official wrapper checks:
+
+- `CaST-official`: `configs/baselines/pems08/cast_official.py`
+- `STONE-official`: `configs/baselines/pems08/stone_official.py`
+- `STOP-official`: `configs/baselines/pems08/stop_official.py`
+
+CaST/STONE/STOP adapters remain separate from official wrapper checks. The
+official configs use the local official repositories when present; otherwise
+they report `skipped_local_repo_missing`. They never fall back to the adapters.
+On the current PEMS08 BasicTS fixed-node data, the official checks skip with
+`unsupported_current_dataset` because the required official data/protocol pieces
+are missing:
+
+- CaST needs PyG graph `Data`, Hodge edge graph preprocessing, and VQ/MI loss
+  integration.
+- STONE needs coordinate/meta spatial side information and structural-shift
+  observed/unobserved splits.
+- STOP needs the official SOOD/OOD protocol, LargeST/KnowAir/TrafficStream data
+  pipeline, and Core_Adaptive centralized interaction training.
+
+Skipped official checks are not failures, but their skipped status means no
+adapter result can be claimed as full official CaST/STONE/STOP. ST-Norm is
+model-internal normalization; the data scaler is the shared train-split
+preprocessing scaler, and the two are not the same thing.
+
+Official wrapper debug commands:
+
+```bash
+python train.py --config configs/baselines/pems08/cast_official.py --debug_batch
+python train.py --config configs/baselines/pems08/stone_official.py --debug_batch
+python train.py --config configs/baselines/pems08/stop_official.py --debug_batch
+python scripts/debug_all_baselines.py --dataset pems08 --batch_size 2 --num_workers 0
+```
 
 Example PEMS commands:
 
@@ -569,10 +597,11 @@ bash scripts/collect_all_results.sh
 python scripts/debug_all_baselines.py --dataset pems08 --dry_run
 ```
 
-`debug_all_baselines.py` prints and checks the nine requested local baselines.
-Runnable baselines are executed unless `--dry_run` is set; if a required local
-reference checkout is absent, that baseline is reported as
-`skipped_local_repo_missing` and skipped.
+`debug_all_baselines.py` prints and checks the runnable baseline adapters plus
+the CaST/STONE/STOP official wrapper gates. Runnable baselines are executed
+unless `--dry_run` is set; if a required local reference checkout is absent,
+that baseline is reported as `skipped_local_repo_missing` and skipped. Official
+wrapper skips are reported as `SKIP` rather than `PASS` or `FAIL`.
 
 The scripts accept environment variables:
 
@@ -850,9 +879,10 @@ history-similar/future-similar samples.
   mining via the existing `SWAP.pair_mining` config slots.
 - `stid_mlp` is a lightweight style-native debug baseline; use `backbone_name=stid`
   for the `faithful_native_adapter` STID baseline.
-- D2STGNN is now an official local wrapper and STOP is an architecture adapter
-  without the official SOOD protocol. CaST and STONE are runnable fixed-node simplified
-  adapters, not full official ST-OOD reproductions. DGCRN, STAEformer, CauSTG,
+- D2STGNN is now an official local wrapper. CaST, STONE, and STOP have runnable
+  fixed-node adapters plus separate official wrapper checks; under the current
+  PEMS08 fixed-node config the official checks skip because the required
+  official graph/spatial/SOOD protocols are missing. DGCRN, STAEformer, CauSTG,
   Samen, CAN-ST, DIDA, I-DIDA, and EAGLE remain external-required.
 - The current separation modes are computation-level constraints, not formal
   guarantees that Z contains every invariant factor and E contains only

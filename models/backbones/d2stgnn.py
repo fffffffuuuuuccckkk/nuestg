@@ -12,6 +12,7 @@ from torch import nn
 
 from models.backbones._time_utils import d2stgnn_time_features
 from models.backbones.base import BaseBackbone
+from models.backbones.official_utils import ensure_repo_exists_or_skip
 
 
 def _row_normalize(adj: torch.Tensor) -> torch.Tensor:
@@ -77,7 +78,7 @@ class D2STGNNBackbone(BaseBackbone):
         input_dim: int,
         output_dim: int,
         representation_dim: int,
-        repo_root: str = "/data/OuXiaoyu/mystg/baselines/D2STGNN",
+        repo_root: str = "",
         num_hidden: int = 32,
         node_hidden: int = 10,
         time_emb_dim: int = 10,
@@ -94,7 +95,13 @@ class D2STGNNBackbone(BaseBackbone):
             raise ValueError("Official D2STGNN wrapper currently supports output_dim=1.")
         if output_len % gap != 0:
             raise ValueError(f"D2STGNN requires output_len divisible by gap, got {output_len=} {gap=}.")
-        official_cls = _load_official_d2stgnn(repo_root)
+        repo_path = ensure_repo_exists_or_skip(
+            "D2STGNN",
+            ("D2STGNN", "GestaltCogTeam-D2STGNN"),
+            explicit_path=repo_root or None,
+        )
+        self.repo_root = str(repo_path)
+        official_cls = _load_official_d2stgnn(self.repo_root)
         self.num_time_in_day = int(num_time_in_day)
         self.num_day_in_week = int(num_day_in_week)
         self.model_args = {
@@ -167,6 +174,15 @@ class D2STGNNBackbone(BaseBackbone):
             num_time_in_day=self.num_time_in_day,
             num_day_in_week=self.num_day_in_week,
         )
+        if tod.numel() and (float(tod.detach().min().cpu()) < -1e-6 or float(tod.detach().max().cpu()) > 1.0 + 1e-6):
+            raise ValueError("D2STGNN official wrapper expects time_of_day normalized to [0,1]; official model multiplies by 288.")
+        if dow.numel():
+            dow_min = float(dow.detach().min().cpu())
+            dow_max = float(dow.detach().max().cpu())
+            if dow_min < -1e-6 or dow_max > self.num_day_in_week - 1 + 1e-6:
+                raise ValueError("D2STGNN official wrapper expects day_of_week integer indices in [0,6].")
+            if not torch.allclose(dow, dow.round(), atol=1e-5):
+                raise ValueError("D2STGNN official wrapper expects day_of_week integer indices, not normalized floats.")
         history = torch.cat([x, tod.unsqueeze(-1), dow.unsqueeze(-1)], dim=-1)
         forecast = self.official_model(history)
         if forecast.dim() != 3:

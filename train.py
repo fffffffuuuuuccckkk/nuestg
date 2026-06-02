@@ -16,6 +16,7 @@ from basicts.data import BasicTSForecastingDataset
 
 from losses import NUESTGLoss, make_basicts_loss, nue_mae_metric
 from models import NUESTG, NUESTGConfig
+from models.backbones.official_utils import OfficialBaselineSkip
 from utils import (
     AverageMeterDict,
     align_target,
@@ -163,8 +164,14 @@ BACKBONE_DESCRIPTIONS = {
     "stnorm_wavenet": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
     "d2stgnn": "official_local_wrapper D2STGNN backbone adapted to the shared interface",
     "cast": "cast_fixed_node_simplified_adapter; not full official PyG/ST-OOD pipeline",
+    "cast_adapter": "cast_fixed_node_simplified_adapter; not full official PyG/ST-OOD pipeline",
+    "cast_official": "official_local_wrapper gate for full CaST; skips when official PyG/data/loss protocol is unavailable",
     "stone": "stone_fixed_node_simplified_adapter with learnable semantic fallback",
+    "stone_adapter": "stone_fixed_node_simplified_adapter with learnable semantic fallback",
+    "stone_official": "official_local_wrapper gate for full STONE; skips when spatial side information is unavailable",
     "stop": "stop_architecture_adapter_without_sood_protocol adapted from STOP architecture",
+    "stop_adapter": "stop_architecture_adapter_without_sood_protocol adapted from STOP architecture",
+    "stop_official": "official_local_wrapper gate for full STOP; skips when official SOOD protocol is unavailable",
 }
 
 
@@ -603,7 +610,13 @@ def debug_batch(cfg: Dict) -> None:
     device = get_device(train_cfg)
     data_scaler = build_data_scaler(cfg, device)
     loader = build_loader(cfg, "train", shuffle=True)
-    model, loss_fn = build_model_and_loss(cfg, device)
+    try:
+        model, loss_fn = build_model_and_loss(cfg, device)
+    except OfficialBaselineSkip as exc:
+        print(str(exc))
+        print(f"reference_status: {exc.reference_status}")
+        print(f"unsupported_reason: {exc.reason}")
+        return
     loss_fn.set_epoch(1)
     model.train()
 
@@ -779,10 +792,15 @@ def build_metrics_payload(
         "dataset": cfg["DATASET"]["name"],
         "setting": run_cfg.get("setting", "forecasting"),
         "method": run_cfg.get("method", model_cfg.get("name", "NUE-STG")),
+        "display_name": run_cfg.get("display_name", run_cfg.get("method", model_cfg.get("name", "NUE-STG"))),
         "category": run_cfg.get("category", "plugin_ours"),
         "backbone": model_cfg.get("backbone_name", ""),
         "ablation": ",".join(run_cfg.get("ablations", [])) if run_cfg.get("ablations") else run_cfg.get("ablation", ""),
         "reference_status": model_cfg.get("reference_status", run_cfg.get("reference_status", "")),
+        "is_official": run_cfg.get("is_official", model_cfg.get("is_official", "")),
+        "is_adapter": run_cfg.get("is_adapter", model_cfg.get("is_adapter", "")),
+        "main_table_safe": run_cfg.get("main_table_safe", model_cfg.get("main_table_safe", "")),
+        "unsupported_reason": run_cfg.get("unsupported_reason", model_cfg.get("unsupported_reason", "")),
         "seed": cfg["TRAIN"].get("seed"),
         "epoch": epoch,
         "global_step": global_step,
@@ -842,7 +860,13 @@ def train_local(cfg: Dict) -> None:
     train_loader = build_loader(cfg, "train", shuffle=True)
     val_loader = build_loader(cfg, "val", shuffle=False)
     test_loader = build_loader(cfg, "test", shuffle=False)
-    model, loss_fn = build_model_and_loss(cfg, device)
+    try:
+        model, loss_fn = build_model_and_loss(cfg, device)
+    except OfficialBaselineSkip as exc:
+        print(str(exc))
+        print(f"reference_status: {exc.reference_status}")
+        print(f"unsupported_reason: {exc.reason}")
+        return
     optimizer = build_optimizer(cfg, model)
     lr_scheduler = build_lr_scheduler(cfg, optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", False) and device.type == "cuda")

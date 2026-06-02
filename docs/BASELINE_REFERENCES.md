@@ -29,6 +29,7 @@ Reference statuses used by the PEMS08 baseline configs:
 - `stone_fixed_node_simplified_adapter`
 - `stop_architecture_adapter_without_sood_protocol`
 - `skipped_local_repo_missing`
+- `unsupported_current_dataset`
 
 ## Summary Table
 
@@ -41,8 +42,28 @@ Reference statuses used by the PEMS08 baseline configs:
 | D2STGNN | 2022 VLDB | `/data/OuXiaoyu/mystg/baselines/D2STGNN` | `models/model.py`, `models/diffusion_block/dif_block.py`, `models/inherent_block/inh_block.py`, `models/dynamic_graph_conv/dy_graph_conv.py`, `models/decouple/estimation_gate.py`, `models/decouple/residual_decomp.py`, `configs/PEMS08.yaml`, `main.py` | `models/backbones/d2stgnn.py` | `official_local_wrapper` | Yes if local wrapper loads | No | Yes, local path required |
 | STID | 2022 CIKM | `/data/OuXiaoyu/mystg/baselines/STID` | `stid/arch/stid_arch.py`, `stid/arch/mlp.py`, `stid/PEMS08.py` | `models/backbones/stid.py` | `faithful_native_adapter` | Yes | Adapter to local timestamp arrays | No |
 | CaST-adapter | 2023 NeurIPS | `/data/OuXiaoyu/mystg/baselines/CaST` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/base/trainer.py`, `experiments/cast/main.py`, `README.md` | `models/backbones/cast.py` | `cast_fixed_node_simplified_adapter` | No | Yes | No |
+| CaST-official | 2023 NeurIPS | `/data/OuXiaoyu/mystg/baselines/CaST` | `src/models/cast.py`, `src/layers/cast_cell.py`, `src/utils/dataset.py`, `src/trainers/cast_trainer.py` | `models/backbones/cast_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
 | STONE-adapter | 2024 KDD | `/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/graph.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py`, `README.md` | `models/backbones/stone.py` | `stone_fixed_node_simplified_adapter` | No | Yes | No |
+| STONE-official | 2024 KDD | `/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024` | `Knowair/model/STONE.py`, `Knowair/frechet.py`, `Knowair/spatial_side_information.py`, `Knowair/train.py`, `src/base/stone.py`, `src/base/stone_engine.py` | `models/backbones/stone_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
 | STOP-adapter | 2025 ICML | `/data/OuXiaoyu/mystg/baselines/STOP` | `LargeST/src/models/stop.py`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `TrafficStream/src/models/stop.py`, `KnowAir/src/models/stop.py`, `README.md` | `models/backbones/stop.py` | `stop_architecture_adapter_without_sood_protocol` | No | Yes | No |
+| STOP-official | 2025 ICML | `/data/OuXiaoyu/mystg/baselines/STOP` | `LargeST/src/models/stop.py`, `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`, `KnowAir/src/models/stop.py`, `TrafficStream/src/models/stop.py` | `models/backbones/stop_official.py` | `official_local_wrapper` check, currently `unsupported_current_dataset` | No | No | Yes |
+
+## Main-Table Safety Under Current PEMS08
+
+| Entry | Current status | Main-table safe | Notes |
+|---|---|---|---|
+| STGCN | `reference_native` | Yes | Native faithful implementation under shared scaler/splits/metrics. |
+| Graph WaveNet | `graphwavenet_native_adapter` | Yes | Adapter only to the local tensor interface and runner. |
+| AGCRN | `faithful_native_adapter` | Yes | Official architecture modules are present in the local adapter. |
+| ST-Norm | `stnorm_wavenet_adapter` | Yes, with note | Model-internal ST-Norm is separate from the shared train-split scaler. |
+| STID | `faithful_native_adapter` | Yes | Uses local timestamp arrays for official TOD/DOW inputs. |
+| D2STGNN | `official_local_wrapper` | Yes if wrapper passes | Uses the local official repo; TOD must be normalized `[0,1]`, DOW integer `0..6`. |
+| CaST-adapter | `cast_fixed_node_simplified_adapter` | No as official | Runnable adapter only; may be appendix/related-work evidence if labeled as adapter. |
+| STONE-adapter | `stone_fixed_node_simplified_adapter` | No as official | Runnable adapter only; lacks official spatial-shift side information. |
+| STOP-adapter | `stop_architecture_adapter_without_sood_protocol` | No as official | Runnable adapter only; lacks official SOOD/OOD protocol. |
+| CaST-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required official CaST graph/loss protocol. |
+| STONE-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required STONE spatial side info and shift metadata. |
+| STOP-official | `unsupported_current_dataset` SKIP | No | Current PEMS08 fixed-node batch lacks required STOP SOOD/OOD protocol. |
 
 ## Per-Baseline Details
 
@@ -135,6 +156,19 @@ Reference statuses used by the PEMS08 baseline configs:
   preprocessing, or full temporal OoD protocol. Report as `CaST-adapter`, not
   official CaST.
 
+### CaST-official
+
+- Official wrapper gate: `models/backbones/cast_official.py`.
+- Required local files checked: `src/models/cast.py`,
+  `src/layers/cast_cell.py`, `src/utils/dataset.py`, and
+  `src/trainers/cast_trainer.py`.
+- Current PEMS08 status: `SKIP`, `unsupported_current_dataset`.
+- Reason: full official CaST requires PyG `Data` objects, Hodge-Laplacian
+  edge graph structures, official preprocessing, and the official prediction +
+  VQ/commitment/MI loss path. The current BasicTS fixed-node batch does not
+  contain that protocol.
+- Fallback rule: never use `CaST-adapter` as the official result.
+
 ### STONE-adapter
 
 - Official core modules expected: ST-OOD spatial/structural shift plus temporal
@@ -146,6 +180,19 @@ Reference statuses used by the PEMS08 baseline configs:
 - Deviations: PEMS fixed-node cross-year data lacks the official STONE
   coordinate/meta/spatial-shift side information, so the current version is not
   full official STONE and must not be used as a main-table official baseline.
+
+### STONE-official
+
+- Official wrapper gate: `models/backbones/stone_official.py`.
+- Required local files checked: `Knowair/model/STONE.py`, `Knowair/frechet.py`,
+  `Knowair/spatial_side_information.py`, `Knowair/train.py`,
+  `src/base/stone.py`, and `src/base/stone_engine.py`.
+- Current PEMS08 status: `SKIP`, `unsupported_current_dataset`.
+- Reason: full official STONE requires coordinate/meta spatial side
+  information, Frechet/spatial-side features, observed/unobserved spatial
+  splits, and structural-shift metadata. The current PEMS08 fixed-node setup
+  does not provide those inputs.
+- Fallback rule: never use `STONE-adapter` as the official result.
 
 ### STOP-adapter
 
@@ -159,6 +206,19 @@ Reference statuses used by the PEMS08 baseline configs:
   training protocol, and dataset protocols are not reproduced. Report as
   `STOP-adapter`, not a full faithful official baseline.
 
+### STOP-official
+
+- Official wrapper gate: `models/backbones/stop_official.py`.
+- Required local files checked: `LargeST/src/models/stop.py`,
+  `LargeST/src/engines/stop_engine.py`, `LargeST/experiments/stop/main.py`,
+  `KnowAir/src/models/stop.py`, and `TrafficStream/src/models/stop.py`.
+- Current PEMS08 status: `SKIP`, `unsupported_current_dataset`.
+- Reason: full official STOP requires the official SOOD/OOD split and
+  LargeST/KnowAir/TrafficStream data protocol plus Core_Adaptive centralized
+  interaction training. The current PEMS08 fixed-node config does not provide
+  that protocol.
+- Fallback rule: never use `STOP-adapter` as the official result.
+
 ## Debug Commands
 
 ```bash
@@ -171,10 +231,13 @@ python train.py --config configs/baselines/pems08/stid.py --debug_batch
 python train.py --config configs/baselines/pems08/cast.py --debug_batch
 python train.py --config configs/baselines/pems08/stone.py --debug_batch
 python train.py --config configs/baselines/pems08/stop.py --debug_batch
+python train.py --config configs/baselines/pems08/cast_official.py --debug_batch
+python train.py --config configs/baselines/pems08/stone_official.py --debug_batch
+python train.py --config configs/baselines/pems08/stop_official.py --debug_batch
 ```
 
-Or run all nine with:
+Or run all runnable adapter checks plus the official wrapper gates with:
 
 ```bash
-python scripts/debug_all_baselines.py --dataset pems08
+python scripts/debug_all_baselines.py --dataset pems08 --batch_size 2 --num_workers 0
 ```
