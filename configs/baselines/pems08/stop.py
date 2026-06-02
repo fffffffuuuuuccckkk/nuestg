@@ -15,12 +15,16 @@ deep_update(
             "category": "st_ood",
             "setting": "fixed_node_forecasting",
             "status": "runnable",
-            "reference_status": "faithful_native",
-            "notes": "Native STOP LargeST model adapter using local timestamps/scaler/splits; special SOOD protocol is not used.",
+            "reference_status": "stop_architecture_adapter_without_sood_protocol",
+            "notes": "STOP architecture adapter using local timestamps/scaler/splits; special SOOD protocol is not reproduced.",
         },
         "DATASET": {"use_timestamps": True},
         "MODEL": {
             "backbone_name": "stop",
+            "reference_status": "stop_architecture_adapter_without_sood_protocol",
+            "input_dim": 1,
+            "output_dim": 1,
+            "num_nodes": 170,
             "backbone": {
                 "name": "stop",
                 "stop": {
@@ -40,7 +44,9 @@ deep_update(
             "use_timestamp": True,
             "required_timestamp": True,
         },
-        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_stop"},
+        "LOSS": {"loss_type": "mae", "null_val": None},
+        "TRAIN": {"seed": 2026, "batch_size": 32, "val_batches": None, "ckpt_dir": "./checkpoints/pems08/baseline_stop"},
+        "EVAL": {"horizon_metrics": True},
     },
 )
 apply_ablation(CONFIG, "no_env")

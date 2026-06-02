@@ -6,4 +6,5 @@ RESULTS_DIR="${RESULTS_DIR:-results}"
 CHECKPOINTS_DIR="${CHECKPOINTS_DIR:-checkpoints}"
 
 "$PYTHON" experiments/collect_results.py --results_dir "$RESULTS_DIR" --checkpoints_dir "$CHECKPOINTS_DIR" --out "$RESULTS_DIR/tables/all_results.csv"
+"$PYTHON" scripts/collect_baseline_results.py --checkpoints_dir "$CHECKPOINTS_DIR" --out "$RESULTS_DIR/tables/baseline_summary.csv"
 "$PYTHON" experiments/make_tables.py --input "$RESULTS_DIR/tables/all_results.csv" --out_dir "$RESULTS_DIR/tables"

@@ -43,9 +43,9 @@ if [[ "$RUN_COMPILE" == "1" ]]; then
     utils/*.py
 fi
 
-echo "[FPEM repro] debug: configs/ours/pems08_fpem.py"
+echo "[FPEM repro] debug: configs/ours/pems08/fpem_stid_mlp.py"
 "$PYTHON" train.py \
-  --config configs/ours/pems08_fpem.py \
+  --config configs/ours/pems08/fpem_stid_mlp.py \
   --debug_batch \
   "${COMMON_SET[@]}"
 
@@ -69,9 +69,9 @@ fi
 if [[ "$RUN_TRAIN" == "1" ]]; then
   EPOCHS="${EPOCHS:-100}"
   CKPT_DIR="${CKPT_DIR:-./checkpoints/pems08_fpem_seed${SEED}}"
-  echo "[FPEM repro] train: configs/ours/pems08_fpem.py epochs=${EPOCHS} ckpt_dir=${CKPT_DIR}"
+  echo "[FPEM repro] train: configs/ours/pems08/fpem_stid_mlp.py epochs=${EPOCHS} ckpt_dir=${CKPT_DIR}"
   "$PYTHON" train.py \
-    --config configs/ours/pems08_fpem.py \
+    --config configs/ours/pems08/fpem_stid_mlp.py \
     "${COMMON_SET[@]}" \
     --set "TRAIN.epochs=${EPOCHS}" \
     --set "TRAIN.ckpt_dir=${CKPT_DIR}"

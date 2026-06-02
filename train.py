@@ -148,23 +148,23 @@ METRIC_FIELDS = [
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, *METRIC_FIELDS]
 
 BACKBONE_DESCRIPTIONS = {
-    "stid": "faithful native STID backbone with spatial identity and TOD/DOW embeddings",
-    "official_stid": "faithful native STID backbone with spatial identity and TOD/DOW embeddings",
+    "stid": "faithful_native_adapter STID backbone with spatial identity and TOD/DOW embeddings",
+    "official_stid": "faithful_native_adapter STID backbone with spatial identity and TOD/DOW embeddings",
     "stid_mlp": "lightweight STID-like temporal MLP + node embedding",
     "mlp": "lightweight STID-like temporal MLP + node embedding",
     "stid_like": "lightweight STID-like temporal MLP + node embedding",
-    "graphwavenet": "faithful native Graph WaveNet backbone adapted to the shared interface",
-    "graph_wavenet": "faithful native Graph WaveNet backbone adapted to the shared interface",
-    "gwnet": "faithful native Graph WaveNet backbone adapted to the shared interface",
-    "agcrn": "faithful native AGCRN backbone adapted to the shared interface",
-    "stgcn": "faithful native STGCN backbone adapted from hazdzz/STGCN",
-    "stnorm": "faithful native ST-Norm WaveNet backbone",
-    "st_norm": "faithful native ST-Norm WaveNet backbone",
-    "stnorm_wavenet": "faithful native ST-Norm WaveNet backbone",
-    "d2stgnn": "official-wrapper D2STGNN backbone adapted to the shared interface",
-    "cast": "fixed-node CaST native adapter; simplified relative to official PyG/ST-OOD pipeline",
-    "stone": "fixed-node STONE native adapter with learnable semantic fallback",
-    "stop": "faithful native STOP backbone adapted from the LargeST official code",
+    "graphwavenet": "graphwavenet_native_adapter backbone adapted to the shared interface",
+    "graph_wavenet": "graphwavenet_native_adapter backbone adapted to the shared interface",
+    "gwnet": "graphwavenet_native_adapter backbone adapted to the shared interface",
+    "agcrn": "faithful_native_adapter AGCRN backbone adapted to the shared interface",
+    "stgcn": "reference_native STGCN backbone adapted from hazdzz/STGCN",
+    "stnorm": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
+    "st_norm": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
+    "stnorm_wavenet": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
+    "d2stgnn": "official_local_wrapper D2STGNN backbone adapted to the shared interface",
+    "cast": "cast_fixed_node_simplified_adapter; not full official PyG/ST-OOD pipeline",
+    "stone": "stone_fixed_node_simplified_adapter with learnable semantic fallback",
+    "stop": "stop_architecture_adapter_without_sood_protocol adapted from STOP architecture",
 }
 
 
@@ -180,7 +180,9 @@ def finalize_config(cfg: Dict) -> Dict:
     ds_cfg = cfg["DATASET"]
     model_cfg = cfg["MODEL"]
     loss_cfg = cfg["LOSS"]
+    run_cfg = cfg.setdefault("RUN", {})
     swap_cfg = cfg.get("SWAP", {})
+    cfg.setdefault("EVAL", {}).setdefault("horizon_metrics", True)
     scaler_cfg = cfg.setdefault("SCALER", {})
     scaler_cfg.setdefault("enabled", True)
     scaler_cfg.setdefault("type", "zscore")
@@ -280,6 +282,24 @@ def finalize_config(cfg: Dict) -> Dict:
     backbone_cfg = model_cfg.setdefault("backbone", {})
     model_cfg["backbone_name"] = model_cfg.get("backbone_name", backbone_cfg.get("name", "stid_mlp"))
     backbone_cfg["name"] = model_cfg["backbone_name"]
+    if isinstance(model_cfg.get("GWNET"), dict):
+        backbone_cfg.setdefault("graph_wavenet", {})
+        backbone_cfg["graph_wavenet"].update(model_cfg["GWNET"])
+    if isinstance(model_cfg.get("STNORM"), dict):
+        stnorm_preset = dict(model_cfg["STNORM"])
+        if "snorm" in stnorm_preset:
+            stnorm_preset["snorm_bool"] = bool(stnorm_preset.pop("snorm"))
+        if "tnorm" in stnorm_preset:
+            stnorm_preset["tnorm_bool"] = bool(stnorm_preset.pop("tnorm"))
+        backbone_cfg.setdefault("stnorm_wavenet", {})
+        backbone_cfg["stnorm_wavenet"].update(stnorm_preset)
+    model_cfg["baseline_name"] = model_cfg.get("baseline_name") or run_cfg.get("method") or model_cfg.get("name", "")
+    model_cfg["reference_status"] = (
+        model_cfg.get("reference_status")
+        or run_cfg.get("reference_status")
+        or "native_adapter"
+    )
+    run_cfg["reference_status"] = model_cfg["reference_status"]
     representation_dim = int(backbone_cfg.get("representation_dim", model_cfg.get("hidden_dim", 64)))
     backbone_key = str(model_cfg["backbone_name"]).lower()
     if backbone_key in {"graphwavenet", "gwnet"}:
@@ -480,6 +500,8 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
     representation_dim = int(cfg["MODEL"].get("backbone", {}).get("representation_dim", cfg["MODEL"]["hidden_dim"]))
     method_variant = output.get("method_variant", cfg["MODEL"].get("method_variant", "nue"))
     print(f"method_variant: {method_variant}")
+    print(f"baseline_name: {output.get('baseline_name', cfg['MODEL'].get('baseline_name', ''))}")
+    print(f"reference_status: {output.get('reference_status', cfg['MODEL'].get('reference_status', ''))}")
     if method_variant == "fpem":
         expected = {
             "prediction": (batch_size, output_len, num_nodes, output_dim),
@@ -656,7 +678,19 @@ def debug_batch(cfg: Dict) -> None:
         raw_batch[target_key],
         cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
     )
+    original_rmse = masked_rmse_value(
+        pred_original,
+        raw_batch[target_key],
+        cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+    )
+    original_mape = masked_mape_value(
+        pred_original,
+        raw_batch[target_key],
+        cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+    )
     print(f"debug_original_scale_mae={float(original_mae.detach().cpu()):.6f}")
+    print(f"debug_original_scale_rmse={float(original_rmse.detach().cpu()):.6f}")
+    print(f"debug_original_scale_mape={float(original_mape.detach().cpu()):.6f}")
     print(format_logs(logs, LOG_KEYS))
     print("debug_batch ok: forward/loss/backward finished without NaN or shape errors")
 
@@ -748,6 +782,7 @@ def build_metrics_payload(
         "category": run_cfg.get("category", "plugin_ours"),
         "backbone": model_cfg.get("backbone_name", ""),
         "ablation": ",".join(run_cfg.get("ablations", [])) if run_cfg.get("ablations") else run_cfg.get("ablation", ""),
+        "reference_status": model_cfg.get("reference_status", run_cfg.get("reference_status", "")),
         "seed": cfg["TRAIN"].get("seed"),
         "epoch": epoch,
         "global_step": global_step,

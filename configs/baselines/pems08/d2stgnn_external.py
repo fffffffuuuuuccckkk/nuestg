@@ -3,7 +3,7 @@ CONFIG = {
         "name": "D2STGNN",
         "dataset": "PEMS08",
         "status": "external_required",
-        "reference_status": "skipped_external_missing",
+        "reference_status": "skipped_local_repo_missing",
         "category": "forecasting",
         "official_repo": "https://github.com/GestaltCogTeam/D2STGNN",
         "local_reference_path": "/data/OuXiaoyu/mystg/baselines/D2STGNN",

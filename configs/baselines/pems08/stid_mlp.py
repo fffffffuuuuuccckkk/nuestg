@@ -15,7 +15,7 @@ deep_update(
             "category": "forecasting",
             "setting": "forecasting",
             "status": "runnable",
-            "reference_status": "simplified",
+            "reference_status": "style_native",
             "notes": "Baseline-only lightweight STID-like MLP; not official STID.",
         },
         "MODEL": {"backbone_name": "stid_mlp", "backbone": {"name": "stid_mlp"}},

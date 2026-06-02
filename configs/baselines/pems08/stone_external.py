@@ -3,7 +3,7 @@ CONFIG = {
         "name": "STONE",
         "dataset": "PEMS08",
         "status": "external_required",
-        "reference_status": "skipped_external_missing",
+        "reference_status": "skipped_local_repo_missing",
         "category": "st_ood",
         "official_repo": "https://github.com/PoorOtterBob/STONE-KDD-2024",
         "local_reference_path": "/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024",

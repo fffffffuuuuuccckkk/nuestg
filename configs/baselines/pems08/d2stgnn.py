@@ -15,12 +15,16 @@ deep_update(
             "category": "forecasting",
             "setting": "forecasting",
             "status": "runnable",
-            "reference_status": "official_wrapper",
+            "reference_status": "official_local_wrapper",
             "notes": "Official D2STGNN model wrapper adapted from local reference repo; uses local scaler/splits.",
         },
         "DATASET": {"use_timestamps": True},
         "MODEL": {
             "backbone_name": "d2stgnn",
+            "reference_status": "official_local_wrapper",
+            "input_dim": 1,
+            "output_dim": 1,
+            "num_nodes": 170,
             "backbone": {
                 "name": "d2stgnn",
                 "d2stgnn": {
@@ -41,7 +45,9 @@ deep_update(
             "use_timestamp": True,
             "required_timestamp": True,
         },
-        "TRAIN": {"ckpt_dir": "./checkpoints/pems08/baseline_d2stgnn"},
+        "LOSS": {"loss_type": "mae", "null_val": None},
+        "TRAIN": {"seed": 2026, "batch_size": 32, "val_batches": None, "ckpt_dir": "./checkpoints/pems08/baseline_d2stgnn"},
+        "EVAL": {"horizon_metrics": True},
     },
 )
 apply_ablation(CONFIG, "no_env")

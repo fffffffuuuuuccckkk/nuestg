@@ -21,6 +21,8 @@ from utils.tensor_ops import align_target, ensure_blnc, load_adjacency, load_gra
 @dataclass
 class NUESTGConfig(BasicTSModelConfig):
     name: str = "NUESTG"
+    baseline_name: str = ""
+    reference_status: str = "native_adapter"
     input_len: int = 12
     output_len: int = 12
     num_nodes: int = 1
@@ -50,6 +52,8 @@ class NUESTGConfig(BasicTSModelConfig):
     adaptive_adj: bool = False
     backbone_name: str = "stid_mlp"
     backbone: Dict = field(default_factory=dict)
+    GWNET: Dict = field(default_factory=dict)
+    STNORM: Dict = field(default_factory=dict)
     method_variant: str = "nue"
     separation: Dict = field(default_factory=dict)
     use_separated_z_for_y_inv: bool = True
@@ -206,6 +210,8 @@ class NUESTG(nn.Module):
         self.swap_cfg = config.swap or {}
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
+        self.baseline_name = config.baseline_name or config.name or config.backbone_name
+        self.reference_status = config.reference_status
         self.method_variant = str(config.method_variant or "nue").lower()
         self.is_fpem = self.method_variant == "fpem"
         self.use_separated_z_for_y_inv = bool(config.use_separated_z_for_y_inv)
@@ -750,6 +756,8 @@ class NUESTG(nn.Module):
 
         return {
             "method_variant": "fpem",
+            "baseline_name": self.baseline_name,
+            "reference_status": self.reference_status,
             "prediction": prediction,
             "y_inv": y_inv,
             "y_potential": y_potential,
@@ -904,6 +912,8 @@ class NUESTG(nn.Module):
 
         return {
             "method_variant": "nue",
+            "baseline_name": self.baseline_name,
+            "reference_status": self.reference_status,
             "prediction": prediction,
             "y_inv": y_inv,
             "y_potential": y_potential,

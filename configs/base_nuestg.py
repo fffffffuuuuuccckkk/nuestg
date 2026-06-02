@@ -333,6 +333,9 @@ CONFIG = {
         "early_stop_patience": 20,
         "amp": False,
     },
+    "EVAL": {
+        "horizon_metrics": True,
+    },
     "LOGGING": {
         "print_shapes_debug": True,
         "save_csv_log": True,

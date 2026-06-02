@@ -3,6 +3,20 @@ from __future__ import annotations
 from typing import Dict, Iterable, List
 
 
+LOCAL_REPO_PATHS = {
+    "STID": "/data/OuXiaoyu/mystg/baselines/STID",
+    "STID-like MLP": "/data/OuXiaoyu/mystg/baselines/STID",
+    "Graph WaveNet": "/data/OuXiaoyu/mystg/baselines/Graph-WaveNet",
+    "AGCRN": "/data/OuXiaoyu/mystg/baselines/AGCRN",
+    "STGCN": "/data/OuXiaoyu/mystg/baselines/stgcn",
+    "ST-Norm": "/data/OuXiaoyu/mystg/baselines/ST-Norm",
+    "D2STGNN": "/data/OuXiaoyu/mystg/baselines/D2STGNN",
+    "CaST-fixed-node-adapter": "/data/OuXiaoyu/mystg/baselines/CaST",
+    "STONE-fixed-node-adapter": "/data/OuXiaoyu/mystg/baselines/STONE-KDD-2024",
+    "STOP": "/data/OuXiaoyu/mystg/baselines/STOP",
+}
+
+
 def _train_command(config: str) -> str:
     return f"python train.py --config {config}"
 
@@ -45,7 +59,7 @@ def _external_entry(dataset: str, name: str, category: str, note: str) -> Dict:
         "command": "import results via results/external_import_templates/*.csv",
         "paper_note": note,
         "expected_outputs": ["MAE", "RMSE", "MAPE"],
-        "reference_status": "skipped_external_missing",
+        "reference_status": "skipped_local_repo_missing",
         "implementation_type": "external_required",
         "official_repo": official_repo,
         "referenced_files": referenced_files,
@@ -69,7 +83,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stid.py",
             "Faithful native STID adapted from official BasicTS/STID architecture.",
             "stid",
-            "faithful_native",
+            "faithful_native_adapter",
             "https://github.com/GestaltCogTeam/STID",
             [
                 "stid/arch/stid_arch.py::STID",
@@ -83,7 +97,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stid_mlp.py",
             "Lightweight temporal MLP plus node embedding; simplified debug baseline, not official STID.",
             "stid_mlp",
-            "simplified",
+            "style_native",
             "https://github.com/GestaltCogTeam/STID",
             ["stid/arch/stid_arch.py", "stid/arch/mlp.py"],
         ),
@@ -93,7 +107,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/graphwavenet.py",
             "Faithful native Graph WaveNet adapted from official model.py/util.py.",
             "graphwavenet",
-            "faithful_native",
+            "graphwavenet_native_adapter",
             "https://github.com/nnzhan/Graph-WaveNet",
             ["model.py::gwnet/gcn/nconv", "util.py::load_adj", "train.py"],
         ),
@@ -103,7 +117,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/agcrn.py",
             "Faithful native AGCRN adapted from official AGCRN.py/AGCN.py/AGCRNCell.py.",
             "agcrn",
-            "faithful_native",
+            "faithful_native_adapter",
             "https://github.com/LeiBAI/AGCRN",
             ["model/AGCRN.py::AGCRN/AVWDCRNN", "model/AGCN.py::AVWGCN", "model/AGCRNCell.py::AGCRNCell"],
         ),
@@ -113,7 +127,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stgcn.py",
             "Faithful native STGCN adapted from hazdzz/STGCN.",
             "stgcn",
-            "faithful_native",
+            "reference_native",
             "https://github.com/hazdzz/STGCN",
             ["model/models.py::STGCNChebGraphConv", "model/layers.py::STConvBlock/TemporalConvLayer/ChebGraphConv"],
         ),
@@ -123,7 +137,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stnorm.py",
             "Faithful native ST-Norm WaveNet with internal spatial/temporal normalization.",
             "stnorm",
-            "faithful_native",
+            "stnorm_wavenet_adapter",
             "https://github.com/JLDeng/ST-Norm",
             ["models/Wavenet.py::SNorm/TNorm/Wavenet", "main.py"],
         ),
@@ -133,7 +147,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/d2stgnn.py",
             "Official D2STGNN model wrapper with local scaler/splits/metrics.",
             "d2stgnn",
-            "official_wrapper",
+            "official_local_wrapper",
             "https://github.com/GestaltCogTeam/D2STGNN",
             [
                 "models/model.py::D2STGNN/DecoupleLayer",
@@ -150,7 +164,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/cast.py",
             "Runnable fixed-node CaST adapter; simplified relative to official PyG ST-OOD data objects.",
             "cast",
-            "simplified",
+            "cast_fixed_node_simplified_adapter",
             "https://github.com/yutong-xia/CaST",
             ["src/models/cast.py", "src/layers/cast_cell.py", "src/utils/dataset.py", "experiments/cast/main.py"],
         ),
@@ -160,7 +174,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stone.py",
             "Runnable fixed-node STONE adapter with learnable semantic fallback; simplified relative to full spatial-shift protocol.",
             "stone",
-            "simplified",
+            "stone_fixed_node_simplified_adapter",
             "https://github.com/PoorOtterBob/STONE-KDD-2024",
             ["src/base/stone.py", "Knowair/model/STONE.py", "src/utils/spatial_side_information.py", "experiments/stone/main.py"],
         ),
@@ -170,7 +184,7 @@ def _pems08_entries() -> List[Dict]:
             "configs/baselines/pems08/stop.py",
             "Faithful native STOP LargeST model adapter with local scaler/splits/metrics.",
             "stop",
-            "faithful_native",
+            "stop_architecture_adapter_without_sood_protocol",
             "https://github.com/PoorOtterBob/STOP",
             ["LargeST/src/models/stop.py::STOP/MLP", "LargeST/src/engines/stop_engine.py", "LargeST/experiments/stop/main.py"],
         ),
@@ -217,6 +231,7 @@ def _pems08_entries() -> List[Dict]:
             "reference_status": reference_status,
             "implementation_type": reference_status,
             "official_repo": official_repo,
+            "local_repo_path": LOCAL_REPO_PATHS.get(name, ""),
             "referenced_files": referenced_files,
             "architecture_check": {
                 "expected": note,

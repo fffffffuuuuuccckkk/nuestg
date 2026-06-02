@@ -246,6 +246,49 @@ Graph WaveNet / AGCRN-style experiments:
 - Evaluation logs and metrics JSON include horizon-wise MAE/RMSE/MAPE for
   horizons 3, 6, 12 plus average over the first 12 horizons.
 
+## A. Future-Predictive Environment Masking (FPEM)
+
+FPEM is enabled with `MODEL.method_variant="fpem"`. Its final prediction is
+`Pred(Fuse(Z, E_plus))`, not `y_inv + rho * r_env`. During training, the true
+future target `Y` is used only to extract the training-only future environment
+`E_fut`. During validation, testing, and inference, the model must never use
+`Y` or `E_fut`.
+
+`E_plus` comes from the time-node mask over historical environment tokens. The
+mask shape is `[B,L,N,1]`. The default future MI loss is `ba_nll`. The default
+E-Z separation loss is `cross_cov`; CLUB and HSIC remain optional variants.
+
+Run the formal PEMS08 FPEM debug entry:
+
+```bash
+python train.py --config configs/ours/pems08/fpem_stid_mlp.py --debug_batch
+```
+
+## B. Baseline Reproduction
+
+Main-table-safe or relatively safe:
+
+- `STGCN`: `reference_native`
+- `GraphWaveNet`: `graphwavenet_native_adapter`
+- `AGCRN`: `faithful_native_adapter` when `AVWGCN`, `weights_pool`,
+  `bias_pool`, `AGCRNCell`, and `end_conv` are present; otherwise downgrade to
+  `style_native`
+- `ST-Norm`: `stnorm_wavenet_adapter`
+- `D2STGNN`: `official_local_wrapper` when the local official repo is found
+- `STID`: `faithful_native_adapter`
+
+Adapter/simplified:
+
+- `CaST-adapter`: `cast_fixed_node_simplified_adapter`
+- `STONE-adapter`: `stone_fixed_node_simplified_adapter`
+- `STOP-adapter`: `stop_architecture_adapter_without_sood_protocol`
+
+CaST/STONE/STOP adapters are not full official baselines unless an official
+local wrapper and the required data/protocol are enabled. STOP-adapter does not
+reproduce the full official SOOD protocol unless official wrapper support is
+enabled. ST-Norm is model-internal normalization; the data scaler is the shared
+train-split preprocessing scaler, and the two are not the same thing.
+
 Example PEMS commands:
 
 ```bash
@@ -444,22 +487,22 @@ that require official external code or imported results.
 
 Runnable forecasting baselines:
 
-- `STID`: `configs/baselines/pems08/stid.py`, `faithful_native`, adapted from
+- `STID`: `configs/baselines/pems08/stid.py`, `faithful_native_adapter`, adapted from
   the official BasicTS/STID architecture with spatial identity, time-of-day,
   day-of-week embeddings, and residual 1x1 MLP blocks.
 - `Graph WaveNet`: `configs/baselines/pems08/graphwavenet.py`,
-  `faithful_native`, adapted from official `model.py` / `util.py`.
-- `AGCRN`: `configs/baselines/pems08/agcrn.py`, `faithful_native`, adapted
+  `graphwavenet_native_adapter`, adapted from official `model.py` / `util.py`.
+- `AGCRN`: `configs/baselines/pems08/agcrn.py`, `faithful_native_adapter`, adapted
   from official `AGCN.py`, `AGCRNCell.py`, and `AGCRN.py`.
-- `STGCN`: `configs/baselines/pems08/stgcn.py`, `faithful_native`, adapted
+- `STGCN`: `configs/baselines/pems08/stgcn.py`, `reference_native`, adapted
   from `hazdzz/STGCN`.
-- `ST-Norm`: `configs/baselines/pems08/stnorm.py`, `faithful_native`, adapted
+- `ST-Norm`: `configs/baselines/pems08/stnorm.py`, `stnorm_wavenet_adapter`, adapted
   from official `ST-Norm/models/Wavenet.py`. ST-Norm is model-internal
   spatial/temporal normalization, not a replacement for the train-split scaler.
-- `D2STGNN`: `configs/baselines/pems08/d2stgnn.py`, `official_wrapper`, loads
+- `D2STGNN`: `configs/baselines/pems08/d2stgnn.py`, `official_local_wrapper`, loads
   the official local D2STGNN `models/model.py` and adapts local TOD/DOW,
   scaler, splits, and metrics.
-- `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`, `simplified`.
+- `STID-like MLP`: `configs/baselines/pems08/stid_mlp.py`, `style_native`.
   This is retained only as a lightweight debug/ablation baseline and should
   not be reported as official STID.
 
@@ -481,16 +524,16 @@ invariant backbone that produces `z_inv` and `y_inv`.
 Runnable ST-OOD / fixed-node adapters:
 
 - `CaST-fixed-node-adapter`: `configs/baselines/pems08/cast.py`,
-  `simplified`. It keeps CaST temporal disentangling, environment codebook,
+  `cast_fixed_node_simplified_adapter`. It keeps CaST temporal disentangling, environment codebook,
   causal edge scoring, and message passing, but replaces official PyG graph
   Data objects with dense fixed-node PyTorch adjacency because the current
   environment lacks `torch_geometric`/`einops`.
 - `STONE-fixed-node-adapter`: `configs/baselines/pems08/stone.py`,
-  `simplified`. It keeps STONE-style temporal gated convolution, semantic
+  `stone_fixed_node_simplified_adapter`. It keeps STONE-style temporal gated convolution, semantic
   stream, adaptive interaction, graph aggregation, and gated fusion, but PEMS
   lacks the official coordinates/meta side information, so semantic features
   fall back to learnable node embeddings.
-- `STOP`: `configs/baselines/pems08/stop.py`, `faithful_native`, adapted from
+- `STOP`: `configs/baselines/pems08/stop.py`, `stop_architecture_adapter_without_sood_protocol`, adapted from
   official LargeST `src/models/stop.py` with local timestamps/scaler/splits.
   The official SOOD node split/cross-year engine is not used in this fixed-node
   baseline config.
@@ -508,15 +551,16 @@ metadata configs and import templates under
 or implementation is added later.
 
 The full reference and architecture audit table is in
-`docs/BASELINE_REFERENCES.md`. It records official repo URLs, local reference
-files/classes read before implementation, `faithful_native` /
-`official_wrapper` / `simplified` / `external_required` status, deviations, and
-license notes. Simplified baselines are for debug or appendix use only.
+`docs/BASELINE_REFERENCES.md`. It records local reference paths, files/classes
+read before implementation, exact `reference_status`, deviations, main-table
+safety, adapter/simplified flags, and wrapper requirements.
 
 Useful commands:
 
 ```bash
 bash scripts/run_debug_all.sh
+bash scripts/run_pems08_baselines.sh
+bash scripts/run_pems08_fpem.sh
 bash scripts/run_forecasting_baselines.sh
 bash scripts/run_ours_backbones.sh
 bash scripts/run_ablations.sh
@@ -525,12 +569,10 @@ bash scripts/collect_all_results.sh
 python scripts/debug_all_baselines.py --dataset pems08 --dry_run
 ```
 
-`debug_all_baselines.py` prints every registered forecasting/ST-OOD baseline's
-`reference_status`. Runnable baselines are executed unless `--dry_run` is set;
-remaining `external_required` methods are reported with
-`skipped_external_missing` and skipped, so they cannot be mistaken for local
-implementations. Ours plug-in variants can be inspected separately with
-`--category plugin_ours`.
+`debug_all_baselines.py` prints and checks the nine requested local baselines.
+Runnable baselines are executed unless `--dry_run` is set; if a required local
+reference checkout is absent, that baseline is reported as
+`skipped_local_repo_missing` and skipped.
 
 The scripts accept environment variables:
 
@@ -672,7 +714,7 @@ in debug output is only a compatibility placeholder derived from the mean mask.
 
 Timestamp handling:
 
-- `configs/ours/pems08_fpem.py` sets `DATASET.use_timestamps=True`, so BasicTS
+- `configs/ours/pems08/fpem_stid_mlp.py` sets `DATASET.use_timestamps=True`, so BasicTS
   batches expose `inputs_timestamps` and `targets_timestamps`.
 - `TimestampEncoder` supports `stid`, `sinusoidal`, `mlp`, and `none`.
 - Current timestamp embedding is injected into `Z` through a lightweight
@@ -725,7 +767,7 @@ Other FPEM losses:
 Run a FPEM debug batch:
 
 ```bash
-python train.py --config configs/ours/pems08_fpem.py --debug_batch
+python train.py --config configs/ours/pems08/fpem_stid_mlp.py --debug_batch
 ```
 
 Or smoke-test the variant directly on the base config:
@@ -806,10 +848,10 @@ history-similar/future-similar samples.
   concept-shift pair mining.
 - Future work can add Samen-style history-similar / future-different pair
   mining via the existing `SWAP.pair_mining` config slots.
-- `stid_mlp` is a lightweight simplified debug baseline; use `backbone_name=stid`
-  for the faithful native STID baseline.
-- D2STGNN is now an official-model wrapper and STOP is a faithful native
-  fixed-node adapter. CaST and STONE are runnable fixed-node simplified
+- `stid_mlp` is a lightweight style-native debug baseline; use `backbone_name=stid`
+  for the `faithful_native_adapter` STID baseline.
+- D2STGNN is now an official local wrapper and STOP is an architecture adapter
+  without the official SOOD protocol. CaST and STONE are runnable fixed-node simplified
   adapters, not full official ST-OOD reproductions. DGCRN, STAEformer, CauSTG,
   Samen, CAN-ST, DIDA, I-DIDA, and EAGLE remain external-required.
 - The current separation modes are computation-level constraints, not formal
