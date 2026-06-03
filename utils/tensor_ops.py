@@ -162,7 +162,18 @@ def make_valid_mask(
     if existing_mask is not None:
         if existing_mask.dim() == 3:
             existing_mask = existing_mask.unsqueeze(-1)
-        mask = mask & existing_mask.bool()
+        if existing_mask.dim() != targets.dim():
+            raise ValueError(
+                "existing_mask must have the same rank as targets after optional channel unsqueeze, "
+                f"got mask={tuple(existing_mask.shape)} targets={tuple(targets.shape)}"
+            )
+        for mask_size, target_size in zip(existing_mask.shape, targets.shape):
+            if mask_size not in (1, target_size):
+                raise ValueError(
+                    "existing_mask is not broadcast-compatible with targets, "
+                    f"got mask={tuple(existing_mask.shape)} targets={tuple(targets.shape)}"
+                )
+        mask = mask & existing_mask.to(device=targets.device).bool().expand_as(targets)
     return mask
 
 
@@ -204,10 +215,34 @@ def masked_rmse_value(
     null_val: Optional[float] = None,
     existing_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    return torch.sqrt(masked_mse_value(prediction, targets, null_val, existing_mask).clamp_min(0.0))
+
+
+def masked_mse_value(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     targets = align_target(targets, prediction)
     mask = make_valid_mask(targets, null_val, existing_mask)
-    squared_error = (prediction - torch.nan_to_num(targets, nan=0.0)).pow(2)
-    return torch.sqrt(masked_mean(squared_error, mask).clamp_min(0.0))
+    mask = mask & torch.isfinite(prediction)
+    squared_error = (torch.nan_to_num(prediction, nan=0.0) - torch.nan_to_num(targets, nan=0.0)).pow(2)
+    return masked_mean(squared_error, mask)
+
+
+def make_mape_valid_mask(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    targets = align_target(targets, prediction)
+    valid = make_valid_mask(targets, null_val, existing_mask)
+    valid = valid & torch.isfinite(prediction) & torch.isfinite(targets)
+    valid = valid & (targets.abs() > float(threshold))
+    return valid
 
 
 def masked_mape_value(
@@ -216,12 +251,17 @@ def masked_mape_value(
     null_val: Optional[float] = None,
     existing_mask: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
+    threshold: float = 1.0,
+    as_percent: bool = True,
 ) -> torch.Tensor:
     targets = align_target(targets, prediction)
-    mask = make_valid_mask(targets, null_val, existing_mask)
-    denom = torch.nan_to_num(targets.abs(), nan=0.0).clamp_min(eps)
-    ape = (prediction - torch.nan_to_num(targets, nan=0.0)).abs() / denom
-    return masked_mean(ape, mask)
+    valid = make_mape_valid_mask(prediction, targets, null_val, existing_mask, threshold=threshold)
+    if valid.sum() == 0:
+        return prediction.new_tensor(float("nan"))
+    denom = targets[valid].abs().clamp_min(float(eps))
+    ape = (prediction[valid] - targets[valid]).abs() / denom
+    value = ape.mean()
+    return value * 100.0 if as_percent else value
 
 
 def generate_tod_dow_timestamps(

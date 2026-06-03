@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import importlib.util
 import json
@@ -44,6 +45,11 @@ def cast_value(value: str) -> Any:
         return False
     if lowered == "none" or lowered == "null":
         return None
+    if lowered.startswith(("[", "{", "(")):
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            pass
     try:
         if lowered.startswith("0") and len(lowered) > 1 and not lowered.startswith("0."):
             raise ValueError

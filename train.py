@@ -26,6 +26,8 @@ from utils import (
     masked_mae_value,
     masked_mape_value,
     masked_rmse_value,
+    masked_mse_value,
+    make_mape_valid_mask,
     make_valid_mask,
     maybe_generate_timestamp_file,
     resolve_cli_config,
@@ -137,6 +139,7 @@ LOG_KEYS = [
 HORIZON_EVAL_STEPS = (3, 6, 12)
 METRIC_FIELDS = [
     "val_mae",
+    "val_mse",
     "val_rmse",
     "val_mape",
     "val_mae_h3",
@@ -194,15 +197,21 @@ def finalize_config(cfg: Dict) -> Dict:
     ds_cfg = cfg["DATASET"]
     model_cfg = cfg["MODEL"]
     loss_cfg = cfg["LOSS"]
+    train_cfg = cfg.setdefault("TRAIN", {})
     run_cfg = cfg.setdefault("RUN", {})
     swap_cfg = cfg.get("SWAP", {})
     cfg.setdefault("EVAL", {}).setdefault("horizon_metrics", True)
+    metrics_cfg = cfg.setdefault("METRICS", {})
+    metrics_cfg.setdefault("mape_threshold", 1.0)
+    metrics_cfg.setdefault("mape_eps", 1e-5)
+    metrics_cfg.setdefault("mape_as_percent", True)
     scaler_cfg = cfg.setdefault("SCALER", {})
     scaler_cfg.setdefault("enabled", True)
     scaler_cfg.setdefault("type", "zscore")
     scaler_cfg.setdefault("norm_each_channel", False)
     scaler_cfg.setdefault("rescale", True)
     scaler_cfg.setdefault("eps", 1e-5)
+    train_cfg.setdefault("no_decay_for_bias_norm_emb", False)
     ds_cfg.setdefault("null_to_num", 0.0)
     ds_cfg.setdefault("frequency_minutes", 5)
     ds_cfg.setdefault("auto_generate_timestamps", True)
@@ -462,14 +471,39 @@ def build_model_and_loss(cfg: Dict, device: torch.device) -> Tuple[NUESTG, NUEST
 def build_optimizer(cfg: Dict, model: torch.nn.Module) -> torch.optim.Optimizer:
     train_cfg = cfg["TRAIN"]
     optimizer_name = train_cfg.get("optimizer", "adam").lower()
-    params = {
-        "lr": train_cfg["learning_rate"],
-        "weight_decay": train_cfg.get("weight_decay", 0.0),
-    }
+    learning_rate = train_cfg["learning_rate"]
+    weight_decay = float(train_cfg.get("weight_decay", 0.0))
+    optimizer_kwargs = {"lr": learning_rate}
+    if weight_decay > 0 and bool(train_cfg.get("no_decay_for_bias_norm_emb", False)):
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            lowered = name.lower()
+            no_decay = (
+                param.ndim <= 1
+                or lowered.endswith(".bias")
+                or "norm" in lowered
+                or "embedding" in lowered
+                or "emb" in lowered
+            )
+            if no_decay:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+        params = []
+        if decay_params:
+            params.append({"params": decay_params, "weight_decay": weight_decay})
+        if no_decay_params:
+            params.append({"params": no_decay_params, "weight_decay": 0.0})
+    else:
+        params = model.parameters()
+        optimizer_kwargs["weight_decay"] = weight_decay
     if optimizer_name == "adam":
-        return torch.optim.Adam(model.parameters(), **params)
+        return torch.optim.Adam(params, **optimizer_kwargs)
     if optimizer_name == "adamw":
-        return torch.optim.AdamW(model.parameters(), **params)
+        return torch.optim.AdamW(params, **optimizer_kwargs)
     raise ValueError(f"Unsupported optimizer={optimizer_name!r}")
 
 
@@ -610,6 +644,84 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
     print(f"aligned_targets: {tuple(aligned.shape)}")
 
 
+def _finite_stats(tensor: torch.Tensor) -> Dict[str, float]:
+    values = tensor.detach().float()
+    values = values[torch.isfinite(values)]
+    if values.numel() == 0:
+        return {"min": float("nan"), "max": float("nan"), "mean": float("nan"), "std": float("nan")}
+    return {
+        "min": float(values.min().cpu()),
+        "max": float(values.max().cpu()),
+        "mean": float(values.mean().cpu()),
+        "std": float(values.std(unbiased=False).cpu()),
+    }
+
+
+def _format_stats(name: str, tensor: torch.Tensor) -> str:
+    stats = _finite_stats(tensor)
+    return (
+        f"metrics_debug {name} "
+        f"min={stats['min']:.6f} max={stats['max']:.6f} "
+        f"mean={stats['mean']:.6f} std={stats['std']:.6f}"
+    )
+
+
+def print_metric_debug_diagnostics(
+    cfg: Dict,
+    raw_batch: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    output: Dict[str, torch.Tensor],
+    data_scaler: ZScoreDataScaler,
+) -> None:
+    input_key = cfg["DATASET"].get("input_key", "inputs")
+    target_key = cfg["DATASET"].get("target_key", "targets")
+    null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
+    metrics_cfg = cfg.get("METRICS", {})
+    threshold = float(metrics_cfg.get("mape_threshold", 1.0))
+
+    pred_norm = output["prediction"]
+    pred_raw = data_scaler.inverse_transform(pred_norm)
+    target_raw = align_target(raw_batch[target_key], pred_raw)
+    target_norm = align_target(batch[target_key], pred_norm)
+    mask = batch.get("targets_mask")
+    mask_valid = make_valid_mask(target_raw, null_val, mask)
+    mape_valid = make_mape_valid_mask(pred_raw, target_raw, null_val, mask, threshold=threshold)
+    total = int(target_raw.numel())
+    finite_target = torch.isfinite(target_raw)
+    finite_total = int(finite_target.sum().detach().cpu())
+
+    print(_format_stats("target_raw", target_raw))
+    print(_format_stats("pred_raw", pred_raw))
+    print(_format_stats("target_norm", target_norm))
+    print(_format_stats("pred_norm", pred_norm))
+    for small_threshold in (0.0, 1.0, 5.0):
+        small = finite_target & (target_raw.abs() <= small_threshold)
+        ratio = float(small.float().mean().detach().cpu()) if total else float("nan")
+        print(f"metrics_debug target_raw_abs_le_{small_threshold:g}_ratio={ratio:.6f}")
+    print(
+        "metrics_debug "
+        f"mape_valid_count={int(mape_valid.sum().detach().cpu())}/{total} "
+        f"mape_threshold={threshold:g} finite_target_count={finite_total}/{total}"
+    )
+    print(
+        "metrics_debug "
+        f"mask_valid_count={int(mask_valid.sum().detach().cpu())}/{total} "
+        f"mask_shape={tuple(mask.shape) if isinstance(mask, torch.Tensor) else None}"
+    )
+
+    if bool(cfg["MODEL"].get("required_timestamp", False)) or str(cfg["MODEL"].get("method_variant", "")).lower() == "fpem":
+        missing_time_keys = [
+            key for key in [
+                cfg["DATASET"].get("input_timestamp_key", "inputs_timestamps"),
+                cfg["DATASET"].get("target_timestamp_key", "targets_timestamps"),
+                cfg["DATASET"].get("current_timestamp_key", "current_timestamps"),
+            ]
+            if not isinstance(batch.get(key), torch.Tensor)
+        ]
+        if missing_time_keys:
+            print(f"WARNING: FPEM requires timestamps but batch is missing {missing_time_keys}")
+
+
 def debug_batch(cfg: Dict) -> None:
     cfg = finalize_config(cfg)
     train_cfg = cfg["TRAIN"]
@@ -697,20 +809,35 @@ def debug_batch(cfg: Dict) -> None:
         pred_original,
         raw_batch[target_key],
         cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+        batch.get("targets_mask"),
+    )
+    original_mse = masked_mse_value(
+        pred_original,
+        raw_batch[target_key],
+        cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+        batch.get("targets_mask"),
     )
     original_rmse = masked_rmse_value(
         pred_original,
         raw_batch[target_key],
         cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+        batch.get("targets_mask"),
     )
+    metrics_cfg = cfg.get("METRICS", {})
     original_mape = masked_mape_value(
         pred_original,
         raw_batch[target_key],
         cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val")),
+        batch.get("targets_mask"),
+        eps=float(metrics_cfg.get("mape_eps", 1e-5)),
+        threshold=float(metrics_cfg.get("mape_threshold", 1.0)),
+        as_percent=bool(metrics_cfg.get("mape_as_percent", True)),
     )
     print(f"debug_original_scale_mae={float(original_mae.detach().cpu()):.6f}")
+    print(f"debug_original_scale_mse={float(original_mse.detach().cpu()):.6f}")
     print(f"debug_original_scale_rmse={float(original_rmse.detach().cpu()):.6f}")
     print(f"debug_original_scale_mape={float(original_mape.detach().cpu()):.6f}")
+    print_metric_debug_diagnostics(cfg, raw_batch, batch, output, data_scaler)
     print(format_logs(logs, LOG_KEYS))
     print("debug_batch ok: forward/loss/backward finished without NaN or shape errors")
 
@@ -721,32 +848,69 @@ def compute_metric_dict(
     targets: torch.Tensor,
     null_val,
     existing_mask: torch.Tensor | None = None,
+    metrics_cfg: Dict | None = None,
 ) -> Dict[str, float]:
+    metrics_cfg = metrics_cfg or {}
+    mape_eps = float(metrics_cfg.get("mape_eps", 1e-5))
+    mape_threshold = float(metrics_cfg.get("mape_threshold", 1.0))
+    mape_as_percent = bool(metrics_cfg.get("mape_as_percent", True))
     metrics = {
         "mae": float(masked_mae_value(prediction, targets, null_val, existing_mask).detach().cpu()),
-        "rmse": float(masked_rmse_value(prediction, targets, null_val, existing_mask).detach().cpu()),
-        "mape": float(masked_mape_value(prediction, targets, null_val, existing_mask).detach().cpu()),
+        "mse": float(masked_mse_value(prediction, targets, null_val, existing_mask).detach().cpu()),
+        "mape": float(
+            masked_mape_value(
+                prediction,
+                targets,
+                null_val,
+                existing_mask,
+                eps=mape_eps,
+                threshold=mape_threshold,
+                as_percent=mape_as_percent,
+            ).detach().cpu()
+        ),
     }
+    metrics["rmse"] = float(np.sqrt(max(metrics["mse"], 0.0)))
     horizon = prediction.shape[1]
     eval_horizon = min(12, horizon)
     avg_mask = existing_mask[:, :eval_horizon] if existing_mask is not None else None
     metrics["mae_avg12"] = float(
         masked_mae_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
     )
-    metrics["rmse_avg12"] = float(
-        masked_rmse_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
+    metrics["mse_avg12"] = float(
+        masked_mse_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
     )
+    metrics["rmse_avg12"] = float(np.sqrt(max(metrics["mse_avg12"], 0.0)))
     metrics["mape_avg12"] = float(
-        masked_mape_value(prediction[:, :eval_horizon], targets[:, :eval_horizon], null_val, avg_mask).detach().cpu()
+        masked_mape_value(
+            prediction[:, :eval_horizon],
+            targets[:, :eval_horizon],
+            null_val,
+            avg_mask,
+            eps=mape_eps,
+            threshold=mape_threshold,
+            as_percent=mape_as_percent,
+        ).detach().cpu()
     )
     for step in HORIZON_EVAL_STEPS:
         if horizon >= step:
             pred_h = prediction[:, step - 1 : step]
             target_h = targets[:, step - 1 : step]
             mask_h = existing_mask[:, step - 1 : step] if existing_mask is not None else None
+            mse_key = f"mse_h{step}"
             metrics[f"mae_h{step}"] = float(masked_mae_value(pred_h, target_h, null_val, mask_h).detach().cpu())
-            metrics[f"rmse_h{step}"] = float(masked_rmse_value(pred_h, target_h, null_val, mask_h).detach().cpu())
-            metrics[f"mape_h{step}"] = float(masked_mape_value(pred_h, target_h, null_val, mask_h).detach().cpu())
+            metrics[mse_key] = float(masked_mse_value(pred_h, target_h, null_val, mask_h).detach().cpu())
+            metrics[f"rmse_h{step}"] = float(np.sqrt(max(metrics[mse_key], 0.0)))
+            metrics[f"mape_h{step}"] = float(
+                masked_mape_value(
+                    pred_h,
+                    target_h,
+                    null_val,
+                    mask_h,
+                    eps=mape_eps,
+                    threshold=mape_threshold,
+                    as_percent=mape_as_percent,
+                ).detach().cpu()
+            )
     return metrics
 
 
@@ -765,6 +929,10 @@ def evaluate(
     target_key = cfg["DATASET"].get("target_key", "targets")
     null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
     full_eval = max_batches is None or int(max_batches) < 0
+    needs_future_time = bool(
+        cfg["MODEL"].get("required_timestamp", False)
+        or str(cfg["MODEL"].get("method_variant", "")).lower() == "fpem"
+    )
     for step, batch in enumerate(loader):
         if not full_eval and step >= int(max_batches):
             break
@@ -772,17 +940,29 @@ def evaluate(
         batch = preprocess_batch(raw_batch, cfg, data_scaler)
         output = model(
             batch[input_key],
-            **get_time_kwargs(batch, cfg, include_future=False),
+            **get_time_kwargs(batch, cfg, include_future=needs_future_time),
         )
         prediction = data_scaler.inverse_transform(output["prediction"])
         targets = raw_batch[target_key]
-        batch_metrics = compute_metric_dict(prediction, targets, null_val, batch.get("targets_mask"))
+        batch_metrics = compute_metric_dict(
+            prediction,
+            targets,
+            null_val,
+            batch.get("targets_mask"),
+            cfg.get("METRICS", {}),
+        )
         for key, value in batch_metrics.items():
             values.setdefault(key, []).append(value)
     model.train()
     if not values.get("mae"):
-        return {"mae": float("nan"), "rmse": float("nan"), "mape": float("nan")}
-    return {key: float(np.mean(item_values)) for key, item_values in values.items()}
+        return {"mae": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mape": float("nan")}
+    result = {key: float(np.mean(item_values)) for key, item_values in values.items()}
+    for suffix in ["", "_avg12", *[f"_h{step}" for step in HORIZON_EVAL_STEPS]]:
+        mse_key = f"mse{suffix}"
+        rmse_key = f"rmse{suffix}"
+        if mse_key in result:
+            result[rmse_key] = float(np.sqrt(max(result[mse_key], 0.0)))
+    return result
 
 
 def build_metrics_payload(
@@ -813,6 +993,7 @@ def build_metrics_payload(
         "global_step": global_step,
         "split": split,
         "mae": metrics.get("mae", float("nan")),
+        "mse": metrics.get("mse", float("nan")),
         "rmse": metrics.get("rmse", float("nan")),
         "mape": metrics.get("mape", float("nan")),
         "config_path": run_cfg.get("config_path", ""),
@@ -835,6 +1016,7 @@ def save_metrics_json(path: Path, payload: Dict) -> None:
 def make_val_metric_row(metrics: Dict[str, float], lr: float | None = None) -> Dict[str, object]:
     row = {
         "val_mae": metrics.get("mae", ""),
+        "val_mse": metrics.get("mse", ""),
         "val_rmse": metrics.get("rmse", ""),
         "val_mape": metrics.get("mape", ""),
         "val_mae_avg12": metrics.get("mae_avg12", metrics.get("mae", "")),
@@ -977,6 +1159,7 @@ def train_local(cfg: Dict) -> None:
             )
             print(
                 f"epoch={epoch} val_mae={val_metrics['mae']:.6f} "
+                f"val_mse={val_metrics['mse']:.6f} "
                 f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f} "
                 f"val_mae_h3={val_metrics.get('mae_h3', float('nan')):.6f} "
                 f"val_mae_h6={val_metrics.get('mae_h6', float('nan')):.6f} "
@@ -1022,6 +1205,7 @@ def train_local(cfg: Dict) -> None:
                             "epoch": epoch,
                             "global_step": global_step,
                             "val_mae": val_metrics["mae"],
+                            "val_mse": val_metrics["mse"],
                             "val_rmse": val_metrics["rmse"],
                             "val_mape": val_metrics["mape"],
                         },
@@ -1065,6 +1249,7 @@ def train_local(cfg: Dict) -> None:
                         )
                         print(
                             f"best test_mae={test_metrics['mae']:.6f} "
+                            f"test_mse={test_metrics['mse']:.6f} "
                             f"test_rmse={test_metrics['rmse']:.6f} test_mape={test_metrics['mape']:.6f}"
                         )
                     print(f"saved best checkpoint: {best_ckpt_path}")

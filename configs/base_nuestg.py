@@ -30,6 +30,11 @@ CONFIG = {
         "rescale": True,
         "eps": 1e-5,
     },
+    "METRICS": {
+        "mape_threshold": 1.0,
+        "mape_eps": 1e-5,
+        "mape_as_percent": True,
+    },
     "MODEL": {
         "name": "NUESTG",
         "input_len": 12,
@@ -310,6 +315,7 @@ CONFIG = {
         "learning_rate": 1e-3,
         "weight_decay": 0.0,
         "optimizer": "adam",
+        "no_decay_for_bias_norm_emb": False,
         "grad_clip": 5.0,
         "num_workers": 4,
         "pin_memory": True,
