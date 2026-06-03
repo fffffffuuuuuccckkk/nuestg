@@ -250,6 +250,9 @@ class CaSTBackbone(BaseBackbone):
         time_delay_scaler: int = 6,
         beta1: float = 1.0,
         beta2: float = 1.0,
+        lambda_vq: float = 1.0,
+        lambda_commit: Optional[float] = None,
+        lambda_mi: Optional[float] = None,
         bias: bool = True,
         **kwargs,
     ) -> None:
@@ -259,8 +262,9 @@ class CaSTBackbone(BaseBackbone):
         self.node_embed_dim = int(node_embed_dim)
         self.K = int(K)
         self.time_delay_scaler = max(1, int(time_delay_scaler))
-        self.beta1 = float(beta1)
-        self.beta2 = float(beta2)
+        self.lambda_vq = float(lambda_vq)
+        self.lambda_commit = float(beta1 if lambda_commit is None else lambda_commit)
+        self.lambda_mi = float(beta2 if lambda_mi is None else lambda_mi)
         self.start_encoder = _DilatedConvEncoder(input_dim, [input_dim] * int(depth) + [hid_dim], kernel_size=3)
         kernels = [2**i for i in range(max(1, int(math.log2(max(2, input_len // 2)))))]
         self.temporal = _TempDisentangler(hid_dim, kernels, input_len, dropout)
@@ -394,8 +398,8 @@ class CaSTBackbone(BaseBackbone):
                 "cast_mi_loss": loss_mi,
             },
             "backbone_aux_weights": {
-                "cast_vq_loss": 1.0,
-                "cast_commit_loss": self.beta1,
-                "cast_mi_loss": self.beta2,
+                "cast_vq_loss": self.lambda_vq,
+                "cast_commit_loss": self.lambda_commit,
+                "cast_mi_loss": self.lambda_mi,
             },
         }

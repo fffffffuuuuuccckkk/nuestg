@@ -219,6 +219,9 @@ class NUESTGLoss(nn.Module):
         "cast_vq_loss",
         "cast_commit_loss",
         "cast_mi_loss",
+        "stone_graph_perturb_loss",
+        "stone_spatial_graph_entropy",
+        "stone_temporal_graph_entropy",
     ]
 
     def __init__(self, **kwargs) -> None:
@@ -365,6 +368,9 @@ class NUESTGLoss(nn.Module):
             "cast_vq_loss": zero,
             "cast_commit_loss": zero,
             "cast_mi_loss": zero,
+            "stone_graph_perturb_loss": zero,
+            "stone_spatial_graph_entropy": zero,
+            "stone_temporal_graph_entropy": zero,
         }
         aux_losses = output.get("backbone_aux_losses") or {}
         aux_weights = output.get("backbone_aux_weights") or {}

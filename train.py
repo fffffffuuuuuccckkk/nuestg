@@ -130,6 +130,9 @@ LOG_KEYS = [
     "cast_vq_loss",
     "cast_commit_loss",
     "cast_mi_loss",
+    "stone_graph_perturb_loss",
+    "stone_spatial_graph_entropy",
+    "stone_temporal_graph_entropy",
 ]
 HORIZON_EVAL_STEPS = (3, 6, 12)
 METRIC_FIELDS = [
@@ -167,14 +170,14 @@ BACKBONE_DESCRIPTIONS = {
     "st_norm": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
     "stnorm_wavenet": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
     "d2stgnn": "official_local_wrapper D2STGNN backbone adapted to the shared interface",
-    "cast": "cast_faithful_pytorch_adapter_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
-    "cast_adapter": "cast_faithful_pytorch_adapter_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
+    "cast": "cast_method_level_pytorch_reproduction_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
+    "cast_adapter": "cast_method_level_pytorch_reproduction_with_official_aux_loss; fixed-node PyTorch adapter, not full official PyG/ST-OOD pipeline",
     "cast_official": "official_local_wrapper gate for full CaST; skips when official PyG/data/loss protocol is unavailable",
-    "stone": "stone_faithful_pytorch_adapter_without_spatial_side_info with learnable semantic fallback",
-    "stone_adapter": "stone_faithful_pytorch_adapter_without_spatial_side_info with learnable semantic fallback",
+    "stone": "stone_method_level_pytorch_adapter_with_adjacency_frechet_side_info_and_graph_perturbation",
+    "stone_adapter": "stone_method_level_pytorch_adapter_with_adjacency_frechet_side_info_and_graph_perturbation",
     "stone_official": "official_local_wrapper gate for full STONE; skips when spatial side information is unavailable",
-    "stop": "stop_faithful_architecture_adapter_without_sood_protocol adapted from STOP architecture",
-    "stop_adapter": "stop_faithful_architecture_adapter_without_sood_protocol adapted from STOP architecture",
+    "stop": "stop_released_code_method_reproduction_without_sood_protocol adapted from released STOP architecture",
+    "stop_adapter": "stop_released_code_method_reproduction_without_sood_protocol adapted from released STOP architecture",
     "stop_official": "official_local_wrapper gate for full STOP; skips when official SOOD protocol is unavailable",
 }
 
@@ -1124,7 +1127,7 @@ def train_with_basicts_launcher(cfg: Dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="NUE-STG experiment entrypoint.")
-    parser.add_argument("--config", required=True, help="Path to Python config file.")
+    parser.add_argument("--config", "--config_file", dest="config", required=True, help="Path to Python config file.")
     parser.add_argument("--debug_batch", action="store_true", help="Run one forward/loss/backward smoke test.")
     parser.add_argument("--runner", choices=["local", "basicts"], default="local")
     parser.add_argument("--set", dest="dotlist", action="append", default=[], help="Override config, e.g. LOSS.lambda_kl=1e-5")
