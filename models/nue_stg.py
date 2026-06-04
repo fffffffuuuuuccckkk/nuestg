@@ -617,6 +617,7 @@ class NUESTG(nn.Module):
         seq_time: Optional[torch.Tensor] = None,
         cur_time: Optional[torch.Tensor] = None,
         future_time: Optional[torch.Tensor] = None,
+        compute_aux: bool = False,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size, input_len, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)
@@ -670,7 +671,8 @@ class NUESTG(nn.Module):
         persist_q = None
         persist_k = None
         persist_score = None
-        if self.training and y_true is not None:
+        compute_future_aux = y_true is not None and (self.training or compute_aux)
+        if compute_future_aux:
             aligned_true = align_target(y_true, y_inv)
             future_env_input = self._match_env_input_dim(aligned_true)
             env_fut_mu_tokens, env_fut_logvar_tokens, env_fut_tokens = self.env_token_encoder(
@@ -711,7 +713,7 @@ class NUESTG(nn.Module):
         prediction_swap = None
         env_perm = None
         env_perm_index = None
-        if self.training and self.swap_cfg.get("enabled", True):
+        if (self.training or compute_aux) and self.swap_cfg.get("enabled", True):
             env_perm, env_perm_index = self._permute_env_with_indices(env_plus)
             env_swap_decode = env_perm.detach() if bool(self.swap_cfg.get("detach_env", True)) else env_perm
             swap_out = self.fpem_predict_from_z_env(z_inv, env_swap_decode)
@@ -834,6 +836,7 @@ class NUESTG(nn.Module):
                 seq_time=seq_time,
                 cur_time=cur_time,
                 future_time=future_time,
+                compute_aux=bool(kwargs.get("compute_aux", False)),
             )
         batch_size, _, num_nodes, _ = x.shape
         adj = getattr(self, "adj_norm", None)

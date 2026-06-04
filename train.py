@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import warnings
@@ -27,6 +28,7 @@ from utils import (
     masked_mape_value,
     masked_rmse_value,
     masked_mse_value,
+    masked_wape_value,
     make_mape_valid_mask,
     make_valid_mask,
     maybe_generate_timestamp_file,
@@ -51,6 +53,7 @@ LOG_KEYS = [
     "effective_lambda_swap",
     "effective_lambda_sep",
     "effective_lambda_mask_sparse",
+    "aux_schedule_factor",
     "ind_loss",
     "sparse_loss",
     "entropy_loss",
@@ -61,6 +64,8 @@ LOG_KEYS = [
     "future_mi_loss",
     "future_mi_type",
     "env_fut_nll",
+    "env_fut_nll_plus",
+    "env_fut_nll_minus",
     "env_fut_kl",
     "pred_fut_logvar_mean",
     "pred_fut_mu_norm",
@@ -129,6 +134,7 @@ LOG_KEYS = [
     "seq_time_emb_norm",
     "future_time_emb_norm",
     "backbone_aux_loss",
+    "curriculum_horizon",
     "cast_vq_loss",
     "cast_commit_loss",
     "cast_mi_loss",
@@ -142,18 +148,23 @@ METRIC_FIELDS = [
     "val_mse",
     "val_rmse",
     "val_mape",
+    "val_wape",
     "val_mae_h3",
     "val_rmse_h3",
     "val_mape_h3",
+    "val_wape_h3",
     "val_mae_h6",
     "val_rmse_h6",
     "val_mape_h6",
+    "val_wape_h6",
     "val_mae_h12",
     "val_rmse_h12",
     "val_mape_h12",
+    "val_wape_h12",
     "val_mae_avg12",
     "val_rmse_avg12",
     "val_mape_avg12",
+    "val_wape_avg12",
     "lr",
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, *METRIC_FIELDS]
@@ -201,6 +212,7 @@ def finalize_config(cfg: Dict) -> Dict:
     run_cfg = cfg.setdefault("RUN", {})
     swap_cfg = cfg.get("SWAP", {})
     cfg.setdefault("EVAL", {}).setdefault("horizon_metrics", True)
+    cfg.setdefault("EVAL", {}).setdefault("save_test_diagnostics", False)
     metrics_cfg = cfg.setdefault("METRICS", {})
     metrics_cfg.setdefault("mape_threshold", 1.0)
     metrics_cfg.setdefault("mape_eps", 1e-5)
@@ -212,6 +224,16 @@ def finalize_config(cfg: Dict) -> Dict:
     scaler_cfg.setdefault("rescale", True)
     scaler_cfg.setdefault("eps", 1e-5)
     train_cfg.setdefault("no_decay_for_bias_norm_emb", False)
+    train_cfg.setdefault("curriculum_enabled", False)
+    train_cfg.setdefault("curriculum_start_horizon", 3)
+    train_cfg.setdefault("curriculum_full_horizon_epoch", 30)
+    train_cfg.setdefault("teacher_forcing_enabled", False)
+    train_cfg.setdefault("tf_decay_steps", 2000)
+    loss_cfg.setdefault("warmup_epochs", 0)
+    loss_cfg.setdefault("aux_ramp_epochs", 0)
+    loss_cfg.setdefault("peak_weight_enabled", False)
+    loss_cfg.setdefault("peak_quantile", 0.75)
+    loss_cfg.setdefault("peak_weight", 0.2)
     ds_cfg.setdefault("null_to_num", 0.0)
     ds_cfg.setdefault("frequency_minutes", 5)
     ds_cfg.setdefault("auto_generate_timestamps", True)
@@ -305,6 +327,13 @@ def finalize_config(cfg: Dict) -> Dict:
     backbone_cfg = model_cfg.setdefault("backbone", {})
     model_cfg["backbone_name"] = model_cfg.get("backbone_name", backbone_cfg.get("name", "stid_mlp"))
     backbone_cfg["name"] = model_cfg["backbone_name"]
+    backbone_name_lower = str(model_cfg["backbone_name"]).lower()
+    if train_cfg.get("teacher_forcing_enabled", False) and backbone_name_lower == "agcrn":
+        warnings.warn(
+            "TRAIN.teacher_forcing_enabled=True was requested for AGCRN, but the current AGCRN adapter "
+            "uses a direct multi-horizon head and does not implement the official decoder scheduled sampling protocol.",
+            RuntimeWarning,
+        )
     if isinstance(model_cfg.get("GWNET"), dict):
         backbone_cfg.setdefault("graph_wavenet", {})
         backbone_cfg["graph_wavenet"].update(model_cfg["GWNET"])
@@ -539,6 +568,80 @@ def current_lr(optimizer: torch.optim.Optimizer) -> float:
     return float(optimizer.param_groups[0].get("lr", 0.0))
 
 
+def curriculum_horizon(train_cfg: Dict, epoch: int, full_horizon: int) -> int:
+    if not bool(train_cfg.get("curriculum_enabled", False)):
+        return int(full_horizon)
+    full_horizon = int(full_horizon)
+    start = max(1, min(int(train_cfg.get("curriculum_start_horizon", full_horizon)), full_horizon))
+    full_epoch = max(1, int(train_cfg.get("curriculum_full_horizon_epoch", 1)))
+    if epoch >= full_epoch or start >= full_horizon:
+        return full_horizon
+    progress = max(epoch - 1, 0) / max(full_epoch - 1, 1)
+    horizon = int(np.ceil(start + (full_horizon - start) * progress))
+    return max(start, min(horizon, full_horizon))
+
+
+def slice_for_train_horizon(
+    output: Dict[str, torch.Tensor],
+    y_true: torch.Tensor,
+    targets_mask: torch.Tensor | None,
+    raw_y_true: torch.Tensor | None,
+    horizon: int,
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    full_horizon = int(output["prediction"].shape[1])
+    horizon = max(1, min(int(horizon), full_horizon))
+    if horizon >= full_horizon:
+        return output, y_true, targets_mask, raw_y_true
+    horizon_keys = {
+        "prediction",
+        "y_inv",
+        "y_potential",
+        "r_env",
+        "rho",
+        "y_inv_raw",
+        "prediction_swap",
+        "rho_swap",
+        "env_fut_tokens",
+        "env_fut_mu_tokens",
+        "env_fut_logvar_tokens",
+        "pred_fut_mu",
+        "pred_fut_logvar",
+        "pred_fut_mu_minus",
+        "pred_fut_logvar_minus",
+        "future_time_emb",
+    }
+    sliced = dict(output)
+    for key in horizon_keys:
+        value = sliced.get(key)
+        if isinstance(value, torch.Tensor) and value.dim() >= 2 and value.shape[1] == full_horizon:
+            sliced[key] = value[:, :horizon]
+    y_true_sliced = y_true[:, :horizon] if isinstance(y_true, torch.Tensor) and y_true.shape[1] >= horizon else y_true
+    mask_sliced = (
+        targets_mask[:, :horizon]
+        if isinstance(targets_mask, torch.Tensor) and targets_mask.shape[1] >= horizon
+        else targets_mask
+    )
+    raw_sliced = (
+        raw_y_true[:, :horizon]
+        if isinstance(raw_y_true, torch.Tensor) and raw_y_true.shape[1] >= horizon
+        else raw_y_true
+    )
+    return sliced, y_true_sliced, mask_sliced, raw_sliced
+
+
+def describe_backbone_features(model: NUESTG) -> Dict[str, bool]:
+    backbone = getattr(model, "backbone", None)
+    return {
+        "node_embedding": bool(
+            getattr(backbone, "node_emb", None) is not None
+            or getattr(backbone, "node_embeddings", None) is not None
+            or getattr(backbone, "nodevec1", None) is not None
+        ),
+        "time_of_day_embedding": bool(getattr(backbone, "time_in_day_emb", None) is not None),
+        "day_of_week_embedding": bool(getattr(backbone, "day_in_week_emb", None) is not None),
+    }
+
+
 def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, cfg: Dict) -> None:
     batch_size = targets.shape[0]
     input_len = cfg["DATASET"]["input_len"]
@@ -710,14 +813,18 @@ def print_metric_debug_diagnostics(
     )
 
     if bool(cfg["MODEL"].get("required_timestamp", False)) or str(cfg["MODEL"].get("method_variant", "")).lower() == "fpem":
+        seq_key = cfg["DATASET"].get("input_timestamp_key", "inputs_timestamps")
+        cur_key = cfg["DATASET"].get("current_timestamp_key", "current_timestamps")
         missing_time_keys = [
             key for key in [
-                cfg["DATASET"].get("input_timestamp_key", "inputs_timestamps"),
+                seq_key,
                 cfg["DATASET"].get("target_timestamp_key", "targets_timestamps"),
-                cfg["DATASET"].get("current_timestamp_key", "current_timestamps"),
+                cur_key,
             ]
             if not isinstance(batch.get(key), torch.Tensor)
         ]
+        if cur_key in missing_time_keys and isinstance(batch.get(seq_key), torch.Tensor):
+            missing_time_keys.remove(cur_key)
         if missing_time_keys:
             print(f"WARNING: FPEM requires timestamps but batch is missing {missing_time_keys}")
 
@@ -750,6 +857,35 @@ def debug_batch(cfg: Dict) -> None:
     print(f"method_variant: {cfg['MODEL'].get('method_variant', 'nue')}")
     print(f"backbone_name: {backbone_name}")
     print(f"backbone_description: {BACKBONE_DESCRIPTIONS.get(str(backbone_name).lower(), 'custom invariant backbone')}")
+    backbone_features = describe_backbone_features(model)
+    print(f"backbone_uses_node_embedding: {backbone_features['node_embedding']}")
+    print(f"backbone_uses_time_of_day_embedding: {backbone_features['time_of_day_embedding']}")
+    print(f"backbone_uses_day_of_week_embedding: {backbone_features['day_of_week_embedding']}")
+    if cfg["MODEL"].get("required_timestamp", False) and not (
+        backbone_features["time_of_day_embedding"] or backbone_features["day_of_week_embedding"]
+    ):
+        print(
+            "WARNING: current backbone does not consume TOD/DOW identity embeddings directly; "
+            "FPEM still uses timestamp embeddings in z/env/mask/future branches."
+        )
+    print(f"teacher_forcing_enabled: {cfg['TRAIN'].get('teacher_forcing_enabled', False)}")
+    print(f"tf_decay_steps: {cfg['TRAIN'].get('tf_decay_steps', '')}")
+    if str(backbone_name).lower() == "agcrn":
+        print(
+            "WARNING: AGCRN adapter uses a direct multi-horizon head; official decoder scheduled sampling "
+            "is not implemented in this local wrapper."
+        )
+    print(
+        "loss_schedule: "
+        f"warmup_epochs={cfg['LOSS'].get('warmup_epochs', 0)} "
+        f"aux_ramp_epochs={cfg['LOSS'].get('aux_ramp_epochs', 0)}"
+    )
+    print(
+        "horizon_curriculum: "
+        f"enabled={cfg['TRAIN'].get('curriculum_enabled', False)} "
+        f"start={cfg['TRAIN'].get('curriculum_start_horizon', '')} "
+        f"full_epoch={cfg['TRAIN'].get('curriculum_full_horizon_epoch', '')}"
+    )
     print(f"gate_label_mode: {cfg['LOSS'].get('gate_label_mode', 'potential_gain')}")
     print(f"swap_mode: {cfg.get('SWAP', {}).get('mode', 'batch_node_random')}")
     print(f"pair_mining: {cfg.get('SWAP', {}).get('pair_mining', False)}")
@@ -794,13 +930,22 @@ def debug_batch(cfg: Dict) -> None:
         **get_time_kwargs(batch, cfg, include_future=True),
     )
     check_output_shapes(output, batch[target_key], cfg)
-    loss, logs = loss_fn(
+    debug_horizon = curriculum_horizon(train_cfg, 1, cfg["DATASET"]["output_len"])
+    loss_output, loss_targets, loss_mask, loss_raw_targets = slice_for_train_horizon(
         output,
         batch[target_key],
         batch.get("targets_mask"),
-        raw_y_true=raw_batch[target_key],
+        raw_batch[target_key],
+        debug_horizon,
+    )
+    loss, logs = loss_fn(
+        loss_output,
+        loss_targets,
+        loss_mask,
+        raw_y_true=loss_raw_targets,
         data_scaler=data_scaler,
     )
+    logs["curriculum_horizon"] = output["prediction"].new_tensor(float(debug_horizon))
     loss.backward()
     assert_finite(loss, "total_loss")
     assert_finite(output["rho"], "rho")
@@ -868,6 +1013,16 @@ def compute_metric_dict(
                 as_percent=mape_as_percent,
             ).detach().cpu()
         ),
+        "wape": float(
+            masked_wape_value(
+                prediction,
+                targets,
+                null_val,
+                existing_mask,
+                eps=mape_eps,
+                as_percent=mape_as_percent,
+            ).detach().cpu()
+        ),
     }
     metrics["rmse"] = float(np.sqrt(max(metrics["mse"], 0.0)))
     horizon = prediction.shape[1]
@@ -891,6 +1046,16 @@ def compute_metric_dict(
             as_percent=mape_as_percent,
         ).detach().cpu()
     )
+    metrics["wape_avg12"] = float(
+        masked_wape_value(
+            prediction[:, :eval_horizon],
+            targets[:, :eval_horizon],
+            null_val,
+            avg_mask,
+            eps=mape_eps,
+            as_percent=mape_as_percent,
+        ).detach().cpu()
+    )
     for step in HORIZON_EVAL_STEPS:
         if horizon >= step:
             pred_h = prediction[:, step - 1 : step]
@@ -908,6 +1073,16 @@ def compute_metric_dict(
                     mask_h,
                     eps=mape_eps,
                     threshold=mape_threshold,
+                    as_percent=mape_as_percent,
+                ).detach().cpu()
+            )
+            metrics[f"wape_h{step}"] = float(
+                masked_wape_value(
+                    pred_h,
+                    target_h,
+                    null_val,
+                    mask_h,
+                    eps=mape_eps,
                     as_percent=mape_as_percent,
                 ).detach().cpu()
             )
@@ -955,7 +1130,7 @@ def evaluate(
             values.setdefault(key, []).append(value)
     model.train()
     if not values.get("mae"):
-        return {"mae": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mape": float("nan")}
+        return {"mae": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mape": float("nan"), "wape": float("nan")}
     result = {key: float(np.mean(item_values)) for key, item_values in values.items()}
     for suffix in ["", "_avg12", *[f"_h{step}" for step in HORIZON_EVAL_STEPS]]:
         mse_key = f"mse{suffix}"
@@ -963,6 +1138,149 @@ def evaluate(
         if mse_key in result:
             result[rmse_key] = float(np.sqrt(max(result[mse_key], 0.0)))
     return result
+
+
+@torch.no_grad()
+def save_test_diagnostics(
+    model: NUESTG,
+    loader: DataLoader,
+    device: torch.device,
+    cfg: Dict,
+    max_batches,
+    data_scaler: ZScoreDataScaler,
+    ckpt_dir: Path,
+) -> Dict[str, float]:
+    if not bool(cfg.get("EVAL", {}).get("save_test_diagnostics", False)):
+        return {}
+    model.eval()
+    input_key = cfg["DATASET"].get("input_key", "inputs")
+    target_key = cfg["DATASET"].get("target_key", "targets")
+    null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
+    metrics_cfg = cfg.get("METRICS", {})
+    full_eval = max_batches is None or int(max_batches) < 0
+    arrays: Dict[str, list] = {
+        "prediction_raw": [],
+        "target_raw": [],
+        "mask": [],
+        "env_mask": [],
+        "env_plus": [],
+        "env_minus": [],
+    }
+    stats: Dict[str, list] = {
+        "mask_density": [],
+        "env_plus_future_nll": [],
+        "env_minus_future_nll": [],
+        "swap_delta_mae": [],
+    }
+    for step, batch in enumerate(loader):
+        if not full_eval and step >= int(max_batches):
+            break
+        raw_batch = to_device_batch(batch, device)
+        batch = preprocess_batch(raw_batch, cfg, data_scaler)
+        output = model(
+            batch[input_key],
+            y_true=batch[target_key],
+            **get_time_kwargs(batch, cfg, include_future=True),
+            compute_aux=True,
+        )
+        prediction_raw = data_scaler.inverse_transform(output["prediction"])
+        target_raw = align_target(raw_batch[target_key], prediction_raw)
+        target_mask = make_valid_mask(target_raw, null_val, batch.get("targets_mask"))
+        arrays["prediction_raw"].append(prediction_raw.detach().cpu().numpy().astype(np.float32))
+        arrays["target_raw"].append(target_raw.detach().cpu().numpy().astype(np.float32))
+        arrays["mask"].append(target_mask.detach().cpu().numpy().astype(np.bool_))
+        if isinstance(output.get("mask"), torch.Tensor):
+            env_mask = output["mask"].detach()
+            arrays["env_mask"].append(env_mask.cpu().numpy().astype(np.float32))
+            stats["mask_density"].append(float(env_mask.mean().cpu()))
+        for key in ["env_plus", "env_minus"]:
+            if isinstance(output.get(key), torch.Tensor):
+                arrays[key].append(output[key].detach().cpu().numpy().astype(np.float32))
+        pred_swap = output.get("prediction_swap")
+        if isinstance(pred_swap, torch.Tensor):
+            swap_raw = data_scaler.inverse_transform(pred_swap)
+            full_mae = masked_mae_value(prediction_raw, target_raw, null_val, target_mask)
+            swap_mae = masked_mae_value(swap_raw, target_raw, null_val, target_mask)
+            stats["swap_delta_mae"].append(float((swap_mae - full_mae).detach().cpu()))
+        env_fut_tokens = output.get("env_fut_tokens")
+        pred_fut_mu = output.get("pred_fut_mu")
+        pred_fut_logvar = output.get("pred_fut_logvar")
+        pred_fut_mu_minus = output.get("pred_fut_mu_minus")
+        pred_fut_logvar_minus = output.get("pred_fut_logvar_minus")
+        if isinstance(env_fut_tokens, torch.Tensor) and isinstance(pred_fut_mu, torch.Tensor) and isinstance(pred_fut_logvar, torch.Tensor):
+            nll_plus = 0.5 * ((env_fut_tokens - pred_fut_mu).pow(2) * torch.exp(-pred_fut_logvar) + pred_fut_logvar)
+            stats["env_plus_future_nll"].append(float(nll_plus.mean().detach().cpu()))
+        if isinstance(env_fut_tokens, torch.Tensor) and isinstance(pred_fut_mu_minus, torch.Tensor) and isinstance(pred_fut_logvar_minus, torch.Tensor):
+            nll_minus = 0.5 * (
+                (env_fut_tokens - pred_fut_mu_minus).pow(2) * torch.exp(-pred_fut_logvar_minus) + pred_fut_logvar_minus
+            )
+            stats["env_minus_future_nll"].append(float(nll_minus.mean().detach().cpu()))
+
+    if not arrays["prediction_raw"]:
+        model.train()
+        return {}
+
+    save_payload = {}
+    for key, chunks in arrays.items():
+        if chunks:
+            save_payload[key] = np.concatenate(chunks, axis=0)
+    np.savez_compressed(ckpt_dir / "test_outputs.npz", **save_payload)
+
+    prediction = torch.from_numpy(save_payload["prediction_raw"]).to(device)
+    targets = torch.from_numpy(save_payload["target_raw"]).to(device)
+    mask = torch.from_numpy(save_payload["mask"]).to(device)
+    horizon_rows = []
+    for horizon_idx in range(prediction.shape[1]):
+        pred_h = prediction[:, horizon_idx : horizon_idx + 1]
+        target_h = targets[:, horizon_idx : horizon_idx + 1]
+        mask_h = mask[:, horizon_idx : horizon_idx + 1]
+        row_metrics = compute_metric_dict(pred_h, target_h, null_val, mask_h, metrics_cfg)
+        horizon_rows.append({
+            "horizon": horizon_idx + 1,
+            "mae": row_metrics.get("mae", float("nan")),
+            "mse": row_metrics.get("mse", float("nan")),
+            "rmse": row_metrics.get("rmse", float("nan")),
+            "mape": row_metrics.get("mape", float("nan")),
+            "wape": row_metrics.get("wape", float("nan")),
+        })
+    with (ckpt_dir / "test_metrics_by_horizon.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["horizon", "mae", "mse", "rmse", "mape", "wape"])
+        writer.writeheader()
+        writer.writerows(horizon_rows)
+
+    valid_targets = targets[mask]
+    range_rows = []
+    if valid_targets.numel() > 0:
+        q_low = torch.quantile(valid_targets.float(), 1.0 / 3.0)
+        q_high = torch.quantile(valid_targets.float(), 2.0 / 3.0)
+        ranges = [
+            ("low", mask & (targets <= q_low)),
+            ("mid", mask & (targets > q_low) & (targets <= q_high)),
+            ("high", mask & (targets > q_high)),
+        ]
+        for label, range_mask in ranges:
+            row_metrics = compute_metric_dict(prediction, targets, null_val, range_mask, metrics_cfg)
+            range_rows.append({
+                "range": label,
+                "count": int(range_mask.sum().detach().cpu()),
+                "mae": row_metrics.get("mae", float("nan")),
+                "mse": row_metrics.get("mse", float("nan")),
+                "rmse": row_metrics.get("rmse", float("nan")),
+                "mape": row_metrics.get("mape", float("nan")),
+                "wape": row_metrics.get("wape", float("nan")),
+            })
+    with (ckpt_dir / "test_metrics_by_range.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["range", "count", "mae", "mse", "rmse", "mape", "wape"])
+        writer.writeheader()
+        writer.writerows(range_rows)
+
+    summary = {
+        key: float(np.mean(values)) if values else float("nan")
+        for key, values in stats.items()
+    }
+    save_metrics_json(ckpt_dir / "test_env_diagnostics.json", summary)
+    model.train()
+    return summary
 
 
 def build_metrics_payload(
@@ -996,6 +1314,7 @@ def build_metrics_payload(
         "mse": metrics.get("mse", float("nan")),
         "rmse": metrics.get("rmse", float("nan")),
         "mape": metrics.get("mape", float("nan")),
+        "wape": metrics.get("wape", float("nan")),
         "config_path": run_cfg.get("config_path", ""),
         "ckpt_path": str(ckpt_path),
         "status": run_cfg.get("status", "runnable"),
@@ -1019,15 +1338,18 @@ def make_val_metric_row(metrics: Dict[str, float], lr: float | None = None) -> D
         "val_mse": metrics.get("mse", ""),
         "val_rmse": metrics.get("rmse", ""),
         "val_mape": metrics.get("mape", ""),
+        "val_wape": metrics.get("wape", ""),
         "val_mae_avg12": metrics.get("mae_avg12", metrics.get("mae", "")),
         "val_rmse_avg12": metrics.get("rmse_avg12", metrics.get("rmse", "")),
         "val_mape_avg12": metrics.get("mape_avg12", metrics.get("mape", "")),
+        "val_wape_avg12": metrics.get("wape_avg12", metrics.get("wape", "")),
         "lr": "" if lr is None else lr,
     }
     for step in HORIZON_EVAL_STEPS:
         row[f"val_mae_h{step}"] = metrics.get(f"mae_h{step}", "")
         row[f"val_rmse_h{step}"] = metrics.get(f"rmse_h{step}", "")
         row[f"val_mape_h{step}"] = metrics.get(f"mape_h{step}", "")
+        row[f"val_wape_h{step}"] = metrics.get(f"wape_h{step}", "")
     return row
 
 
@@ -1094,13 +1416,22 @@ def train_local(cfg: Dict) -> None:
                     y_true=batch[target_key],
                     **get_time_kwargs(batch, cfg, include_future=True),
                 )
-                loss, logs = loss_fn(
+                train_horizon = curriculum_horizon(train_cfg, epoch, cfg["DATASET"]["output_len"])
+                loss_output, loss_targets, loss_mask, loss_raw_targets = slice_for_train_horizon(
                     output,
                     batch[target_key],
                     batch.get("targets_mask"),
-                    raw_y_true=raw_batch[target_key],
+                    raw_batch[target_key],
+                    train_horizon,
+                )
+                loss, logs = loss_fn(
+                    loss_output,
+                    loss_targets,
+                    loss_mask,
+                    raw_y_true=loss_raw_targets,
                     data_scaler=data_scaler,
                 )
+                logs["curriculum_horizon"] = output["prediction"].new_tensor(float(train_horizon))
             scaler.scale(loss).backward()
             grad_clip = train_cfg.get("grad_clip")
             if grad_clip:
@@ -1161,6 +1492,7 @@ def train_local(cfg: Dict) -> None:
                 f"epoch={epoch} val_mae={val_metrics['mae']:.6f} "
                 f"val_mse={val_metrics['mse']:.6f} "
                 f"val_rmse={val_metrics['rmse']:.6f} val_mape={val_metrics['mape']:.6f} "
+                f"val_wape={val_metrics.get('wape', float('nan')):.6f} "
                 f"val_mae_h3={val_metrics.get('mae_h3', float('nan')):.6f} "
                 f"val_mae_h6={val_metrics.get('mae_h6', float('nan')):.6f} "
                 f"val_mae_h12={val_metrics.get('mae_h12', float('nan')):.6f} "
@@ -1229,6 +1561,17 @@ def train_local(cfg: Dict) -> None:
                             train_cfg.get("test_batches", None),
                             data_scaler,
                         )
+                        diagnostic_metrics = save_test_diagnostics(
+                            model,
+                            test_loader,
+                            device,
+                            cfg,
+                            train_cfg.get("test_batches", None),
+                            data_scaler,
+                            ckpt_dir,
+                        )
+                        for diag_key, diag_value in diagnostic_metrics.items():
+                            test_metrics[f"diag_{diag_key}"] = diag_value
                         test_payload = build_metrics_payload(
                             cfg,
                             epoch,
@@ -1250,7 +1593,8 @@ def train_local(cfg: Dict) -> None:
                         print(
                             f"best test_mae={test_metrics['mae']:.6f} "
                             f"test_mse={test_metrics['mse']:.6f} "
-                            f"test_rmse={test_metrics['rmse']:.6f} test_mape={test_metrics['mape']:.6f}"
+                            f"test_rmse={test_metrics['rmse']:.6f} test_mape={test_metrics['mape']:.6f} "
+                            f"test_wape={test_metrics.get('wape', float('nan')):.6f}"
                         )
                     print(f"saved best checkpoint: {best_ckpt_path}")
             else:

@@ -22,6 +22,11 @@ class NUESTGLossConfig:
     use_masked_mae: bool = True
     null_val: Optional[float] = None
     train_loss_scale: str = "normalized"
+    warmup_epochs: int = 0
+    aux_ramp_epochs: int = 0
+    peak_weight_enabled: bool = False
+    peak_quantile: float = 0.75
+    peak_weight: float = 0.2
     lambda_pred: float = 1.0
     use_inv: bool = True
     lambda_inv: float = 0.2
@@ -138,6 +143,7 @@ class NUESTGLoss(nn.Module):
         "effective_lambda_swap",
         "effective_lambda_sep",
         "effective_lambda_mask_sparse",
+        "aux_schedule_factor",
         "ind_loss",
         "sparse_loss",
         "entropy_loss",
@@ -148,6 +154,8 @@ class NUESTGLoss(nn.Module):
         "future_mi_loss",
         "future_mi_type",
         "env_fut_nll",
+        "env_fut_nll_plus",
+        "env_fut_nll_minus",
         "env_fut_kl",
         "pred_fut_logvar_mean",
         "pred_fut_mu_norm",
@@ -275,6 +283,17 @@ class NUESTGLoss(nn.Module):
             )
         return data_scaler.inverse_transform(prediction), raw_y_true
 
+    def _peak_weight_mask(self, targets: torch.Tensor, mask: torch.Tensor) -> Optional[torch.Tensor]:
+        if not self.cfg.peak_weight_enabled or float(self.cfg.peak_weight) == 0.0:
+            return None
+        valid_values = targets.detach()[mask]
+        if valid_values.numel() == 0:
+            return None
+        quantile = float(self.cfg.peak_quantile)
+        quantile = min(max(quantile, 0.0), 1.0)
+        threshold = torch.quantile(valid_values.float(), quantile).to(device=targets.device, dtype=targets.dtype)
+        return 1.0 + float(self.cfg.peak_weight) * (targets >= threshold).to(dtype=targets.dtype)
+
     def _mae_loss(
         self,
         prediction: torch.Tensor,
@@ -285,6 +304,9 @@ class NUESTGLoss(nn.Module):
             raise ValueError(f"Only loss_type='mae' is implemented, got {self.cfg.loss_type!r}")
         null_val = None if targets_mask is not None else self.cfg.null_val
         abs_error, mask = masked_abs_error(prediction, targets, null_val, targets_mask)
+        peak_weight = self._peak_weight_mask(align_target(targets, prediction), mask)
+        if peak_weight is not None:
+            abs_error = abs_error * peak_weight
         return masked_mean(abs_error, mask if self.cfg.use_masked_mae else None)
 
     def _channel_mean_error(
@@ -297,6 +319,9 @@ class NUESTGLoss(nn.Module):
         null_val = None if targets_mask is not None else self.cfg.null_val
         mask = make_valid_mask(targets, null_val, targets_mask)
         abs_error = (prediction - torch.nan_to_num(targets, nan=0.0)).abs()
+        peak_weight = self._peak_weight_mask(targets, mask)
+        if peak_weight is not None:
+            abs_error = abs_error * peak_weight
         if not self.cfg.use_masked_mae:
             return abs_error.mean(dim=-1, keepdim=True), torch.ones_like(abs_error[..., :1], dtype=torch.bool)
         valid_counts = mask.to(abs_error.dtype).sum(dim=-1, keepdim=True).clamp_min(1.0)
@@ -335,8 +360,8 @@ class NUESTGLoss(nn.Module):
             return 0.0
         warmup = int(self.cfg.kl_warmup_epochs or 0)
         if warmup <= 0:
-            return float(self.cfg.lambda_kl)
-        return float(self.cfg.lambda_kl) * min(1.0, max(self.epoch, 0) / warmup)
+            return float(self.cfg.lambda_kl) * self._aux_schedule_factor()
+        return float(self.cfg.lambda_kl) * min(1.0, max(self.epoch, 0) / warmup) * self._aux_schedule_factor()
 
     def _effective_lambda_persistence_mi(self) -> float:
         if not self.cfg.use_persistence_mi or self.cfg.lambda_persistence_mi == 0:
@@ -352,10 +377,19 @@ class NUESTGLoss(nn.Module):
             return 1.0
         return min(1.0, max(self.epoch - 1, 0) / warmup)
 
+    def _aux_schedule_factor(self) -> float:
+        warmup = int(self.cfg.warmup_epochs or 0)
+        ramp = int(self.cfg.aux_ramp_epochs or 0)
+        if warmup > 0 and self.epoch <= warmup:
+            return 0.0
+        if ramp <= 0:
+            return 1.0
+        return min(1.0, max(self.epoch - warmup, 0) / ramp)
+
     def _effective_aux_lambda(self, enabled: bool, value: float, warmup_epochs: int) -> float:
         if not enabled or value == 0:
             return 0.0
-        return float(value) * self._warmup_factor(warmup_epochs)
+        return float(value) * self._warmup_factor(warmup_epochs) * self._aux_schedule_factor()
 
     def _backbone_aux_terms(
         self,
@@ -526,6 +560,8 @@ class NUESTGLoss(nn.Module):
         logs = {
             "future_mi_type": like.new_tensor(type_map.get(mi_type, 0.0)),
             "env_fut_nll": zero,
+            "env_fut_nll_plus": zero,
+            "env_fut_nll_minus": zero,
             "env_fut_kl": zero,
             "pred_fut_logvar_mean": zero,
             "pred_fut_mu_norm": zero,
@@ -547,6 +583,7 @@ class NUESTGLoss(nn.Module):
         target_tokens = env_fut_tokens.detach() if self.cfg.future_mi_detach_target else env_fut_tokens
         nll = self._diag_gaussian_nll(target_tokens, pred_mu, pred_logvar).mean()
         logs["env_fut_nll"] = nll.detach()
+        logs["env_fut_nll_plus"] = nll.detach()
         logs["future_mi_valid"] = like.new_tensor(1.0)
         if mi_type == "ba_nll":
             return nll, logs
@@ -770,6 +807,8 @@ class NUESTGLoss(nn.Module):
             target = env_fut_tokens.detach()
             nll_plus = self._diag_gaussian_nll(target, pred_fut_mu, pred_fut_logvar).mean(dim=-1)
             nll_minus = self._diag_gaussian_nll(target, pred_fut_mu_minus, pred_fut_logvar_minus).mean(dim=-1)
+            future_mi_logs["env_fut_nll_plus"] = nll_plus.mean().detach()
+            future_mi_logs["env_fut_nll_minus"] = nll_minus.mean().detach()
             rank_loss_raw = F.relu(float(self.cfg.rank_margin) + nll_plus - nll_minus).mean()
 
         pred_loss = pred_loss_raw
@@ -851,6 +890,7 @@ class NUESTGLoss(nn.Module):
             "effective_lambda_swap": prediction.new_tensor(effective_lambda_swap),
             "effective_lambda_sep": prediction.new_tensor(effective_lambda_sep),
             "effective_lambda_mask_sparse": prediction.new_tensor(effective_lambda_mask_sparse),
+            "aux_schedule_factor": prediction.new_tensor(self._aux_schedule_factor()),
             "ind_loss": ind_loss.detach(),
             "sep_loss": ind_loss.detach(),
             "sparse_loss": sparse_loss.detach(),
@@ -1086,6 +1126,7 @@ class NUESTGLoss(nn.Module):
             "effective_lambda_swap": prediction.new_tensor(effective_lambda_swap),
             "effective_lambda_sep": prediction.new_tensor(effective_lambda_sep),
             "effective_lambda_mask_sparse": zero,
+            "aux_schedule_factor": prediction.new_tensor(self._aux_schedule_factor()),
             "ind_loss": ind_loss.detach(),
             "sparse_loss": sparse_loss.detach(),
             "entropy_loss": entropy_loss.detach(),

@@ -51,6 +51,23 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             node_emb_dim=int(stid_cfg.get("node_emb_dim", model_cfg.get("node_emb_dim", 32))),
             dropout=float(stid_cfg.get("dropout", model_cfg.get("dropout", 0.1))),
             use_node_embedding=bool(stid_cfg.get("use_node_embedding", model_cfg.get("use_node_embedding", True))),
+            use_time_of_day_embedding=bool(
+                stid_cfg.get(
+                    "use_time_of_day_embedding",
+                    bool(model_cfg.get("use_timestamp", False)) and bool(model_cfg.get("use_time_of_day", True)),
+                )
+            ),
+            use_day_of_week_embedding=bool(
+                stid_cfg.get(
+                    "use_day_of_week_embedding",
+                    bool(model_cfg.get("use_timestamp", False)) and bool(model_cfg.get("use_day_of_week", True)),
+                )
+            ),
+            tod_emb_dim=int(stid_cfg.get("tod_emb_dim", model_cfg.get("tod_emb_dim", 16))),
+            dow_emb_dim=int(stid_cfg.get("dow_emb_dim", model_cfg.get("dow_emb_dim", 8))),
+            num_time_in_day=int(stid_cfg.get("num_time_in_day", model_cfg.get("num_time_in_day", 288))),
+            num_day_in_week=int(stid_cfg.get("num_day_in_week", model_cfg.get("num_day_in_week", 7))),
+            require_time_features=bool(stid_cfg.get("require_time_features", model_cfg.get("required_timestamp", False))),
         )
 
     if name in {"stid", "official_stid"}:

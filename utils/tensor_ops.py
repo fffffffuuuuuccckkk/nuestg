@@ -264,6 +264,26 @@ def masked_mape_value(
     return value * 100.0 if as_percent else value
 
 
+def masked_wape_value(
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+    null_val: Optional[float] = None,
+    existing_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-5,
+    as_percent: bool = True,
+) -> torch.Tensor:
+    targets = align_target(targets, prediction)
+    mask = make_valid_mask(targets, null_val, existing_mask)
+    mask = mask & torch.isfinite(prediction) & torch.isfinite(targets)
+    if mask.sum() == 0:
+        return prediction.new_tensor(float("nan"))
+    abs_error = (torch.nan_to_num(prediction, nan=0.0) - torch.nan_to_num(targets, nan=0.0)).abs()
+    numerator = abs_error[mask].sum()
+    denominator = targets[mask].abs().sum().clamp_min(float(eps))
+    value = numerator / denominator
+    return value * 100.0 if as_percent else value
+
+
 def generate_tod_dow_timestamps(
     num_steps: int,
     frequency_minutes: int,

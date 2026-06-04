@@ -8,11 +8,12 @@ CONFIG="${CONFIG:-configs/ours/pems08_fpem.py}"
 GPU="${GPU:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 
-SWEEP_NAME="${SWEEP_NAME:-pems08_fpem_sweep}"
+SWEEP_NAME="${SWEEP_NAME:-pems08_fpem_backbone_sweep}"
 SWEEP_ROOT="${SWEEP_ROOT:-${PROJECT_DIR}/checkpoints/${SWEEP_NAME}}"
 RESULTS_TSV="${RESULTS_TSV:-${SWEEP_ROOT}/results.tsv}"
 BEST_JSON="${BEST_JSON:-${SWEEP_ROOT}/best_config.json}"
 BEST_TXT="${BEST_TXT:-${SWEEP_ROOT}/best_config.txt}"
+BEST_BY_BACKBONE_TSV="${BEST_BY_BACKBONE_TSV:-${SWEEP_ROOT}/best_by_backbone.tsv}"
 BEST_METRIC="${BEST_METRIC:-mae}"
 BEST_SPLIT_METRICS="${BEST_SPLIT_METRICS:-best_test_metrics.json}"
 INCLUDE_NONZERO_WITH_METRICS="${INCLUDE_NONZERO_WITH_METRICS:-true}"
@@ -20,21 +21,72 @@ SKIP_COMPLETED="${SKIP_COMPLETED:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 MAX_COMBOS="${MAX_COMBOS:-0}"
 
-# Space-separated sweep grids. Override any of these from the shell.
+SWEEP_PROFILE="${SWEEP_PROFILE:-backbone_pruned}"
+BACKBONE_PROFILE="${BACKBONE_PROFILE:-official}"
+ANALYZE_PREVIOUS="${ANALYZE_PREVIOUS:-true}"
+PREVIOUS_RESULTS_TSV="${PREVIOUS_RESULTS_TSV:-${PROJECT_DIR}/checkpoints/pems08_fpem_sweep/results.tsv}"
+PREVIOUS_ANALYSIS_TXT="${PREVIOUS_ANALYSIS_TXT:-${SWEEP_ROOT}/previous_sweep_analysis.txt}"
+PREVIOUS_TOP_K="${PREVIOUS_TOP_K:-10}"
+
+# Default backbone candidates verified through the FPEM path. Extended
+# candidates are documented but intentionally not enabled by default.
+BACKBONE_LIST="${BACKBONE_LIST:-stid_mlp graphwavenet agcrn}"
+BACKBONE_LIST_EXTENDED="${BACKBONE_LIST_EXTENDED:-stid stgcn stnorm}"
+
+# Space-separated sweep grids. Profiles only set defaults; explicit environment
+# variables still win.
 SEED_LIST="${SEED_LIST:-2026}"
-LR_LIST="${LR_LIST:-0.001 0.0005}"
-OPTIMIZER_LIST="${OPTIMIZER_LIST:-adamw}"
-WEIGHT_DECAY_LIST="${WEIGHT_DECAY_LIST:-1e-5 5e-5}"
-GRAD_CLIP_LIST="${GRAD_CLIP_LIST:-3.0 5.0}"
-LR_SCHEDULER_LIST="${LR_SCHEDULER_LIST:-multistep}"
-LR_MILESTONES_LIST="${LR_MILESTONES_LIST:-[30,60,80]}"
-LR_GAMMA_LIST="${LR_GAMMA_LIST:-0.3 0.5}"
-LAMBDA_ENVPRED_LIST="${LAMBDA_ENVPRED_LIST:-0.03 0.05}"
-LAMBDA_FUTURE_MI_LIST="${LAMBDA_FUTURE_MI_LIST:-0.03 0.05}"
-LAMBDA_SWAP_LIST="${LAMBDA_SWAP_LIST:-0.03 0.05}"
-LAMBDA_MASK_SPARSE_LIST="${LAMBDA_MASK_SPARSE_LIST:-1e-3}"
-SPARSE_TARGET_LIST="${SPARSE_TARGET_LIST:-0.25 0.3}"
-TRAIN_LOSS_SCALE_LIST="${TRAIN_LOSS_SCALE_LIST:-normalized}"
+case "${SWEEP_PROFILE}" in
+  full)
+    LR_LIST="${LR_LIST:-0.001 0.0005}"
+    OPTIMIZER_LIST="${OPTIMIZER_LIST:-adamw}"
+    WEIGHT_DECAY_LIST="${WEIGHT_DECAY_LIST:-1e-5 5e-5}"
+    GRAD_CLIP_LIST="${GRAD_CLIP_LIST:-3.0 5.0}"
+    LR_SCHEDULER_LIST="${LR_SCHEDULER_LIST:-multistep}"
+    LR_MILESTONES_LIST="${LR_MILESTONES_LIST:-[30,60,80]}"
+    LR_GAMMA_LIST="${LR_GAMMA_LIST:-0.3 0.5}"
+    LAMBDA_ENVPRED_LIST="${LAMBDA_ENVPRED_LIST:-0.03 0.05}"
+    LAMBDA_FUTURE_MI_LIST="${LAMBDA_FUTURE_MI_LIST:-0.03 0.05}"
+    LAMBDA_SWAP_LIST="${LAMBDA_SWAP_LIST:-0.03 0.05}"
+    LAMBDA_MASK_SPARSE_LIST="${LAMBDA_MASK_SPARSE_LIST:-1e-3}"
+    SPARSE_TARGET_LIST="${SPARSE_TARGET_LIST:-0.25 0.3}"
+    TRAIN_LOSS_SCALE_LIST="${TRAIN_LOSS_SCALE_LIST:-normalized}"
+    ;;
+  fine)
+    LR_LIST="${LR_LIST:-0.001 0.0008 0.0005}"
+    OPTIMIZER_LIST="${OPTIMIZER_LIST:-adamw}"
+    WEIGHT_DECAY_LIST="${WEIGHT_DECAY_LIST:-1e-5}"
+    GRAD_CLIP_LIST="${GRAD_CLIP_LIST:-3.0}"
+    LR_SCHEDULER_LIST="${LR_SCHEDULER_LIST:-multistep}"
+    LR_MILESTONES_LIST="${LR_MILESTONES_LIST:-[30,60,80]}"
+    LR_GAMMA_LIST="${LR_GAMMA_LIST:-0.5}"
+    LAMBDA_ENVPRED_LIST="${LAMBDA_ENVPRED_LIST:-0.05}"
+    LAMBDA_FUTURE_MI_LIST="${LAMBDA_FUTURE_MI_LIST:-0.01 0.02 0.03}"
+    LAMBDA_SWAP_LIST="${LAMBDA_SWAP_LIST:-0.05}"
+    LAMBDA_MASK_SPARSE_LIST="${LAMBDA_MASK_SPARSE_LIST:-1e-3}"
+    SPARSE_TARGET_LIST="${SPARSE_TARGET_LIST:-0.3}"
+    TRAIN_LOSS_SCALE_LIST="${TRAIN_LOSS_SCALE_LIST:-normalized}"
+    ;;
+  backbone_pruned)
+    LR_LIST="${LR_LIST:-0.001 0.0005}"
+    OPTIMIZER_LIST="${OPTIMIZER_LIST:-adamw}"
+    WEIGHT_DECAY_LIST="${WEIGHT_DECAY_LIST:-1e-5}"
+    GRAD_CLIP_LIST="${GRAD_CLIP_LIST:-3.0}"
+    LR_SCHEDULER_LIST="${LR_SCHEDULER_LIST:-multistep}"
+    LR_MILESTONES_LIST="${LR_MILESTONES_LIST:-[30,60,80]}"
+    LR_GAMMA_LIST="${LR_GAMMA_LIST:-0.5}"
+    LAMBDA_ENVPRED_LIST="${LAMBDA_ENVPRED_LIST:-0.05}"
+    LAMBDA_FUTURE_MI_LIST="${LAMBDA_FUTURE_MI_LIST:-0.01 0.03}"
+    LAMBDA_SWAP_LIST="${LAMBDA_SWAP_LIST:-0.05}"
+    LAMBDA_MASK_SPARSE_LIST="${LAMBDA_MASK_SPARSE_LIST:-1e-3}"
+    SPARSE_TARGET_LIST="${SPARSE_TARGET_LIST:-0.3}"
+    TRAIN_LOSS_SCALE_LIST="${TRAIN_LOSS_SCALE_LIST:-normalized}"
+    ;;
+  *)
+    echo "[sweep] unknown SWEEP_PROFILE=${SWEEP_PROFILE}; expected backbone_pruned, fine, or full" >&2
+    exit 2
+    ;;
+esac
 
 # Fixed metric definition. Do not sweep this when comparing model quality.
 MAPE_THRESHOLD="${MAPE_THRESHOLD:-1.0}"
@@ -48,6 +100,7 @@ EXTRA_ARGS_BASE="${EXTRA_ARGS_BASE:-}"
 cd "${PROJECT_DIR}" || exit 1
 mkdir -p "${SWEEP_ROOT}"
 
+read -r -a BACKBONES <<< "${BACKBONE_LIST}"
 read -r -a SEEDS <<< "${SEED_LIST}"
 read -r -a LRS <<< "${LR_LIST}"
 read -r -a OPTIMIZERS <<< "${OPTIMIZER_LIST}"
@@ -63,9 +116,7 @@ read -r -a LAMBDA_MASK_SPARSES <<< "${LAMBDA_MASK_SPARSE_LIST}"
 read -r -a SPARSE_TARGETS <<< "${SPARSE_TARGET_LIST}"
 read -r -a TRAIN_LOSS_SCALES <<< "${TRAIN_LOSS_SCALE_LIST}"
 
-if [[ ! -f "${RESULTS_TSV}" ]]; then
-  printf "combo_id\tstatus\texit_code\tmetrics_found\tckpt_dir\tseed\tlr\toptimizer\tweight_decay\tgrad_clip\tlr_scheduler\tlr_milestones\tlr_gamma\tlambda_envpred\tlambda_future_mi\tlambda_swap\tlambda_mask_sparse\tsparse_target\ttrain_loss_scale\tmae\tmse\trmse\tmape\tmetric_path\n" > "${RESULTS_TSV}"
-fi
+RESULTS_HEADER="combo_id	status	exit_code	metrics_found	ckpt_dir	backbone	seed	lr	optimizer	weight_decay	grad_clip	dropout	lr_scheduler	lr_milestones	lr_gamma	lambda_envpred	lambda_future_mi	lambda_swap	lambda_mask_sparse	sparse_target	train_loss_scale	mae	mse	rmse	mape	wape	metric_path"
 
 truthy() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -74,34 +125,179 @@ truthy() {
   esac
 }
 
+backbone_config_key() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    graphwavenet|gwnet|graph_wavenet) printf "graph_wavenet" ;;
+    stnorm|st_norm|stnorm_wavenet) printf "stnorm_wavenet" ;;
+    *) printf "%s" "$1" ;;
+  esac
+}
+
+profile_combo_enabled() {
+  local candidate_backbone="$1"
+  local candidate_lr="$2"
+  if [[ "${BACKBONE_PROFILE}" != "official" ]]; then
+    return 0
+  fi
+  case "$(printf '%s' "${candidate_backbone}" | tr '[:upper:]' '[:lower:]')" in
+    graphwavenet|gwnet|graph_wavenet)
+      [[ "${candidate_lr}" == "0.001" || "${candidate_lr}" == "1e-3" ]]
+      return
+      ;;
+  esac
+  return 0
+}
+
+apply_backbone_profile() {
+  effective_lr="${lr}"
+  effective_weight_decay="${weight_decay}"
+  effective_grad_clip="${grad_clip}"
+  effective_dropout=""
+  case "${BACKBONE_PROFILE}" in
+    official)
+      case "$(printf '%s' "${backbone}" | tr '[:upper:]' '[:lower:]')" in
+        stid_mlp|mlp|stid_like|stid|official_stid)
+          effective_lr="${lr}"
+          effective_weight_decay="1e-5"
+          effective_grad_clip="3.0"
+          effective_dropout="0.1"
+          ;;
+        graphwavenet|gwnet|graph_wavenet)
+          effective_lr="0.001"
+          effective_weight_decay="1e-4"
+          effective_grad_clip="5.0"
+          effective_dropout="0.3"
+          ;;
+        agcrn)
+          effective_lr="${lr}"
+          if [[ "${lr}" == "0.0005" || "${lr}" == "5e-4" ]]; then
+            effective_lr="0.003"
+          fi
+          effective_weight_decay="1e-5"
+          effective_grad_clip="5.0"
+          effective_dropout="0.1"
+          ;;
+      esac
+      ;;
+    default|custom)
+      ;;
+    *)
+      echo "[sweep] unknown BACKBONE_PROFILE=${BACKBONE_PROFILE}; expected official, default, or custom" >&2
+      exit 2
+      ;;
+  esac
+}
+
+analyze_previous() {
+  if ! truthy "${ANALYZE_PREVIOUS}"; then
+    return 0
+  fi
+  "${PYTHON}" - "${PREVIOUS_RESULTS_TSV}" "${PREVIOUS_ANALYSIS_TXT}" "${PREVIOUS_TOP_K}" <<'PY'
+import csv
+import math
+import sys
+from collections import Counter
+from pathlib import Path
+
+results_path, out_path, top_k_raw = sys.argv[1:]
+top_k = int(top_k_raw)
+out = Path(out_path)
+out.parent.mkdir(parents=True, exist_ok=True)
+path = Path(results_path)
+if not path.exists():
+    text = f"Previous results not found: {path}\n"
+    out.write_text(text, encoding="utf-8")
+    print(text.rstrip())
+    raise SystemExit(0)
+
+with path.open("r", encoding="utf-8", newline="") as f:
+    rows = list(csv.DictReader(f, delimiter="\t"))
+
+def finite_float(row, key):
+    try:
+        value = float(row.get(key, "nan"))
+    except Exception:
+        value = float("nan")
+    return value if math.isfinite(value) else None
+
+candidates = [row for row in rows if finite_float(row, "mae") is not None]
+candidates.sort(key=lambda row: finite_float(row, "mae"))
+top = candidates[:top_k]
+columns = [
+    "combo_id", "mae", "rmse", "mape", "lr", "optimizer", "weight_decay",
+    "grad_clip", "lr_scheduler", "lr_milestones", "lr_gamma",
+    "lambda_envpred", "lambda_future_mi", "lambda_swap",
+    "lambda_mask_sparse", "sparse_target", "train_loss_scale",
+]
+param_keys = [
+    "lr", "optimizer", "weight_decay", "grad_clip", "lr_scheduler",
+    "lr_milestones", "lr_gamma", "lambda_envpred", "lambda_future_mi",
+    "lambda_swap", "lambda_mask_sparse", "sparse_target",
+    "train_loss_scale",
+]
+lines = [
+    f"previous_results={path}",
+    f"rows={len(rows)} metric_rows={len(candidates)} top_k={len(top)}",
+    "",
+    f"Top-{len(top)} by mae:",
+    ",".join(columns),
+]
+for row in top:
+    lines.append(",".join(str(row.get(col, "")) for col in columns))
+lines.extend(["", "Top-k param frequency:"])
+for key in param_keys:
+    counts = Counter(str(row.get(key, "")) for row in top)
+    pieces = [f"{value} -> {count}/{len(top)}" for value, count in counts.most_common()]
+    lines.append(f"{key}: " + (", ".join(pieces) if pieces else "n/a"))
+
+out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(f"[sweep] wrote previous analysis: {out}")
+PY
+}
+
+ensure_results_header() {
+  if [[ -f "${RESULTS_TSV}" ]]; then
+    first_line="$(head -n 1 "${RESULTS_TSV}")"
+    if [[ "${first_line}" != "${RESULTS_HEADER}" ]]; then
+      backup="${RESULTS_TSV}.pre_backbone.$(date +%Y%m%d%H%M%S)"
+      cp "${RESULTS_TSV}" "${backup}"
+      printf "%s\n" "${RESULTS_HEADER}" > "${RESULTS_TSV}"
+      echo "[sweep] backed up old results schema to ${backup}"
+    fi
+  else
+    printf "%s\n" "${RESULTS_HEADER}" > "${RESULTS_TSV}"
+  fi
+}
+
 append_result() {
   local combo_id="$1"
   local status="$2"
   local exit_code="$3"
   local metrics_path="$4"
   local ckpt_dir="$5"
-  local seed="$6"
-  local lr="$7"
-  local optimizer="$8"
-  local weight_decay="$9"
-  local grad_clip="${10}"
-  local lr_scheduler="${11}"
-  local lr_milestones="${12}"
-  local lr_gamma="${13}"
-  local lambda_envpred="${14}"
-  local lambda_future_mi="${15}"
-  local lambda_swap="${16}"
-  local lambda_mask_sparse="${17}"
-  local sparse_target="${18}"
-  local train_loss_scale="${19}"
+  local backbone="$6"
+  local seed="$7"
+  local lr="$8"
+  local optimizer="$9"
+  local weight_decay="${10}"
+  local grad_clip="${11}"
+  local dropout="${12}"
+  local lr_scheduler="${13}"
+  local lr_milestones="${14}"
+  local lr_gamma="${15}"
+  local lambda_envpred="${16}"
+  local lambda_future_mi="${17}"
+  local lambda_swap="${18}"
+  local lambda_mask_sparse="${19}"
+  local sparse_target="${20}"
+  local train_loss_scale="${21}"
 
   "${PYTHON}" - "${RESULTS_TSV}" "${metrics_path}" "${combo_id}" "${status}" "${exit_code}" "${ckpt_dir}" \
-    "${seed}" "${lr}" "${optimizer}" "${weight_decay}" "${grad_clip}" "${lr_scheduler}" "${lr_milestones}" \
-    "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" "${lambda_mask_sparse}" \
-    "${sparse_target}" "${train_loss_scale}" <<'PY'
+    "${backbone}" "${seed}" "${lr}" "${optimizer}" "${weight_decay}" "${grad_clip}" "${dropout}" "${lr_scheduler}" \
+    "${lr_milestones}" "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" \
+    "${lambda_mask_sparse}" "${sparse_target}" "${train_loss_scale}" <<'PY'
 import csv
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -112,11 +308,13 @@ from pathlib import Path
     status,
     exit_code,
     ckpt_dir,
+    backbone,
     seed,
     lr,
     optimizer,
     weight_decay,
     grad_clip,
+    dropout,
     lr_scheduler,
     lr_milestones,
     lr_gamma,
@@ -149,11 +347,13 @@ row = {
     "exit_code": exit_code,
     "metrics_found": "1" if metrics_found else "0",
     "ckpt_dir": ckpt_dir,
+    "backbone": backbone,
     "seed": seed,
     "lr": lr,
     "optimizer": optimizer,
     "weight_decay": weight_decay,
     "grad_clip": grad_clip,
+    "dropout": dropout,
     "lr_scheduler": lr_scheduler,
     "lr_milestones": lr_milestones,
     "lr_gamma": lr_gamma,
@@ -167,6 +367,7 @@ row = {
     "mse": mse,
     "rmse": rmse,
     "mape": metrics.get("mape", float("nan")),
+    "wape": metrics.get("wape", float("nan")),
     "metric_path": str(metrics_file),
 }
 
@@ -177,14 +378,14 @@ PY
 }
 
 update_best() {
-  "${PYTHON}" - "${RESULTS_TSV}" "${BEST_METRIC}" "${BEST_JSON}" "${BEST_TXT}" "${INCLUDE_NONZERO_WITH_METRICS}" <<'PY'
+  "${PYTHON}" - "${RESULTS_TSV}" "${BEST_METRIC}" "${BEST_JSON}" "${BEST_TXT}" "${BEST_BY_BACKBONE_TSV}" "${INCLUDE_NONZERO_WITH_METRICS}" <<'PY'
 import csv
 import json
 import math
 import sys
 from pathlib import Path
 
-results_path, best_metric, best_json, best_txt, include_nonzero = sys.argv[1:]
+results_path, best_metric, best_json, best_txt, best_by_backbone, include_nonzero = sys.argv[1:]
 include_nonzero = include_nonzero.lower() in {"1", "true", "yes", "y", "on"}
 
 with open(results_path, "r", encoding="utf-8", newline="") as f:
@@ -203,8 +404,18 @@ for row in rows:
     if math.isfinite(value):
         candidates.append((value, row))
 
+by_fields = [
+    "backbone", "best_metric", "best_value", "combo_id", "ckpt_dir",
+    "mae", "mse", "rmse", "mape", "wape", "lr", "weight_decay", "grad_clip", "dropout",
+    "lambda_envpred", "lambda_future_mi", "lambda_swap", "sparse_target",
+]
+best_by_path = Path(best_by_backbone)
+best_by_path.parent.mkdir(parents=True, exist_ok=True)
+
 if not candidates:
     Path(best_txt).write_text("No completed metric rows yet.\n", encoding="utf-8")
+    with best_by_path.open("w", encoding="utf-8", newline="") as f:
+        csv.DictWriter(f, fieldnames=by_fields, delimiter="\t").writeheader()
     raise SystemExit(0)
 
 best_value, best_row = min(candidates, key=lambda item: item[0])
@@ -219,22 +430,58 @@ lines = [
     f"best_metric={best_metric}",
     f"best_value={best_value}",
     f"combo_id={best_row['combo_id']}",
+    f"backbone={best_row.get('backbone', '')}",
     f"ckpt_dir={best_row['ckpt_dir']}",
     f"metric_path={best_row['metric_path']}",
     "params:",
 ]
 for key in [
-    "seed", "lr", "optimizer", "weight_decay", "grad_clip", "lr_scheduler",
-    "lr_milestones", "lr_gamma", "lambda_envpred", "lambda_future_mi",
-    "lambda_swap", "lambda_mask_sparse", "sparse_target", "train_loss_scale",
+    "backbone", "seed", "lr", "optimizer", "weight_decay", "grad_clip",
+    "dropout", "lr_scheduler", "lr_milestones", "lr_gamma", "lambda_envpred",
+    "lambda_future_mi", "lambda_swap", "lambda_mask_sparse",
+    "sparse_target", "train_loss_scale",
 ]:
-    lines.append(f"  {key}={best_row[key]}")
-for key in ["mae", "mse", "rmse", "mape", "status", "exit_code"]:
-    lines.append(f"{key}={best_row[key]}")
+    lines.append(f"  {key}={best_row.get(key, '')}")
+for key in ["mae", "mse", "rmse", "mape", "wape", "status", "exit_code"]:
+    lines.append(f"{key}={best_row.get(key, '')}")
 Path(best_txt).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+best_by = {}
+for value, row in candidates:
+    backbone = row.get("backbone", "")
+    if backbone not in best_by or value < best_by[backbone][0]:
+        best_by[backbone] = (value, row)
+with best_by_path.open("w", encoding="utf-8", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=by_fields, delimiter="\t")
+    writer.writeheader()
+    for backbone in sorted(best_by):
+        value, row = best_by[backbone]
+        writer.writerow({
+            "backbone": backbone,
+            "best_metric": best_metric,
+            "best_value": value,
+            "combo_id": row.get("combo_id", ""),
+            "ckpt_dir": row.get("ckpt_dir", ""),
+            "mae": row.get("mae", ""),
+            "mse": row.get("mse", ""),
+            "rmse": row.get("rmse", ""),
+            "mape": row.get("mape", ""),
+            "wape": row.get("wape", ""),
+            "lr": row.get("lr", ""),
+            "weight_decay": row.get("weight_decay", ""),
+            "grad_clip": row.get("grad_clip", ""),
+            "dropout": row.get("dropout", ""),
+            "lambda_envpred": row.get("lambda_envpred", ""),
+            "lambda_future_mi": row.get("lambda_future_mi", ""),
+            "lambda_swap": row.get("lambda_swap", ""),
+            "sparse_target": row.get("sparse_target", ""),
+        })
 print("\n".join(lines))
 PY
 }
+
+analyze_previous
+ensure_results_header
 
 total=0
 for _seed in "${SEEDS[@]}"; do
@@ -251,13 +498,23 @@ for _lambda_swap in "${LAMBDA_SWAPS[@]}"; do
 for _lambda_mask_sparse in "${LAMBDA_MASK_SPARSES[@]}"; do
 for _sparse_target in "${SPARSE_TARGETS[@]}"; do
 for _train_loss_scale in "${TRAIN_LOSS_SCALES[@]}"; do
+for _backbone in "${BACKBONES[@]}"; do
+  if ! profile_combo_enabled "${_backbone}" "${_lr}"; then
+    continue
+  fi
   total=$((total + 1))
-done; done; done; done; done; done; done; done; done; done; done; done; done; done
+done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
 
 echo "[sweep] project=${PROJECT_DIR}"
 echo "[sweep] run_script=${RUN_SCRIPT}"
+echo "[sweep] config=${CONFIG}"
+echo "[sweep] sweep_profile=${SWEEP_PROFILE}"
+echo "[sweep] backbone_profile=${BACKBONE_PROFILE}"
 echo "[sweep] sweep_root=${SWEEP_ROOT}"
 echo "[sweep] results=${RESULTS_TSV}"
+echo "[sweep] previous_analysis=${PREVIOUS_ANALYSIS_TXT}"
+echo "[sweep] backbone_list=${BACKBONE_LIST}"
+echo "[sweep] backbone_list_extended=${BACKBONE_LIST_EXTENDED} (not enabled by default)"
 echo "[sweep] total_combos=${total} max_combos=${MAX_COMBOS} dry_run=${DRY_RUN}"
 
 combo=0
@@ -275,6 +532,10 @@ for lambda_swap in "${LAMBDA_SWAPS[@]}"; do
 for lambda_mask_sparse in "${LAMBDA_MASK_SPARSES[@]}"; do
 for sparse_target in "${SPARSE_TARGETS[@]}"; do
 for train_loss_scale in "${TRAIN_LOSS_SCALES[@]}"; do
+for backbone in "${BACKBONES[@]}"; do
+  if ! profile_combo_enabled "${backbone}" "${lr}"; then
+    continue
+  fi
   combo=$((combo + 1))
   if [[ "${MAX_COMBOS}" -gt 0 && "${combo}" -gt "${MAX_COMBOS}" ]]; then
     echo "[sweep] reached MAX_COMBOS=${MAX_COMBOS}; stopping."
@@ -282,19 +543,25 @@ for train_loss_scale in "${TRAIN_LOSS_SCALES[@]}"; do
     exit 0
   fi
 
-  combo_id=$(printf "combo_%04d" "${combo}")
-  ckpt_dir="${SWEEP_ROOT}/${combo_id}"
+  combo_short=$(printf "combo_%04d" "${combo}")
+  combo_id=$(printf "%s_%s" "${backbone}" "${combo_short}")
+  ckpt_dir="${SWEEP_ROOT}/${backbone}/${combo_short}"
   metrics_path="${ckpt_dir}/${BEST_SPLIT_METRICS}"
   log_path="${ckpt_dir}/run.log"
+  apply_backbone_profile
+  backbone_cfg_key="$(backbone_config_key "${backbone}")"
   mkdir -p "${ckpt_dir}"
 
   cat > "${ckpt_dir}/params.env" <<EOF
 combo_id=${combo_id}
+backbone=${backbone}
+backbone_profile=${BACKBONE_PROFILE}
 seed=${seed}
-lr=${lr}
+lr=${effective_lr}
 optimizer=${optimizer}
-weight_decay=${weight_decay}
-grad_clip=${grad_clip}
+weight_decay=${effective_weight_decay}
+grad_clip=${effective_grad_clip}
+dropout=${effective_dropout}
 lr_scheduler=${lr_scheduler}
 lr_milestones=${lr_milestones}
 lr_gamma=${lr_gamma}
@@ -307,11 +574,12 @@ train_loss_scale=${train_loss_scale}
 EOF
 
   extra_args=(
-    "--set" "TRAIN.learning_rate=${lr}"
+    "--set" "MODEL.backbone_name=${backbone}"
+    "--set" "TRAIN.learning_rate=${effective_lr}"
     "--set" "TRAIN.optimizer=${optimizer}"
-    "--set" "TRAIN.weight_decay=${weight_decay}"
+    "--set" "TRAIN.weight_decay=${effective_weight_decay}"
     "--set" "TRAIN.no_decay_for_bias_norm_emb=true"
-    "--set" "TRAIN.grad_clip=${grad_clip}"
+    "--set" "TRAIN.grad_clip=${effective_grad_clip}"
     "--set" "TRAIN.lr_scheduler=${lr_scheduler}"
     "--set" "TRAIN.lr_gamma=${lr_gamma}"
     "--set" "LOSS.lambda_envpred=${lambda_envpred}"
@@ -324,6 +592,9 @@ EOF
     "--set" "METRICS.mape_eps=${MAPE_EPS}"
     "--set" "METRICS.mape_as_percent=${MAPE_AS_PERCENT}"
   )
+  if [[ -n "${effective_dropout}" ]]; then
+    extra_args+=("--set" "MODEL.backbone.${backbone_cfg_key}.dropout=${effective_dropout}")
+  fi
   if [[ -n "${EXTRA_ARGS_BASE}" ]]; then
     # shellcheck disable=SC2206
     base_args=( ${EXTRA_ARGS_BASE} )
@@ -331,12 +602,12 @@ EOF
   fi
   extra_args_string=$(printf "%q " "${extra_args[@]}")
 
-  echo "[sweep] ${combo_id}/${total} seed=${seed} lr=${lr} wd=${weight_decay} clip=${grad_clip} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} sparse=${lambda_mask_sparse} target=${sparse_target}"
+  echo "[sweep] ${combo_id}/${total} backbone=${backbone} profile=${BACKBONE_PROFILE} seed=${seed} lr=${effective_lr} wd=${effective_weight_decay} clip=${effective_grad_clip} dropout=${effective_dropout:-na} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} sparse=${lambda_mask_sparse} target=${sparse_target}"
 
   if truthy "${SKIP_COMPLETED}" && [[ -f "${metrics_path}" ]]; then
     echo "[sweep] skip completed ${combo_id}: ${metrics_path}"
-    append_result "${combo_id}" "skipped_completed" "0" "${metrics_path}" "${ckpt_dir}" \
-      "${seed}" "${lr}" "${optimizer}" "${weight_decay}" "${grad_clip}" "${lr_scheduler}" "${lr_milestones}" \
+    append_result "${combo_id}" "skipped_completed" "0" "${metrics_path}" "${ckpt_dir}" "${backbone}" \
+      "${seed}" "${effective_lr}" "${optimizer}" "${effective_weight_decay}" "${effective_grad_clip}" "${effective_dropout}" "${lr_scheduler}" "${lr_milestones}" \
       "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" "${lambda_mask_sparse}" \
       "${sparse_target}" "${train_loss_scale}"
     update_best
@@ -368,12 +639,12 @@ EOF
     status="failed"
   fi
 
-  append_result "${combo_id}" "${status}" "${exit_code}" "${metrics_path}" "${ckpt_dir}" \
-    "${seed}" "${lr}" "${optimizer}" "${weight_decay}" "${grad_clip}" "${lr_scheduler}" "${lr_milestones}" \
+  append_result "${combo_id}" "${status}" "${exit_code}" "${metrics_path}" "${ckpt_dir}" "${backbone}" \
+    "${seed}" "${effective_lr}" "${optimizer}" "${effective_weight_decay}" "${effective_grad_clip}" "${effective_dropout}" "${lr_scheduler}" "${lr_milestones}" \
     "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" "${lambda_mask_sparse}" \
     "${sparse_target}" "${train_loss_scale}"
   update_best
-done; done; done; done; done; done; done; done; done; done; done; done; done; done
+done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
 
 echo "[sweep] done. Final best:"
 update_best

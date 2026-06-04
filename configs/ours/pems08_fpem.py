@@ -50,6 +50,17 @@ CONFIG = deep_update(
             "future_decoder_use_time": True,
             "future_decoder_logvar_min": -8.0,
             "future_decoder_logvar_max": 4.0,
+            "backbone": {
+                "stid_mlp": {
+                    "use_time_of_day_embedding": True,
+                    "use_day_of_week_embedding": True,
+                    "tod_emb_dim": 16,
+                    "dow_emb_dim": 8,
+                    "num_time_in_day": 288,
+                    "num_day_in_week": 7,
+                    "require_time_features": True,
+                },
+            },
             "persistence": {
                 "enabled": False,
             },
@@ -57,6 +68,11 @@ CONFIG = deep_update(
         "LOSS": {
             "use_gate": False,
             "lambda_gate": 0.0,
+            "warmup_epochs": 10,
+            "aux_ramp_epochs": 20,
+            "peak_weight_enabled": False,
+            "peak_quantile": 0.75,
+            "peak_weight": 0.2,
             "use_residual_norm": False,
             "lambda_residual_norm": 0.0,
             "use_persistence_mi": False,
@@ -95,6 +111,14 @@ CONFIG = deep_update(
         },
         "TRAIN": {
             "ckpt_dir": "./checkpoints/pems08_fpem",
+            "curriculum_enabled": True,
+            "curriculum_start_horizon": 3,
+            "curriculum_full_horizon_epoch": 30,
+            "teacher_forcing_enabled": False,
+            "tf_decay_steps": 2000,
+        },
+        "EVAL": {
+            "save_test_diagnostics": True,
         },
     },
 )
