@@ -48,6 +48,18 @@ DATASETS: Dict[str, Dict[str, object]] = {
         "source_year": "2019",
         "ood_year_note": "following-year shift split from ST-OOD idx_shift.npy",
     },
+    "pems08_ood": {
+        "official_name": "PEMS08",
+        "year": "2016",
+        "output_name": "PEMS08-OOD",
+        "num_nodes": 170,
+        "domain": "traffic flow",
+        "frequency_minutes": 5,
+        "num_time_in_day": 288,
+        "source_year": "2016",
+        "ood_year_note": "held-out following-period shift split from ST-OOD idx_shift.npy",
+        "use_shift_as_test": True,
+    },
 }
 
 
@@ -62,6 +74,11 @@ ALIASES = {
     "speed_nyc": "speed_nyc",
     "speed_NYC": "speed_nyc",
     "Speed_NYC": "speed_nyc",
+    "pems08": "pems08_ood",
+    "pems08_ood": "pems08_ood",
+    "PEMS08": "pems08_ood",
+    "PEMS08-OOD": "pems08_ood",
+    "PEMS08_OOD": "pems08_ood",
 }
 
 
@@ -182,6 +199,25 @@ def convert_one(
             "basicts_num_samples": actual_samples,
         }
 
+    if bool(spec.get("use_shift_as_test", False)):
+        id_test_meta = dict(split_meta["test"])
+        id_test_meta["evaluation_role"] = "in_distribution_reference_test"
+        split_meta["id_test"] = id_test_meta
+        for stem in ["data", "timestamps"]:
+            src = out_dir / f"test_{stem}.npy"
+            dst = out_dir / f"id_test_{stem}.npy"
+            if src.exists():
+                src.replace(dst)
+            shift_src = out_dir / f"shift_{stem}.npy"
+            np.save(src, np.load(shift_src, mmap_mode="r"))
+        idx_src = out_dir / "st_ood_idx_test.npy"
+        if idx_src.exists():
+            idx_src.replace(out_dir / "st_ood_idx_id_test.npy")
+        np.save(out_dir / "st_ood_idx_test.npy", np.load(out_dir / "st_ood_idx_shift.npy"))
+        split_meta["test"] = dict(split_meta["shift"])
+        split_meta["test"]["idx_file"] = str(year_dir / "idx_shift.npy")
+        split_meta["test"]["evaluation_role"] = "out_of_distribution_shift_test"
+
     adj = np.load(adj_path).astype(np.float32)
     if adj.shape != (num_nodes, num_nodes):
         raise ValueError(f"{official_name} adj shape mismatch: expected {(num_nodes, num_nodes)}, got {adj.shape}")
@@ -224,7 +260,16 @@ def convert_one(
             "note": "Uses official ST-OOD idx_train/idx_val/idx_test/idx_shift arrays. Each BasicTS split stores the minimal contiguous time window needed to reproduce those samples.",
             "train": "official in-distribution training samples",
             "val": "official in-distribution validation samples",
-            "test": "official in-distribution test samples",
+            "test": (
+                "official out-of-distribution shift samples"
+                if bool(spec.get("use_shift_as_test", False))
+                else "official in-distribution test samples"
+            ),
+            "id_test": (
+                "official in-distribution test samples saved as id_test_* because test_* is reserved for OOD shift"
+                if bool(spec.get("use_shift_as_test", False))
+                else None
+            ),
             "shift": "official out-of-distribution following-year test samples",
         },
         "splits": split_meta,

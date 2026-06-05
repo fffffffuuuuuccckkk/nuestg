@@ -9,6 +9,7 @@ from models.backbones.cast import CaSTBackbone
 from models.backbones.cast_official import CaSTOfficialBackbone
 from models.backbones.d2stgnn import D2STGNNBackbone
 from models.backbones.graph_wavenet import GraphWaveNetBackbone
+from models.backbones.graph_wavenet_full import GraphWaveNetFullBackbone
 from models.backbones.stgcn import STGCNBackbone
 from models.backbones.stid import STIDBackbone
 from models.backbones.stid_mlp import STIDMLPBackbone
@@ -82,6 +83,14 @@ def build_backbone(cfg: Any) -> BaseBackbone:
             common["representation_dim"] = int(gw_cfg.pop("representation_dim"))
         return GraphWaveNetBackbone(**common, **gw_cfg)
 
+    if name in {"graphwavenet_full", "graph_wavenet_full", "gwnet_full", "graphwavenet-full"}:
+        gw_full_cfg = dict(backbone_cfg.get("graph_wavenet_full", {}) or {})
+        gw_full_cfg.setdefault("adj_path", model_cfg.get("adj_path", ""))
+        gw_full_cfg.setdefault("num_time_in_day", model_cfg.get("num_time_in_day", 288))
+        if "representation_dim" in gw_full_cfg:
+            common["representation_dim"] = int(gw_full_cfg.pop("representation_dim"))
+        return GraphWaveNetFullBackbone(**common, **gw_full_cfg)
+
     if name == "agcrn":
         agcrn_cfg = dict(backbone_cfg.get("agcrn", {}) or {})
         if "representation_dim" in agcrn_cfg:
@@ -153,7 +162,8 @@ def build_backbone(cfg: Any) -> BaseBackbone:
 
     raise ValueError(
         f"Unsupported MODEL.backbone_name={name!r}; "
-        "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, agcrn, "
+        "expected one of stid, stid_mlp, graphwavenet, graph_wavenet, gwnet, "
+        "graphwavenet_full, graph_wavenet_full, gwnet_full, agcrn, "
         "stgcn, stnorm, d2stgnn, cast/cast_adapter/cast_official, "
         "stone/stone_adapter/stone_official, stop/stop_adapter/stop_official"
     )
@@ -166,6 +176,7 @@ __all__ = [
     "CaSTOfficialBackbone",
     "D2STGNNBackbone",
     "GraphWaveNetBackbone",
+    "GraphWaveNetFullBackbone",
     "STGCNBackbone",
     "STIDBackbone",
     "STIDMLPBackbone",

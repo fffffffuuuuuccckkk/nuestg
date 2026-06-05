@@ -189,8 +189,8 @@ class NUESTG(nn.Module):
 
         Delta = loss(y_inv, Y) - loss(y_inv + r_env, Y).
 
-    The invariant backbone is pluggable. STID-MLP, Graph WaveNet-style, and
-    AGCRN-style backbones all return the same contract:
+    The invariant backbone is pluggable. STID-MLP, Graph WaveNet-style/full,
+    and AGCRN-style backbones all return the same contract:
     z_inv [B,N,D] and y_inv [B,H,N,C_out]. The node-wise environment encoder,
     residual correction, utility gate, swapping regularizer, and loss interface
     stay unchanged across backbones.
@@ -403,8 +403,14 @@ class NUESTG(nn.Module):
 
         graph_supports = None
         backbone_cfg = config.backbone or {}
-        gw_cfg = backbone_cfg.get("graph_wavenet", {}) if isinstance(backbone_cfg, dict) else {}
-        if config.use_adj and str(config.backbone_name).lower() in {"graphwavenet", "gwnet", "graph_wavenet"}:
+        backbone_name_lower = str(config.backbone_name).lower()
+        graphwavenet_full_names = {"graphwavenet_full", "graph_wavenet_full", "gwnet_full", "graphwavenet-full"}
+        graphwavenet_adapter_names = {"graphwavenet", "gwnet", "graph_wavenet"}
+        if isinstance(backbone_cfg, dict) and backbone_name_lower in graphwavenet_full_names:
+            gw_cfg = backbone_cfg.get("graph_wavenet_full", {})
+        else:
+            gw_cfg = backbone_cfg.get("graph_wavenet", {}) if isinstance(backbone_cfg, dict) else {}
+        if config.use_adj and backbone_name_lower in graphwavenet_adapter_names | graphwavenet_full_names:
             graph_supports = load_graph_supports(
                 config.adj_path,
                 config.num_nodes,

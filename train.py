@@ -178,6 +178,10 @@ BACKBONE_DESCRIPTIONS = {
     "graphwavenet": "graphwavenet_native_adapter backbone adapted to the shared interface",
     "graph_wavenet": "graphwavenet_native_adapter backbone adapted to the shared interface",
     "gwnet": "graphwavenet_native_adapter backbone adapted to the shared interface",
+    "graphwavenet_full": "official_graphwavenet_full prediction path with a thin FPEM representation adapter",
+    "graph_wavenet_full": "official_graphwavenet_full prediction path with a thin FPEM representation adapter",
+    "gwnet_full": "official_graphwavenet_full prediction path with a thin FPEM representation adapter",
+    "graphwavenet-full": "official_graphwavenet_full prediction path with a thin FPEM representation adapter",
     "agcrn": "faithful_native_adapter AGCRN backbone adapted to the shared interface",
     "stgcn": "reference_native STGCN backbone adapted from hazdzz/STGCN",
     "stnorm": "stnorm_wavenet_adapter backbone with model-internal ST-Norm",
@@ -356,6 +360,8 @@ def finalize_config(cfg: Dict) -> Dict:
     backbone_key = str(model_cfg["backbone_name"]).lower()
     if backbone_key in {"graphwavenet", "gwnet"}:
         backbone_key = "graph_wavenet"
+    if backbone_key in {"graphwavenet_full", "gwnet_full", "graphwavenet-full"}:
+        backbone_key = "graph_wavenet_full"
     if backbone_key in {"mlp", "stid_like"}:
         backbone_key = "stid_mlp"
     if backbone_key in {"official_stid"}:
@@ -631,14 +637,21 @@ def slice_for_train_horizon(
 
 def describe_backbone_features(model: NUESTG) -> Dict[str, bool]:
     backbone = getattr(model, "backbone", None)
+    inner_backbone = getattr(backbone, "model", None)
     return {
         "node_embedding": bool(
             getattr(backbone, "node_emb", None) is not None
             or getattr(backbone, "node_embeddings", None) is not None
             or getattr(backbone, "nodevec1", None) is not None
+            or getattr(inner_backbone, "nodevec1", None) is not None
         ),
         "time_of_day_embedding": bool(getattr(backbone, "time_in_day_emb", None) is not None),
         "day_of_week_embedding": bool(getattr(backbone, "day_in_week_emb", None) is not None),
+        "time_of_day_channel": bool(
+            getattr(backbone, "use_time_of_day_channel", False)
+            and int(getattr(backbone, "in_dim", getattr(backbone, "input_dim", 0)))
+            > int(getattr(backbone, "input_dim", 0))
+        ),
     }
 
 
@@ -861,8 +874,11 @@ def debug_batch(cfg: Dict) -> None:
     print(f"backbone_uses_node_embedding: {backbone_features['node_embedding']}")
     print(f"backbone_uses_time_of_day_embedding: {backbone_features['time_of_day_embedding']}")
     print(f"backbone_uses_day_of_week_embedding: {backbone_features['day_of_week_embedding']}")
+    print(f"backbone_uses_time_of_day_channel: {backbone_features['time_of_day_channel']}")
     if cfg["MODEL"].get("required_timestamp", False) and not (
-        backbone_features["time_of_day_embedding"] or backbone_features["day_of_week_embedding"]
+        backbone_features["time_of_day_embedding"]
+        or backbone_features["day_of_week_embedding"]
+        or backbone_features["time_of_day_channel"]
     ):
         print(
             "WARNING: current backbone does not consume TOD/DOW identity embeddings directly; "

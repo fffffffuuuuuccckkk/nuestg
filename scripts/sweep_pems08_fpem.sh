@@ -31,7 +31,7 @@ PREVIOUS_TOP_K="${PREVIOUS_TOP_K:-10}"
 # Default backbone candidates verified through the FPEM path. Extended
 # candidates are documented but intentionally not enabled by default.
 BACKBONE_LIST="${BACKBONE_LIST:-stid_mlp graphwavenet agcrn}"
-BACKBONE_LIST_EXTENDED="${BACKBONE_LIST_EXTENDED:-stid stgcn stnorm}"
+BACKBONE_LIST_EXTENDED="${BACKBONE_LIST_EXTENDED:-graphwavenet_full stid stgcn stnorm}"
 
 # Space-separated sweep grids. Profiles only set defaults; explicit environment
 # variables still win.
@@ -128,6 +128,7 @@ truthy() {
 backbone_config_key() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     graphwavenet|gwnet|graph_wavenet) printf "graph_wavenet" ;;
+    graphwavenet_full|gwnet_full|graph_wavenet_full|graphwavenet-full) printf "graph_wavenet_full" ;;
     stnorm|st_norm|stnorm_wavenet) printf "stnorm_wavenet" ;;
     *) printf "%s" "$1" ;;
   esac
@@ -140,7 +141,7 @@ profile_combo_enabled() {
     return 0
   fi
   case "$(printf '%s' "${candidate_backbone}" | tr '[:upper:]' '[:lower:]')" in
-    graphwavenet|gwnet|graph_wavenet)
+    graphwavenet|gwnet|graph_wavenet|graphwavenet_full|gwnet_full|graph_wavenet_full|graphwavenet-full)
       [[ "${candidate_lr}" == "0.001" || "${candidate_lr}" == "1e-3" ]]
       return
       ;;
@@ -162,7 +163,7 @@ apply_backbone_profile() {
           effective_grad_clip="3.0"
           effective_dropout="0.1"
           ;;
-        graphwavenet|gwnet|graph_wavenet)
+        graphwavenet|gwnet|graph_wavenet|graphwavenet_full|gwnet_full|graph_wavenet_full|graphwavenet-full)
           effective_lr="0.001"
           effective_weight_decay="1e-4"
           effective_grad_clip="5.0"
