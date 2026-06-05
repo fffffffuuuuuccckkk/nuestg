@@ -1,0 +1,33 @@
+{
+  "best_metric": "mae",
+  "best_row": {
+    "backbone": "graphwavenet",
+    "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_tricks_sweep/graphwavenet/combo_0005",
+    "combo_id": "graphwavenet_combo_0005",
+    "dropout": "0.3",
+    "exit_code": "139",
+    "grad_clip": "5.0",
+    "lambda_envpred": "0.05",
+    "lambda_future_mi": "0.03",
+    "lambda_mask_sparse": "1e-3",
+    "lambda_swap": "0.05",
+    "lr": "0.001",
+    "lr_gamma": "0.5",
+    "lr_milestones": "[30,60,80]",
+    "lr_scheduler": "multistep",
+    "mae": "14.613875337549159",
+    "mape": "9.421734573604825",
+    "metric_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_tricks_sweep/graphwavenet/combo_0005/best_test_metrics.json",
+    "metrics_found": "1",
+    "mse": "552.9036487201313",
+    "optimizer": "adamw",
+    "rmse": "23.513903306770047",
+    "seed": "2024",
+    "sparse_target": "0.3",
+    "status": "metric_ok_nonzero_exit",
+    "train_loss_scale": "normalized",
+    "wape": "6.89904058301771",
+    "weight_decay": "1e-4"
+  },
+  "best_value": 14.613875337549159
+}

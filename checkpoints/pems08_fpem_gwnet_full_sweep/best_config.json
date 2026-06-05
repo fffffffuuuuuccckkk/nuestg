@@ -1,0 +1,33 @@
+{
+  "best_metric": "mae",
+  "best_row": {
+    "backbone": "graphwavenet_full",
+    "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_gwnet_full_sweep/graphwavenet_full/combo_0001",
+    "combo_id": "graphwavenet_full_combo_0001",
+    "dropout": "0.3",
+    "exit_code": "139",
+    "grad_clip": "5.0",
+    "lambda_envpred": "0.05",
+    "lambda_future_mi": "0.01",
+    "lambda_mask_sparse": "1e-3",
+    "lambda_swap": "0.05",
+    "lr": "0.001",
+    "lr_gamma": "0.5",
+    "lr_milestones": "[30,60,80]",
+    "lr_scheduler": "multistep",
+    "mae": "14.358464421452704",
+    "mape": "8.847999173241693",
+    "metric_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_gwnet_full_sweep/graphwavenet_full/combo_0001/best_test_metrics.json",
+    "metrics_found": "1",
+    "mse": "553.9525482590134",
+    "optimizer": "adamw",
+    "rmse": "23.536196554647766",
+    "seed": "2026",
+    "sparse_target": "0.3",
+    "status": "metric_ok_nonzero_exit",
+    "train_loss_scale": "normalized",
+    "wape": "6.72002396282849",
+    "weight_decay": "1e-4"
+  },
+  "best_value": 14.358464421452704
+}

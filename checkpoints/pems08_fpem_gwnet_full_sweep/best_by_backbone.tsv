@@ -1,0 +1,2 @@
+backbone	best_metric	best_value	combo_id	ckpt_dir	mae	mse	rmse	mape	wape	lr	weight_decay	grad_clip	dropout	lambda_envpred	lambda_future_mi	lambda_swap	sparse_target
+graphwavenet_full	mae	14.358464421452704	graphwavenet_full_combo_0001	/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_gwnet_full_sweep/graphwavenet_full/combo_0001	14.358464421452704	553.9525482590134	23.536196554647766	8.847999173241693	6.72002396282849	0.001	1e-4	5.0	0.3	0.05	0.01	0.05	0.3

@@ -1,0 +1,19 @@
+{
+  "ablation": "",
+  "backbone": "graphwavenet",
+  "category": "forecasting",
+  "ckpt_path": "checkpoints/pems08/baseline_graphwavenet/last.pt",
+  "config_path": "/data/OuXiaoyu/mystg/nue_stg_project/configs/baselines/pems08/graphwavenet.py",
+  "dataset": "PEMS08",
+  "epoch": 41,
+  "global_step": 13735,
+  "mae": 19.566067351951254,
+  "mape": 0.12911840024832133,
+  "method": "GraphWaveNet-style",
+  "notes": "Baseline-only Graph WaveNet-style backbone; not official line-by-line reproduction.",
+  "rmse": 28.181184579660226,
+  "seed": 2026,
+  "setting": "forecasting",
+  "split": "val",
+  "status": "runnable"
+}

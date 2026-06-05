@@ -1,0 +1,33 @@
+{
+  "best_metric": "mae",
+  "best_row": {
+    "backbone": "agcrn",
+    "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_tricks_smoke/agcrn/combo_0003",
+    "combo_id": "agcrn_combo_0003",
+    "dropout": "0.1",
+    "exit_code": "0",
+    "grad_clip": "5.0",
+    "lambda_envpred": "0.05",
+    "lambda_future_mi": "0.01",
+    "lambda_mask_sparse": "1e-3",
+    "lambda_swap": "0.05",
+    "lr": "0.001",
+    "lr_gamma": "0.5",
+    "lr_milestones": "[30,60,80]",
+    "lr_scheduler": "multistep",
+    "mae": "82.56563928964975",
+    "mape": "124.61823973784576",
+    "metric_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_tricks_smoke/agcrn/combo_0003/best_test_metrics.json",
+    "metrics_found": "1",
+    "mse": "12436.611517278998",
+    "optimizer": "adamw",
+    "rmse": "111.51955665836822",
+    "seed": "2026",
+    "sparse_target": "0.3",
+    "status": "ok",
+    "train_loss_scale": "normalized",
+    "wape": "47.98245514190949",
+    "weight_decay": "1e-5"
+  },
+  "best_value": 82.56563928964975
+}

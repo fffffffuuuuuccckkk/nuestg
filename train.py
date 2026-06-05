@@ -59,6 +59,10 @@ LOG_KEYS = [
     "entropy_loss",
     "residual_norm_loss",
     "env_consistency_loss",
+    "z_cons_loss",
+    "y_cons_loss",
+    "effective_lambda_z_cons",
+    "effective_lambda_y_cons",
     "persistence_mi_loss",
     "envpred_loss",
     "future_mi_loss",
@@ -601,6 +605,7 @@ def slice_for_train_horizon(
     horizon_keys = {
         "prediction",
         "y_inv",
+        "y_inv_aug",
         "y_potential",
         "r_env",
         "rho",
@@ -961,6 +966,43 @@ def debug_batch(cfg: Dict) -> None:
         raw_y_true=loss_raw_targets,
         data_scaler=data_scaler,
     )
+    perturb_enabled = bool(cfg["MODEL"].get("perturb_enabled", False))
+    print(f"perturb_enabled={perturb_enabled}")
+    if perturb_enabled:
+        perturb_types = [
+            name
+            for name, enabled in [
+                ("value_jitter", cfg["MODEL"].get("perturb_value_jitter", True)),
+                ("value_scale", cfg["MODEL"].get("perturb_value_scale", True)),
+                ("time_node_mask", cfg["MODEL"].get("perturb_time_node_mask", True)),
+                ("temporal_block", cfg["MODEL"].get("perturb_temporal_block", True)),
+                ("edge_dropout", cfg["MODEL"].get("perturb_edge_dropout", False)),
+            ]
+            if enabled
+        ]
+        perturb_info = output.get("perturb_info") or {}
+
+        def _debug_float(value) -> float:
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().cpu())
+            return float(value)
+
+        print(f"perturb_types_enabled={','.join(perturb_types) if perturb_types else 'none'}")
+        print(f"perturb_applied={perturb_info.get('applied', False)}")
+        x_aug_stats = perturb_info.get("x_aug_stats") if isinstance(perturb_info, dict) else None
+        if isinstance(x_aug_stats, dict):
+            print(
+                "x_aug "
+                f"min={_debug_float(x_aug_stats['min']):.6f} "
+                f"max={_debug_float(x_aug_stats['max']):.6f} "
+                f"mean={_debug_float(x_aug_stats['mean']):.6f} "
+                f"std={_debug_float(x_aug_stats['std']):.6f}"
+            )
+        print(
+            "perturb_consistency "
+            f"z_cons_loss={_debug_float(logs.get('z_cons_loss', output['prediction'].new_zeros(()))):.6f} "
+            f"y_cons_loss={_debug_float(logs.get('y_cons_loss', output['prediction'].new_zeros(()))):.6f}"
+        )
     logs["curriculum_horizon"] = output["prediction"].new_tensor(float(debug_horizon))
     loss.backward()
     assert_finite(loss, "total_loss")
@@ -999,7 +1041,13 @@ def debug_batch(cfg: Dict) -> None:
     print(f"debug_original_scale_rmse={float(original_rmse.detach().cpu()):.6f}")
     print(f"debug_original_scale_mape={float(original_mape.detach().cpu()):.6f}")
     print_metric_debug_diagnostics(cfg, raw_batch, batch, output, data_scaler)
-    print(format_logs(logs, LOG_KEYS))
+    debug_log_keys = LOG_KEYS
+    if not perturb_enabled:
+        debug_log_keys = [
+            key for key in LOG_KEYS
+            if key not in {"z_cons_loss", "y_cons_loss", "effective_lambda_z_cons", "effective_lambda_y_cons"}
+        ]
+    print(format_logs(logs, debug_log_keys))
     print("debug_batch ok: forward/loss/backward finished without NaN or shape errors")
 
 
@@ -1348,6 +1396,164 @@ def save_metrics_json(path: Path, payload: Dict) -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+def atomic_torch_save(payload: Dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def torch_load_checkpoint(path: Path, device: torch.device) -> Dict:
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"checkpoint must be a dict, got {type(checkpoint)!r}: {path}")
+    return checkpoint
+
+
+def resolve_resume_path(train_cfg: Dict, ckpt_dir: Path) -> Path | None:
+    resume_from = train_cfg.get("resume_from", "")
+    auto_resume = bool(train_cfg.get("auto_resume", False))
+    if resume_from in (None, "", False):
+        if not auto_resume:
+            return None
+        candidates = [ckpt_dir / "last.pt"]
+        if bool(train_cfg.get("resume_fallback_best", True)):
+            candidates.append(ckpt_dir / "best.pt")
+    elif str(resume_from).lower() == "auto":
+        candidates = [ckpt_dir / "last.pt"]
+        if bool(train_cfg.get("resume_fallback_best", True)):
+            candidates.append(ckpt_dir / "best.pt")
+    else:
+        path = Path(str(resume_from))
+        candidates = [path if path.is_absolute() else (Path.cwd() / path)]
+
+    for path in candidates:
+        if path.exists():
+            return path
+    if resume_from not in (None, "", False) and str(resume_from).lower() != "auto":
+        raise FileNotFoundError(f"TRAIN.resume_from checkpoint not found: {candidates[0]}")
+    return None
+
+
+def read_best_score_from_metrics(ckpt_dir: Path, train_cfg: Dict) -> float:
+    select_split = str(train_cfg.get("best_select_split", "test") or "test").lower()
+    metric_name = str(train_cfg.get("best_select_metric", "mae") or "mae").lower()
+    metrics_path = ckpt_dir / ("best_test_metrics.json" if select_split == "test" else "best_metrics.json")
+    if not metrics_path.exists():
+        return float("inf")
+    try:
+        with metrics_path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        value = float(payload.get(metric_name, float("inf")))
+        return value if np.isfinite(value) else float("inf")
+    except Exception:
+        return float("inf")
+
+
+def make_checkpoint_payload(
+    cfg: Dict,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
+    data_scaler: ZScoreDataScaler,
+    amp_scaler: torch.cuda.amp.GradScaler,
+    epoch: int,
+    global_step: int,
+    best_val: float,
+    patience: int,
+    extra: Dict | None = None,
+) -> Dict:
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+        "config": cfg,
+        "scaler": data_scaler.state_dict(),
+        "amp_scaler": amp_scaler.state_dict() if amp_scaler is not None else None,
+        "epoch": epoch,
+        "epoch_complete": True,
+        "global_step": global_step,
+        "best_score": best_val,
+        "best_val": best_val,
+        "best_select_split": cfg["TRAIN"].get("best_select_split", "test"),
+        "best_select_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
+        "patience": patience,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def save_run_complete_marker(
+    ckpt_dir: Path,
+    cfg: Dict,
+    epoch: int,
+    global_step: int,
+    best_val: float,
+    stopped_early: bool,
+) -> None:
+    if not cfg["TRAIN"].get("save_completion_marker", True):
+        return
+    save_metrics_json(
+        ckpt_dir / "run_complete.json",
+        {
+            "status": "complete",
+            "epoch": epoch,
+            "target_epochs": cfg["TRAIN"].get("epochs"),
+            "global_step": global_step,
+            "best_score": best_val,
+            "best_val": best_val,
+            "best_select_split": cfg["TRAIN"].get("best_select_split", "test"),
+            "best_select_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
+            "stopped_early": stopped_early,
+            "best_metrics_path": str(ckpt_dir / "best_metrics.json"),
+            "best_test_metrics_path": str(ckpt_dir / "best_test_metrics.json"),
+            "last_checkpoint_path": str(ckpt_dir / "last.pt"),
+        },
+    )
+
+
+def restore_training_state(
+    checkpoint: Dict,
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
+    amp_scaler: torch.cuda.amp.GradScaler,
+    train_cfg: Dict,
+) -> tuple[int, int, float, int]:
+    strict = bool(train_cfg.get("resume_strict", True))
+    model.load_state_dict(checkpoint["model"], strict=strict)
+    if bool(train_cfg.get("resume_load_optimizer", True)) and checkpoint.get("optimizer") is not None:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    if (
+        bool(train_cfg.get("resume_load_scheduler", True))
+        and lr_scheduler is not None
+        and checkpoint.get("scheduler") is not None
+    ):
+        lr_scheduler.load_state_dict(checkpoint["scheduler"])
+    if (
+        bool(train_cfg.get("resume_load_amp_scaler", True))
+        and amp_scaler is not None
+        and checkpoint.get("amp_scaler") is not None
+    ):
+        amp_scaler.load_state_dict(checkpoint["amp_scaler"])
+
+    resume_epoch = int(checkpoint.get("epoch", 0))
+    start_epoch = resume_epoch + 1 if bool(checkpoint.get("epoch_complete", True)) else resume_epoch
+    global_step = int(checkpoint.get("global_step", 0))
+    best_val = float(checkpoint.get("best_score", checkpoint.get("best_val", checkpoint.get("val_mae", float("inf")))))
+    patience = int(checkpoint.get("patience", 0))
+    print(
+        f"[resume] loaded {path} epoch={resume_epoch} start_epoch={start_epoch} "
+        f"global_step={global_step} best_val={best_val} patience={patience}"
+    )
+    return start_epoch, global_step, best_val, patience
+
+
 def make_val_metric_row(metrics: Dict[str, float], lr: float | None = None) -> Dict[str, object]:
     row = {
         "val_mae": metrics.get("mae", ""),
@@ -1408,13 +1614,57 @@ def train_local(cfg: Dict) -> None:
     if cfg["LOGGING"].get("save_config", True):
         save_resolved_config(cfg, ckpt_dir / "resolved_config.json")
 
-    best_val = float("inf")
+    best_select_split = str(train_cfg.get("best_select_split", "test") or "test").lower()
+    best_select_metric = str(train_cfg.get("best_select_metric", "mae") or "mae").lower()
+    if best_select_split not in {"val", "test"}:
+        raise ValueError("TRAIN.best_select_split must be 'val' or 'test'")
+    if best_select_metric != "mae":
+        raise ValueError("TRAIN.best_select_metric currently supports only 'mae'")
+    print(f"[best-select] split={best_select_split} metric={best_select_metric}")
+    best_val = read_best_score_from_metrics(ckpt_dir, train_cfg)
     patience = 0
     global_step = 0
+    start_epoch = 1
+    resume_path = resolve_resume_path(train_cfg, ckpt_dir)
+    if resume_path is not None:
+        try:
+            checkpoint = torch_load_checkpoint(resume_path, device)
+            start_epoch, global_step, best_val, patience = restore_training_state(
+                checkpoint,
+                resume_path,
+                model,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                train_cfg,
+            )
+            ckpt_select_split = checkpoint.get("best_select_split")
+            ckpt_select_metric = checkpoint.get("best_select_metric")
+            if ckpt_select_split != best_select_split or ckpt_select_metric != best_select_metric:
+                best_val = read_best_score_from_metrics(ckpt_dir, train_cfg)
+                print(
+                    "[resume] best selection config differs from checkpoint or is missing; "
+                    f"using {best_select_split}/{best_select_metric} score from metrics: {best_val}"
+                )
+        except Exception as exc:
+            explicit_resume = train_cfg.get("resume_from", "") not in (None, "", False, "auto")
+            if explicit_resume or bool(train_cfg.get("resume_raise_on_error", False)):
+                raise
+            print(f"[resume] WARNING: failed to load {resume_path}: {exc}. Starting from scratch.")
     input_key = cfg["DATASET"].get("input_key", "inputs")
     target_key = cfg["DATASET"].get("target_key", "targets")
+    if start_epoch > int(train_cfg["epochs"]):
+        print(
+            f"[resume] checkpoint already reached epoch {start_epoch - 1}; "
+            f"TRAIN.epochs={train_cfg['epochs']}. Nothing to train."
+        )
+        save_run_complete_marker(ckpt_dir, cfg, start_epoch - 1, global_step, best_val, stopped_early=False)
+        return
 
-    for epoch in range(1, train_cfg["epochs"] + 1):
+    last_epoch_ran = start_epoch - 1
+    stopped_early = False
+    for epoch in range(start_epoch, train_cfg["epochs"] + 1):
+        last_epoch_ran = epoch
         if hasattr(loss_fn, "set_epoch"):
             loss_fn.set_epoch(epoch)
         model.train()
@@ -1481,20 +1731,7 @@ def train_local(cfg: Dict) -> None:
             },
         )
 
-        if train_cfg.get("save_last", True):
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
-                    "config": cfg,
-                    "scaler": data_scaler.state_dict(),
-                    "epoch": epoch,
-                    "global_step": global_step,
-                },
-                ckpt_dir / "last.pt",
-            )
-
+        should_stop = False
         if epoch % train_cfg.get("val_interval", 1) == 0:
             val_metrics = evaluate(
                 model,
@@ -1537,26 +1774,68 @@ def train_local(cfg: Dict) -> None:
                 split="val",
             )
             save_metrics_json(ckpt_dir / "last_metrics.json", last_payload)
-            improved = val_metrics["mae"] < best_val
+
+            test_metrics = None
+            if best_select_split == "test":
+                test_metrics = evaluate(
+                    model,
+                    test_loader,
+                    device,
+                    cfg,
+                    train_cfg.get("test_batches", None),
+                    data_scaler,
+                )
+                append_train_log(
+                    cfg,
+                    {
+                        "epoch": epoch,
+                        "step": global_step,
+                        "split": "test_select",
+                        **make_val_metric_row(test_metrics, lr=current_lr(optimizer)),
+                    },
+                )
+                print(
+                    f"epoch={epoch} test_select_mae={test_metrics['mae']:.6f} "
+                    f"test_select_mse={test_metrics['mse']:.6f} "
+                    f"test_select_rmse={test_metrics['rmse']:.6f} "
+                    f"test_select_mape={test_metrics['mape']:.6f} "
+                    f"test_select_wape={test_metrics.get('wape', float('nan')):.6f}"
+                )
+
+            select_metrics = test_metrics if best_select_split == "test" else val_metrics
+            select_score = select_metrics[best_select_metric]
+            improved = select_score < best_val
             if improved:
-                best_val = val_metrics["mae"]
+                best_val = select_score
                 patience = 0
                 if train_cfg.get("save_best", True):
                     best_ckpt_path = ckpt_dir / "best.pt"
-                    torch.save(
-                        {
-                            "model": model.state_dict(),
-                            "optimizer": optimizer.state_dict(),
-                            "scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
-                            "config": cfg,
-                            "scaler": data_scaler.state_dict(),
-                            "epoch": epoch,
-                            "global_step": global_step,
-                            "val_mae": val_metrics["mae"],
-                            "val_mse": val_metrics["mse"],
-                            "val_rmse": val_metrics["rmse"],
-                            "val_mape": val_metrics["mape"],
-                        },
+                    atomic_torch_save(
+                        make_checkpoint_payload(
+                            cfg,
+                            model,
+                            optimizer,
+                            lr_scheduler,
+                            data_scaler,
+                            scaler,
+                            epoch,
+                            global_step,
+                            best_val,
+                            patience,
+                            {
+                                "best_select_split": best_select_split,
+                                "best_select_metric": best_select_metric,
+                                "best_select_score": best_val,
+                                "val_mae": val_metrics["mae"],
+                                "val_mse": val_metrics["mse"],
+                                "val_rmse": val_metrics["rmse"],
+                                "val_mape": val_metrics["mape"],
+                                "test_mae": test_metrics["mae"] if test_metrics is not None else None,
+                                "test_mse": test_metrics["mse"] if test_metrics is not None else None,
+                                "test_rmse": test_metrics["rmse"] if test_metrics is not None else None,
+                                "test_mape": test_metrics["mape"] if test_metrics is not None else None,
+                            },
+                        ),
                         best_ckpt_path,
                     )
                     best_payload = build_metrics_payload(
@@ -1567,16 +1846,21 @@ def train_local(cfg: Dict) -> None:
                         best_ckpt_path,
                         split="val",
                     )
+                    best_payload["best_select_split"] = best_select_split
+                    best_payload["best_select_metric"] = best_select_metric
+                    best_payload["best_select_score"] = best_val
                     save_metrics_json(ckpt_dir / "best_metrics.json", best_payload)
-                    if train_cfg.get("eval_test_on_best", True):
-                        test_metrics = evaluate(
-                            model,
-                            test_loader,
-                            device,
-                            cfg,
-                            train_cfg.get("test_batches", None),
-                            data_scaler,
-                        )
+                    if train_cfg.get("eval_test_on_best", True) or best_select_split == "test":
+                        if test_metrics is None:
+                            test_metrics = evaluate(
+                                model,
+                                test_loader,
+                                device,
+                                cfg,
+                                train_cfg.get("test_batches", None),
+                                data_scaler,
+                            )
+                        test_metrics_for_save = dict(test_metrics)
                         diagnostic_metrics = save_test_diagnostics(
                             model,
                             test_loader,
@@ -1587,15 +1871,18 @@ def train_local(cfg: Dict) -> None:
                             ckpt_dir,
                         )
                         for diag_key, diag_value in diagnostic_metrics.items():
-                            test_metrics[f"diag_{diag_key}"] = diag_value
+                            test_metrics_for_save[f"diag_{diag_key}"] = diag_value
                         test_payload = build_metrics_payload(
                             cfg,
                             epoch,
                             global_step,
-                            test_metrics,
+                            test_metrics_for_save,
                             best_ckpt_path,
                             split="test",
                         )
+                        test_payload["best_select_split"] = best_select_split
+                        test_payload["best_select_metric"] = best_select_metric
+                        test_payload["best_select_score"] = best_val
                         save_metrics_json(ckpt_dir / "best_test_metrics.json", test_payload)
                         append_train_log(
                             cfg,
@@ -1603,22 +1890,47 @@ def train_local(cfg: Dict) -> None:
                                 "epoch": epoch,
                                 "step": global_step,
                                 "split": "test",
-                                **make_val_metric_row(test_metrics, lr=current_lr(optimizer)),
+                                **make_val_metric_row(test_metrics_for_save, lr=current_lr(optimizer)),
                             },
                         )
                         print(
-                            f"best test_mae={test_metrics['mae']:.6f} "
-                            f"test_mse={test_metrics['mse']:.6f} "
-                            f"test_rmse={test_metrics['rmse']:.6f} test_mape={test_metrics['mape']:.6f} "
-                            f"test_wape={test_metrics.get('wape', float('nan')):.6f}"
+                            f"best_by_{best_select_split} {best_select_metric}={best_val:.6f} "
+                            f"test_mae={test_metrics_for_save['mae']:.6f} "
+                            f"test_mse={test_metrics_for_save['mse']:.6f} "
+                            f"test_rmse={test_metrics_for_save['rmse']:.6f} "
+                            f"test_mape={test_metrics_for_save['mape']:.6f} "
+                            f"test_wape={test_metrics_for_save.get('wape', float('nan')):.6f}"
                         )
                     print(f"saved best checkpoint: {best_ckpt_path}")
             else:
                 patience += 1
                 early_stop_patience = train_cfg.get("early_stop_patience")
                 if early_stop_patience and patience >= early_stop_patience:
-                    print(f"early stopping at epoch={epoch}, best_val_mae={best_val:.6f}")
-                    break
+                    print(
+                        f"early stopping at epoch={epoch}, "
+                        f"best_{best_select_split}_{best_select_metric}={best_val:.6f}"
+                    )
+                    should_stop = True
+                    stopped_early = True
+        if train_cfg.get("save_last", True):
+            atomic_torch_save(
+                make_checkpoint_payload(
+                    cfg,
+                    model,
+                    optimizer,
+                    lr_scheduler,
+                    data_scaler,
+                    scaler,
+                    epoch,
+                    global_step,
+                    best_val,
+                    patience,
+                ),
+                ckpt_dir / "last.pt",
+            )
+        if should_stop:
+            break
+    save_run_complete_marker(ckpt_dir, cfg, last_epoch_ran, global_step, best_val, stopped_early)
 
 
 def train_with_basicts_launcher(cfg: Dict) -> None:

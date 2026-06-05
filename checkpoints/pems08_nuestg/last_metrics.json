@@ -1,0 +1,19 @@
+{
+  "ablation": "",
+  "backbone": "stid_mlp",
+  "category": "plugin_ours",
+  "ckpt_path": "checkpoints/pems08_nuestg/last.pt",
+  "config_path": "/data/OuXiaoyu/mystg/nue_stg_project/configs/pems08_nuestg.py",
+  "dataset": "PEMS08",
+  "epoch": 72,
+  "global_step": 24120,
+  "mae": 19.605513725280762,
+  "mape": 8196.668453687727,
+  "method": "NUESTG",
+  "notes": "",
+  "rmse": 29.37650625228882,
+  "seed": 2026,
+  "setting": "forecasting",
+  "split": "val",
+  "status": "runnable"
+}

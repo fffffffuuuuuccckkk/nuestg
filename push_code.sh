@@ -32,9 +32,13 @@ if (( ${#untracked_files[@]} > 0 )); then
   git add -- "${untracked_files[@]}"
 fi
 
+# blocked="$(
+#   git diff --cached --name-only |
+#     grep -E '(^|/)(datasets|outputs|checkpoints|runs|wandb|logs)(/|$)|\.(pt|pth|ckpt|safetensors|npy|npz|h5|hdf5|pkl|zip|tar|tar\.gz)$' || true
+# )"
 blocked="$(
   git diff --cached --name-only |
-    grep -E '(^|/)(datasets|outputs|checkpoints|runs|wandb|logs)(/|$)|\.(pt|pth|ckpt|safetensors|npy|npz|h5|hdf5|pkl|zip|tar|tar\.gz)$' || true
+    grep -E '(^|/)(datasets|outputs|runs|wandb|logs)(/|$)|\.(pt|pth|ckpt|safetensors|onnx|bin|joblib|npy|npz|h5|hdf5|pkl|zip|tar|tar\.gz)$' || true
 )"
 
 if [[ -n "$blocked" ]]; then

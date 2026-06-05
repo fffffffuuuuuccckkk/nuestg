@@ -1,0 +1,30 @@
+previous_results=/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_sweep/results.tsv
+rows=256 metric_rows=217 top_k=10
+
+Top-10 by mae:
+combo_id,mae,rmse,mape,lr,optimizer,weight_decay,grad_clip,lr_scheduler,lr_milestones,lr_gamma,lambda_envpred,lambda_future_mi,lambda_swap,lambda_mask_sparse,sparse_target,train_loss_scale
+combo_0028,15.25515162837398,24.118830986630865,10.21228080182462,0.001,adamw,1e-5,3.0,multistep,[30,60,80],0.5,0.05,0.03,0.05,1e-3,0.3,normalized
+combo_0060,15.25515162837398,24.118830986630865,10.21228080182462,0.001,adamw,1e-5,5.0,multistep,[30,60,80],0.5,0.05,0.03,0.05,1e-3,0.3,normalized
+combo_0082,15.260586235974285,24.122025141191624,10.203852945619875,0.001,adamw,5e-5,3.0,multistep,[30,60,80],0.5,0.03,0.03,0.03,1e-3,0.3,normalized
+combo_0114,15.260586235974285,24.122025141191624,10.203852945619875,0.001,adamw,5e-5,5.0,multistep,[30,60,80],0.5,0.03,0.03,0.03,1e-3,0.3,normalized
+combo_0018,15.26272271560119,24.12622880016477,10.196407184944496,0.001,adamw,1e-5,3.0,multistep,[30,60,80],0.5,0.03,0.03,0.03,1e-3,0.3,normalized
+combo_0026,15.26272271560119,24.12622880016477,10.196407184944496,0.001,adamw,1e-5,3.0,multistep,[30,60,80],0.5,0.05,0.03,0.03,1e-3,0.3,normalized
+combo_0050,15.26272271560119,24.12622880016477,10.196407184944496,0.001,adamw,1e-5,5.0,multistep,[30,60,80],0.5,0.03,0.03,0.03,1e-3,0.3,normalized
+combo_0058,15.26272271560119,24.12622880016477,10.196407184944496,0.001,adamw,1e-5,5.0,multistep,[30,60,80],0.5,0.05,0.03,0.03,1e-3,0.3,normalized
+combo_0068,15.33746978828499,24.279693691283246,10.115501833391619,0.001,adamw,5e-5,3.0,multistep,[30,60,80],0.3,0.03,0.03,0.05,1e-3,0.3,normalized
+combo_0076,15.33746978828499,24.279693691283246,10.115501833391619,0.001,adamw,5e-5,3.0,multistep,[30,60,80],0.3,0.05,0.03,0.05,1e-3,0.3,normalized
+
+Top-k param frequency:
+lr: 0.001 -> 10/10
+optimizer: adamw -> 10/10
+weight_decay: 1e-5 -> 6/10, 5e-5 -> 4/10
+grad_clip: 3.0 -> 6/10, 5.0 -> 4/10
+lr_scheduler: multistep -> 10/10
+lr_milestones: [30,60,80] -> 10/10
+lr_gamma: 0.5 -> 8/10, 0.3 -> 2/10
+lambda_envpred: 0.05 -> 5/10, 0.03 -> 5/10
+lambda_future_mi: 0.03 -> 10/10
+lambda_swap: 0.03 -> 6/10, 0.05 -> 4/10
+lambda_mask_sparse: 1e-3 -> 10/10
+sparse_target: 0.3 -> 10/10
+train_loss_scale: normalized -> 10/10

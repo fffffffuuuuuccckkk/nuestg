@@ -20,6 +20,11 @@ INCLUDE_NONZERO_WITH_METRICS="${INCLUDE_NONZERO_WITH_METRICS:-true}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-true}"
 DRY_RUN="${DRY_RUN:-false}"
 MAX_COMBOS="${MAX_COMBOS:-0}"
+AUTO_RESUME="${AUTO_RESUME:-true}"
+RESUME_FROM="${RESUME_FROM:-auto}"
+COMPLETION_MARKER="${COMPLETION_MARKER:-run_complete.json}"
+BEST_SELECT_SPLIT="${BEST_SELECT_SPLIT:-test}"
+BEST_SELECT_METRIC="${BEST_SELECT_METRIC:-mae}"
 
 SWEEP_PROFILE="${SWEEP_PROFILE:-backbone_pruned}"
 BACKBONE_PROFILE="${BACKBONE_PROFILE:-official}"
@@ -88,6 +93,10 @@ case "${SWEEP_PROFILE}" in
     ;;
 esac
 
+PERTURB_ENABLED="${PERTURB_ENABLED:-false}"
+LAMBDA_Z_CONS_LIST="${LAMBDA_Z_CONS_LIST:-0}"
+LAMBDA_Y_CONS_LIST="${LAMBDA_Y_CONS_LIST:-0}"
+
 # Fixed metric definition. Do not sweep this when comparing model quality.
 MAPE_THRESHOLD="${MAPE_THRESHOLD:-1.0}"
 MAPE_EPS="${MAPE_EPS:-1e-5}"
@@ -115,8 +124,10 @@ read -r -a LAMBDA_SWAPS <<< "${LAMBDA_SWAP_LIST}"
 read -r -a LAMBDA_MASK_SPARSES <<< "${LAMBDA_MASK_SPARSE_LIST}"
 read -r -a SPARSE_TARGETS <<< "${SPARSE_TARGET_LIST}"
 read -r -a TRAIN_LOSS_SCALES <<< "${TRAIN_LOSS_SCALE_LIST}"
+read -r -a LAMBDA_Z_CONS_VALUES <<< "${LAMBDA_Z_CONS_LIST}"
+read -r -a LAMBDA_Y_CONS_VALUES <<< "${LAMBDA_Y_CONS_LIST}"
 
-RESULTS_HEADER="combo_id	status	exit_code	metrics_found	ckpt_dir	backbone	seed	lr	optimizer	weight_decay	grad_clip	dropout	lr_scheduler	lr_milestones	lr_gamma	lambda_envpred	lambda_future_mi	lambda_swap	lambda_mask_sparse	sparse_target	train_loss_scale	mae	mse	rmse	mape	wape	metric_path"
+RESULTS_HEADER="combo_id	status	exit_code	metrics_found	ckpt_dir	backbone	seed	lr	optimizer	weight_decay	grad_clip	dropout	lr_scheduler	lr_milestones	lr_gamma	lambda_envpred	lambda_future_mi	lambda_swap	lambda_mask_sparse	sparse_target	train_loss_scale	perturb_enabled	lambda_z_cons	lambda_y_cons	mae	mse	rmse	mape	wape	metric_path"
 
 truthy() {
   case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -292,11 +303,14 @@ append_result() {
   local lambda_mask_sparse="${19}"
   local sparse_target="${20}"
   local train_loss_scale="${21}"
+  local perturb_enabled="${22}"
+  local lambda_z_cons="${23}"
+  local lambda_y_cons="${24}"
 
   "${PYTHON}" - "${RESULTS_TSV}" "${metrics_path}" "${combo_id}" "${status}" "${exit_code}" "${ckpt_dir}" \
     "${backbone}" "${seed}" "${lr}" "${optimizer}" "${weight_decay}" "${grad_clip}" "${dropout}" "${lr_scheduler}" \
     "${lr_milestones}" "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" \
-    "${lambda_mask_sparse}" "${sparse_target}" "${train_loss_scale}" <<'PY'
+    "${lambda_mask_sparse}" "${sparse_target}" "${train_loss_scale}" "${perturb_enabled}" "${lambda_z_cons}" "${lambda_y_cons}" <<'PY'
 import csv
 import json
 import sys
@@ -325,6 +339,9 @@ from pathlib import Path
     lambda_mask_sparse,
     sparse_target,
     train_loss_scale,
+    perturb_enabled,
+    lambda_z_cons,
+    lambda_y_cons,
 ) = sys.argv[1:]
 
 metrics_file = Path(metrics_path)
@@ -364,6 +381,9 @@ row = {
     "lambda_mask_sparse": lambda_mask_sparse,
     "sparse_target": sparse_target,
     "train_loss_scale": train_loss_scale,
+    "perturb_enabled": perturb_enabled,
+    "lambda_z_cons": lambda_z_cons,
+    "lambda_y_cons": lambda_y_cons,
     "mae": metrics.get("mae", float("nan")),
     "mse": mse,
     "rmse": rmse,
@@ -409,6 +429,7 @@ by_fields = [
     "backbone", "best_metric", "best_value", "combo_id", "ckpt_dir",
     "mae", "mse", "rmse", "mape", "wape", "lr", "weight_decay", "grad_clip", "dropout",
     "lambda_envpred", "lambda_future_mi", "lambda_swap", "sparse_target",
+    "perturb_enabled", "lambda_z_cons", "lambda_y_cons",
 ]
 best_by_path = Path(best_by_backbone)
 best_by_path.parent.mkdir(parents=True, exist_ok=True)
@@ -440,7 +461,8 @@ for key in [
     "backbone", "seed", "lr", "optimizer", "weight_decay", "grad_clip",
     "dropout", "lr_scheduler", "lr_milestones", "lr_gamma", "lambda_envpred",
     "lambda_future_mi", "lambda_swap", "lambda_mask_sparse",
-    "sparse_target", "train_loss_scale",
+    "sparse_target", "train_loss_scale", "perturb_enabled",
+    "lambda_z_cons", "lambda_y_cons",
 ]:
     lines.append(f"  {key}={best_row.get(key, '')}")
 for key in ["mae", "mse", "rmse", "mape", "wape", "status", "exit_code"]:
@@ -476,6 +498,9 @@ with best_by_path.open("w", encoding="utf-8", newline="") as f:
             "lambda_future_mi": row.get("lambda_future_mi", ""),
             "lambda_swap": row.get("lambda_swap", ""),
             "sparse_target": row.get("sparse_target", ""),
+            "perturb_enabled": row.get("perturb_enabled", ""),
+            "lambda_z_cons": row.get("lambda_z_cons", ""),
+            "lambda_y_cons": row.get("lambda_y_cons", ""),
         })
 print("\n".join(lines))
 PY
@@ -499,12 +524,14 @@ for _lambda_swap in "${LAMBDA_SWAPS[@]}"; do
 for _lambda_mask_sparse in "${LAMBDA_MASK_SPARSES[@]}"; do
 for _sparse_target in "${SPARSE_TARGETS[@]}"; do
 for _train_loss_scale in "${TRAIN_LOSS_SCALES[@]}"; do
+for _lambda_z_cons in "${LAMBDA_Z_CONS_VALUES[@]}"; do
+for _lambda_y_cons in "${LAMBDA_Y_CONS_VALUES[@]}"; do
 for _backbone in "${BACKBONES[@]}"; do
   if ! profile_combo_enabled "${_backbone}" "${_lr}"; then
     continue
   fi
   total=$((total + 1))
-done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
+done; done; done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
 
 echo "[sweep] project=${PROJECT_DIR}"
 echo "[sweep] run_script=${RUN_SCRIPT}"
@@ -516,6 +543,9 @@ echo "[sweep] results=${RESULTS_TSV}"
 echo "[sweep] previous_analysis=${PREVIOUS_ANALYSIS_TXT}"
 echo "[sweep] backbone_list=${BACKBONE_LIST}"
 echo "[sweep] backbone_list_extended=${BACKBONE_LIST_EXTENDED} (not enabled by default)"
+echo "[sweep] perturb_enabled=${PERTURB_ENABLED} lambda_z_cons_list=${LAMBDA_Z_CONS_LIST} lambda_y_cons_list=${LAMBDA_Y_CONS_LIST}"
+echo "[sweep] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} completion_marker=${COMPLETION_MARKER}"
+echo "[sweep] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
 echo "[sweep] total_combos=${total} max_combos=${MAX_COMBOS} dry_run=${DRY_RUN}"
 
 combo=0
@@ -533,6 +563,8 @@ for lambda_swap in "${LAMBDA_SWAPS[@]}"; do
 for lambda_mask_sparse in "${LAMBDA_MASK_SPARSES[@]}"; do
 for sparse_target in "${SPARSE_TARGETS[@]}"; do
 for train_loss_scale in "${TRAIN_LOSS_SCALES[@]}"; do
+for lambda_z_cons in "${LAMBDA_Z_CONS_VALUES[@]}"; do
+for lambda_y_cons in "${LAMBDA_Y_CONS_VALUES[@]}"; do
 for backbone in "${BACKBONES[@]}"; do
   if ! profile_combo_enabled "${backbone}" "${lr}"; then
     continue
@@ -548,6 +580,7 @@ for backbone in "${BACKBONES[@]}"; do
   combo_id=$(printf "%s_%s" "${backbone}" "${combo_short}")
   ckpt_dir="${SWEEP_ROOT}/${backbone}/${combo_short}"
   metrics_path="${ckpt_dir}/${BEST_SPLIT_METRICS}"
+  complete_path="${ckpt_dir}/${COMPLETION_MARKER}"
   log_path="${ckpt_dir}/run.log"
   apply_backbone_profile
   backbone_cfg_key="$(backbone_config_key "${backbone}")"
@@ -572,10 +605,22 @@ lambda_swap=${lambda_swap}
 lambda_mask_sparse=${lambda_mask_sparse}
 sparse_target=${sparse_target}
 train_loss_scale=${train_loss_scale}
+perturb_enabled=${PERTURB_ENABLED}
+lambda_z_cons=${lambda_z_cons}
+lambda_y_cons=${lambda_y_cons}
+auto_resume=${AUTO_RESUME}
+resume_from=${RESUME_FROM}
+completion_marker=${COMPLETION_MARKER}
+best_select_split=${BEST_SELECT_SPLIT}
+best_select_metric=${BEST_SELECT_METRIC}
 EOF
 
   extra_args=(
     "--set" "MODEL.backbone_name=${backbone}"
+    "--set" "TRAIN.auto_resume=${AUTO_RESUME}"
+    "--set" "TRAIN.resume_from=${RESUME_FROM}"
+    "--set" "TRAIN.best_select_split=${BEST_SELECT_SPLIT}"
+    "--set" "TRAIN.best_select_metric=${BEST_SELECT_METRIC}"
     "--set" "TRAIN.learning_rate=${effective_lr}"
     "--set" "TRAIN.optimizer=${optimizer}"
     "--set" "TRAIN.weight_decay=${effective_weight_decay}"
@@ -589,6 +634,9 @@ EOF
     "--set" "LOSS.lambda_mask_sparse=${lambda_mask_sparse}"
     "--set" "LOSS.sparse_target=${sparse_target}"
     "--set" "LOSS.train_loss_scale=${train_loss_scale}"
+    "--set" "MODEL.perturb_enabled=${PERTURB_ENABLED}"
+    "--set" "LOSS.lambda_z_cons=${lambda_z_cons}"
+    "--set" "LOSS.lambda_y_cons=${lambda_y_cons}"
     "--set" "METRICS.mape_threshold=${MAPE_THRESHOLD}"
     "--set" "METRICS.mape_eps=${MAPE_EPS}"
     "--set" "METRICS.mape_as_percent=${MAPE_AS_PERCENT}"
@@ -603,14 +651,14 @@ EOF
   fi
   extra_args_string=$(printf "%q " "${extra_args[@]}")
 
-  echo "[sweep] ${combo_id}/${total} backbone=${backbone} profile=${BACKBONE_PROFILE} seed=${seed} lr=${effective_lr} wd=${effective_weight_decay} clip=${effective_grad_clip} dropout=${effective_dropout:-na} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} sparse=${lambda_mask_sparse} target=${sparse_target}"
+  echo "[sweep] ${combo_id}/${total} backbone=${backbone} profile=${BACKBONE_PROFILE} seed=${seed} lr=${effective_lr} wd=${effective_weight_decay} clip=${effective_grad_clip} dropout=${effective_dropout:-na} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} sparse=${lambda_mask_sparse} target=${sparse_target} perturb=${PERTURB_ENABLED} z_cons=${lambda_z_cons} y_cons=${lambda_y_cons}"
 
-  if truthy "${SKIP_COMPLETED}" && [[ -f "${metrics_path}" ]]; then
-    echo "[sweep] skip completed ${combo_id}: ${metrics_path}"
+  if truthy "${SKIP_COMPLETED}" && [[ -f "${complete_path}" ]]; then
+    echo "[sweep] skip completed ${combo_id}: ${complete_path}"
     append_result "${combo_id}" "skipped_completed" "0" "${metrics_path}" "${ckpt_dir}" "${backbone}" \
       "${seed}" "${effective_lr}" "${optimizer}" "${effective_weight_decay}" "${effective_grad_clip}" "${effective_dropout}" "${lr_scheduler}" "${lr_milestones}" \
       "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" "${lambda_mask_sparse}" \
-      "${sparse_target}" "${train_loss_scale}"
+      "${sparse_target}" "${train_loss_scale}" "${PERTURB_ENABLED}" "${lambda_z_cons}" "${lambda_y_cons}"
     update_best
     continue
   fi
@@ -643,9 +691,9 @@ EOF
   append_result "${combo_id}" "${status}" "${exit_code}" "${metrics_path}" "${ckpt_dir}" "${backbone}" \
     "${seed}" "${effective_lr}" "${optimizer}" "${effective_weight_decay}" "${effective_grad_clip}" "${effective_dropout}" "${lr_scheduler}" "${lr_milestones}" \
     "${lr_gamma}" "${lambda_envpred}" "${lambda_future_mi}" "${lambda_swap}" "${lambda_mask_sparse}" \
-    "${sparse_target}" "${train_loss_scale}"
+    "${sparse_target}" "${train_loss_scale}" "${PERTURB_ENABLED}" "${lambda_z_cons}" "${lambda_y_cons}"
   update_best
-done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
+done; done; done; done; done; done; done; done; done; done; done; done; done; done; done; done; done
 
 echo "[sweep] done. Final best:"
 update_best

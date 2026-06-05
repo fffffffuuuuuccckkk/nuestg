@@ -1,0 +1,30 @@
+{
+  "best_metric": "mae",
+  "best_row": {
+    "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_sweep/combo_0028",
+    "combo_id": "combo_0028",
+    "exit_code": "0",
+    "grad_clip": "3.0",
+    "lambda_envpred": "0.05",
+    "lambda_future_mi": "0.03",
+    "lambda_mask_sparse": "1e-3",
+    "lambda_swap": "0.05",
+    "lr": "0.001",
+    "lr_gamma": "0.5",
+    "lr_milestones": "[30,60,80]",
+    "lr_scheduler": "multistep",
+    "mae": "15.25515162837398",
+    "mape": "10.21228080182462",
+    "metric_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_sweep/combo_0028/best_test_metrics.json",
+    "metrics_found": "1",
+    "mse": "581.7180081616651",
+    "optimizer": "adamw",
+    "rmse": "24.118830986630865",
+    "seed": "2026",
+    "sparse_target": "0.3",
+    "status": "ok",
+    "train_loss_scale": "normalized",
+    "weight_decay": "1e-5"
+  },
+  "best_value": 15.25515162837398
+}

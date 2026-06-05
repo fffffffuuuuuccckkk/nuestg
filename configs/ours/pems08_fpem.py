@@ -50,6 +50,10 @@ CONFIG = deep_update(
             "future_decoder_use_time": True,
             "future_decoder_logvar_min": -8.0,
             "future_decoder_logvar_max": 4.0,
+            # Recommended invariant consistency experiment:
+            # set MODEL.perturb_enabled=True, LOSS.lambda_z_cons=0.01,
+            # and LOSS.lambda_y_cons=0.01 from the command line.
+            "perturb_enabled": False,
             "backbone": {
                 "stid_mlp": {
                     "use_time_of_day_embedding": True,
@@ -75,6 +79,10 @@ CONFIG = deep_update(
             "peak_weight": 0.2,
             "use_residual_norm": False,
             "lambda_residual_norm": 0.0,
+            "lambda_z_cons": 0.0,
+            "lambda_y_cons": 0.0,
+            "consistency_detach_target": True,
+            "consistency_loss": "mse",
             "use_persistence_mi": False,
             "use_envpred": True,
             "lambda_envpred": 0.05,

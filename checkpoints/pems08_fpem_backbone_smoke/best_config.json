@@ -1,0 +1,31 @@
+{
+  "best_metric": "mae",
+  "best_row": {
+    "backbone": "stid_mlp",
+    "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_backbone_smoke/stid_mlp/combo_0001",
+    "combo_id": "stid_mlp_combo_0001",
+    "exit_code": "0",
+    "grad_clip": "3.0",
+    "lambda_envpred": "0.05",
+    "lambda_future_mi": "0.01",
+    "lambda_mask_sparse": "1e-3",
+    "lambda_swap": "0.05",
+    "lr": "0.001",
+    "lr_gamma": "0.5",
+    "lr_milestones": "[30,60,80]",
+    "lr_scheduler": "multistep",
+    "mae": "19.42558869370469",
+    "mape": "13.453391410209036",
+    "metric_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_fpem_backbone_smoke/stid_mlp/combo_0001/best_test_metrics.json",
+    "metrics_found": "1",
+    "mse": "908.1881185995566",
+    "optimizer": "adamw",
+    "rmse": "30.136159652476568",
+    "seed": "2026",
+    "sparse_target": "0.3",
+    "status": "ok",
+    "train_loss_scale": "normalized",
+    "weight_decay": "1e-5"
+  },
+  "best_value": 19.42558869370469
+}

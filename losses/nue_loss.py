@@ -70,6 +70,10 @@ class NUESTGLossConfig:
     lambda_residual_norm: float = 0.0
     use_env_consistency: bool = False
     lambda_env_consistency: float = 0.0
+    lambda_z_cons: float = 0.0
+    lambda_y_cons: float = 0.0
+    consistency_detach_target: bool = True
+    consistency_loss: str = "mse"
     use_persistence_mi: bool = True
     lambda_persistence_mi: float = 0.05
     persistence_tau: float = 0.2
@@ -149,6 +153,10 @@ class NUESTGLoss(nn.Module):
         "entropy_loss",
         "residual_norm_loss",
         "env_consistency_loss",
+        "z_cons_loss",
+        "y_cons_loss",
+        "effective_lambda_z_cons",
+        "effective_lambda_y_cons",
         "persistence_mi_loss",
         "envpred_loss",
         "future_mi_loss",
@@ -417,6 +425,33 @@ class NUESTGLoss(nn.Module):
             logs[name] = value
         logs["backbone_aux_loss"] = total
         return total, logs
+
+    def _consistency_term(
+        self,
+        source: Optional[torch.Tensor],
+        target: Optional[torch.Tensor],
+        like: torch.Tensor,
+        default: str,
+    ) -> torch.Tensor:
+        if source is None or target is None:
+            return self._zero(like)
+        if tuple(source.shape) != tuple(target.shape):
+            raise AssertionError(
+                f"consistency tensors must share shape, got {tuple(source.shape)} and {tuple(target.shape)}"
+            )
+        target_view = target.detach() if self.cfg.consistency_detach_target else target
+        source_view = torch.nan_to_num(source)
+        target_view = torch.nan_to_num(target_view)
+        mode = str(self.cfg.consistency_loss or "mse").lower()
+        if mode == "cosine":
+            source_flat = source_view.reshape(-1, source_view.shape[-1])
+            target_flat = target_view.reshape(-1, target_view.shape[-1])
+            return (1.0 - F.cosine_similarity(source_flat, target_flat, dim=-1, eps=1e-8)).mean()
+        if mode != "mse":
+            raise ValueError("LOSS.consistency_loss must be 'mse' or 'cosine'")
+        if default == "mae":
+            return (source_view - target_view).abs().mean()
+        return (source_view - target_view).pow(2).mean()
 
     def _persistence_terms(
         self,
@@ -856,6 +891,20 @@ class NUESTGLoss(nn.Module):
             if self.cfg.use_backbone_aux and self.cfg.lambda_backbone_aux != 0
             else zero
         )
+        z_cons_loss_raw = self._consistency_term(output.get("z_inv_aug"), output.get("z_inv"), prediction, "mse")
+        y_cons_loss_raw = self._consistency_term(output.get("y_inv_aug"), y_inv, prediction, "mae")
+        effective_lambda_z_cons = (
+            float(self.cfg.lambda_z_cons)
+            if output.get("z_inv_aug") is not None and self.cfg.lambda_z_cons != 0
+            else 0.0
+        )
+        effective_lambda_y_cons = (
+            float(self.cfg.lambda_y_cons)
+            if output.get("y_inv_aug") is not None and self.cfg.lambda_y_cons != 0
+            else 0.0
+        )
+        z_cons_loss = z_cons_loss_raw if effective_lambda_z_cons != 0 else zero
+        y_cons_loss = y_cons_loss_raw if effective_lambda_y_cons != 0 else zero
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
@@ -868,6 +917,8 @@ class NUESTGLoss(nn.Module):
             + effective_lambda_kl * kl_loss
             + self.cfg.lambda_rank * rank_loss
             + self.cfg.lambda_backbone_aux * backbone_aux_loss
+            + effective_lambda_z_cons * z_cons_loss
+            + effective_lambda_y_cons * y_cons_loss
         )
 
         rho = output.get("rho")
@@ -898,6 +949,10 @@ class NUESTGLoss(nn.Module):
             "entropy_loss": zero,
             "residual_norm_loss": zero,
             "env_consistency_loss": zero,
+            "z_cons_loss": z_cons_loss.detach(),
+            "y_cons_loss": y_cons_loss.detach(),
+            "effective_lambda_z_cons": prediction.new_tensor(effective_lambda_z_cons),
+            "effective_lambda_y_cons": prediction.new_tensor(effective_lambda_y_cons),
             "persistence_mi_loss": zero,
             "effective_lambda_persistence_mi": zero,
             "envpred_loss": envpred_loss.detach(),
@@ -1132,6 +1187,10 @@ class NUESTGLoss(nn.Module):
             "entropy_loss": entropy_loss.detach(),
             "residual_norm_loss": residual_norm_loss.detach(),
             "env_consistency_loss": env_consistency_loss.detach(),
+            "z_cons_loss": zero,
+            "y_cons_loss": zero,
+            "effective_lambda_z_cons": zero,
+            "effective_lambda_y_cons": zero,
             "persistence_mi_loss": persistence_mi_loss.detach(),
             "effective_lambda_persistence_mi": prediction.new_tensor(effective_lambda_persistence_mi),
             "rho_mean": rho.detach().mean(),

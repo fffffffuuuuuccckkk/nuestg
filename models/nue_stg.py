@@ -14,6 +14,7 @@ from models.env_encoder import NodeWiseEnvironmentEncoder, TimeNodeEnvironmentEn
 from models.env_mask import FuturePredictiveEnvMask
 from models.future_env_encoder import FutureEnvEncoder
 from models.separation import SeparationModule
+from models.st_perturbation import STPerturbation
 from models.time_embedding import TimestampEncoder
 from utils.tensor_ops import align_target, ensure_blnc, load_adjacency, load_graph_supports
 
@@ -103,6 +104,22 @@ class NUESTGConfig(BasicTSModelConfig):
     future_decoder_logvar_max: float = 4.0
     use_shuffled_env_train: bool = False
     use_shuffled_env_eval: bool = False
+    perturb_enabled: bool = False
+    perturb_prob: float = 1.0
+    perturb_value_jitter: bool = True
+    perturb_jitter_std: float = 0.01
+    perturb_value_scale: bool = True
+    perturb_scale_min: float = 0.9
+    perturb_scale_max: float = 1.1
+    perturb_time_node_mask: bool = True
+    perturb_time_node_mask_ratio: float = 0.1
+    perturb_mask_value: str = "zero"
+    perturb_temporal_block: bool = True
+    perturb_temporal_block_ratio: float = 0.1
+    perturb_temporal_block_len: int = 2
+    perturb_edge_dropout: bool = False
+    perturb_edge_dropout_p: float = 0.1
+    perturb_edge_dropout_for_env_only: bool = True
     swap: Dict = field(default_factory=dict)
     swap_detach_inv: bool = True
 
@@ -210,6 +227,7 @@ class NUESTG(nn.Module):
         self.force_gate_value = config.force_gate_value
         self.use_shuffled_env_train = config.use_shuffled_env_train
         self.use_shuffled_env_eval = config.use_shuffled_env_eval
+        self.perturb_enabled = bool(config.perturb_enabled)
         self.swap_cfg = config.swap or {}
         self.swap_detach_inv = config.swap_detach_inv
         self.backbone_name = config.backbone_name
@@ -373,6 +391,24 @@ class NUESTG(nn.Module):
             use_time=config.future_decoder_use_time,
             logvar_min=config.future_decoder_logvar_min,
             logvar_max=config.future_decoder_logvar_max,
+        )
+        self.st_perturbation = STPerturbation(
+            enabled=config.perturb_enabled,
+            prob=config.perturb_prob,
+            value_jitter=config.perturb_value_jitter,
+            jitter_std=config.perturb_jitter_std,
+            value_scale=config.perturb_value_scale,
+            scale_min=config.perturb_scale_min,
+            scale_max=config.perturb_scale_max,
+            time_node_mask=config.perturb_time_node_mask,
+            time_node_mask_ratio=config.perturb_time_node_mask_ratio,
+            mask_value=config.perturb_mask_value,
+            temporal_block=config.perturb_temporal_block,
+            temporal_block_ratio=config.perturb_temporal_block_ratio,
+            temporal_block_len=config.perturb_temporal_block_len,
+            edge_dropout=config.perturb_edge_dropout,
+            edge_dropout_p=config.perturb_edge_dropout_p,
+            edge_dropout_for_env_only=config.perturb_edge_dropout_for_env_only,
         )
 
         decode_in_dim = self.representation_dim + config.env_dim
@@ -624,10 +660,14 @@ class NUESTG(nn.Module):
         cur_time: Optional[torch.Tensor] = None,
         future_time: Optional[torch.Tensor] = None,
         compute_aux: bool = False,
+        adj_override: Optional[torch.Tensor] = None,
+        backbone_adj_override: Optional[torch.Tensor] = None,
+        compute_swap: bool = True,
+        apply_perturb: bool = True,
     ) -> Dict[str, Optional[torch.Tensor]]:
         batch_size, input_len, num_nodes, _ = x.shape
-        adj = getattr(self, "adj_norm", None)
-        backbone_adj = getattr(self, "backbone_adj", None)
+        adj = adj_override if adj_override is not None else getattr(self, "adj_norm", None)
+        backbone_adj = backbone_adj_override if backbone_adj_override is not None else getattr(self, "backbone_adj", None)
         time_out = self._encode_time(x, seq_time, cur_time, future_time)
         seq_time_emb = time_out["seq_time_emb"] if self.use_current_timestamp_for_env else None
         cur_time_emb = time_out["cur_time_emb"] if self.use_current_timestamp_for_env else None
@@ -719,7 +759,7 @@ class NUESTG(nn.Module):
         prediction_swap = None
         env_perm = None
         env_perm_index = None
-        if (self.training or compute_aux) and self.swap_cfg.get("enabled", True):
+        if compute_swap and (self.training or compute_aux) and self.swap_cfg.get("enabled", True):
             env_perm, env_perm_index = self._permute_env_with_indices(env_plus)
             env_swap_decode = env_perm.detach() if bool(self.swap_cfg.get("detach_env", True)) else env_perm
             swap_out = self.fpem_predict_from_z_env(z_inv, env_swap_decode)
@@ -765,7 +805,7 @@ class NUESTG(nn.Module):
         r_env = torch.zeros_like(prediction)
         y_potential = prediction
 
-        return {
+        output = {
             "method_variant": "fpem",
             "baseline_name": self.baseline_name,
             "reference_status": self.reference_status,
@@ -824,6 +864,30 @@ class NUESTG(nn.Module):
             "backbone_aux_losses": backbone_out.get("backbone_aux_losses", {}),
             "backbone_aux_weights": backbone_out.get("backbone_aux_weights", {}),
         }
+        if apply_perturb:
+            output["perturb_info"] = {"enabled": self.perturb_enabled, "applied": False}
+        if apply_perturb and self.training and self.perturb_enabled:
+            x_aug, adj_aug, perturb_info = self.st_perturbation(x, adj=adj)
+            output["perturb_info"] = perturb_info
+            if bool(perturb_info.get("applied", False)):
+                aug_backbone_adj = backbone_adj
+                if not bool(perturb_info.get("edge_dropout_for_env_only", True)) and backbone_adj is None:
+                    aug_backbone_adj = adj_aug
+                aug_out = self._forward_fpem(
+                    x_aug,
+                    y_true=None,
+                    seq_time=seq_time,
+                    cur_time=cur_time,
+                    future_time=future_time,
+                    compute_aux=False,
+                    adj_override=adj_aug,
+                    backbone_adj_override=aug_backbone_adj,
+                    compute_swap=False,
+                    apply_perturb=False,
+                )
+                output["z_inv_aug"] = aug_out["z_inv"]
+                output["y_inv_aug"] = aug_out["y_inv"]
+        return output
 
     def forward(
         self,

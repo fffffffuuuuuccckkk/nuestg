@@ -1,0 +1,6 @@
+{
+  "env_minus_future_nll": 0.02246432051666685,
+  "env_plus_future_nll": 0.022570744182008343,
+  "mask_density": 0.21455574606184488,
+  "swap_delta_mae": 0.1696148090534382
+}

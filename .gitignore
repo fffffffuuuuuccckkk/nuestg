@@ -10,15 +10,36 @@ env/
 datasets/
 datasets.zip
 outputs/
-checkpoints/
+checkpoints/**
+!checkpoints/
+!checkpoints/**/
+!checkpoints/**/best_metrics.json
+!checkpoints/**/best_test_metrics.json
+!checkpoints/**/last_metrics.json
+!checkpoints/**/test_env_diagnostics.json
+!checkpoints/**/test_metrics_by_horizon.csv
+!checkpoints/**/test_metrics_by_range.csv
+!checkpoints/**/train_log.csv
+!checkpoints/**/resolved_config.json
+!checkpoints/**/params.env
+!checkpoints/**/results.tsv
+!checkpoints/**/best_by_backbone.tsv
+!checkpoints/**/best_config.json
+!checkpoints/**/best_config.txt
+!checkpoints/**/previous_sweep_analysis.txt
 runs/
 wandb/
 logs/
 
+# Heavy checkpoint/model/data artifacts stay out of git even when their parent
+# checkpoint directory is visible for lightweight metric/config files.
 *.pt
 *.pth
 *.ckpt
 *.safetensors
+*.onnx
+*.bin
+*.joblib
 *.npy
 *.npz
 *.h5
