@@ -25,6 +25,7 @@ checkpoints/**
 !checkpoints/**/results.tsv
 !checkpoints/**/best_by_backbone.tsv
 !checkpoints/**/best_config.json
+!checkpoints/**/run_complete.json
 !checkpoints/**/best_config.txt
 !checkpoints/**/previous_sweep_analysis.txt
 runs/
