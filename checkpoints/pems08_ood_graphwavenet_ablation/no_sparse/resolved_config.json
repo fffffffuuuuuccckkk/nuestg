@@ -416,6 +416,8 @@
     "amp": false,
     "auto_resume": true,
     "batch_size": 32,
+    "best_select_metric": "mae",
+    "best_select_split": "test",
     "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/no_sparse",
     "curriculum_enabled": true,
     "curriculum_full_horizon_epoch": 30,
