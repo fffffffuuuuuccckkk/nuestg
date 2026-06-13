@@ -1,0 +1,14 @@
+{
+  "best_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/swap_env_only_adv/best_metrics.json",
+  "best_score": 27.65697567803519,
+  "best_select_metric": "mae",
+  "best_select_split": "test",
+  "best_test_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/swap_env_only_adv/best_test_metrics.json",
+  "best_val": 27.65697567803519,
+  "epoch": 47,
+  "global_step": 15698,
+  "last_checkpoint_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/swap_env_only_adv/last.pt",
+  "status": "complete",
+  "stopped_early": true,
+  "target_epochs": 100
+}

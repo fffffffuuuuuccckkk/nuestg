@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional
 
@@ -483,6 +484,20 @@ class NUESTG(nn.Module):
         pred = pred.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
         return self._apply_prediction_activation(pred)
 
+    @staticmethod
+    @contextmanager
+    def _frozen_module_parameters(*modules: nn.Module):
+        states = []
+        for module in modules:
+            for param in module.parameters():
+                states.append((param, param.requires_grad))
+                param.requires_grad_(False)
+        try:
+            yield
+        finally:
+            for param, requires_grad in states:
+                param.requires_grad_(requires_grad)
+
     def fpem_predict_from_z_env(self, z_inv: torch.Tensor, env_plus: torch.Tensor) -> Dict[str, torch.Tensor]:
         if z_inv.dim() != 3:
             raise AssertionError(f"z_inv must be [B, N, D_z], got {tuple(z_inv.shape)}")
@@ -766,7 +781,11 @@ class NUESTG(nn.Module):
             z_swap_decode = z_inv.detach() if self.swap_detach_inv else z_inv
             detach_env = bool(self.swap_cfg.get("detach_env", self.swap_detach_env))
             env_swap_decode = env_perm.detach() if detach_env else env_perm
-            swap_out = self.fpem_predict_from_z_env(z_swap_decode, env_swap_decode)
+            if bool(self.swap_cfg.get("freeze_predictor", True)):
+                with self._frozen_module_parameters(self.latent_fusion, self.fpem_predictor):
+                    swap_out = self.fpem_predict_from_z_env(z_swap_decode, env_swap_decode)
+            else:
+                swap_out = self.fpem_predict_from_z_env(z_swap_decode, env_swap_decode)
             prediction_swap = swap_out["prediction"]
 
         expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)

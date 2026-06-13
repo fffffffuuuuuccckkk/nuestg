@@ -384,6 +384,7 @@ def finalize_config(cfg: Dict) -> Dict:
         loss_cfg["swap_detach_env"] = bool(swap_cfg["detach_env"])
     else:
         swap_cfg["detach_env"] = bool(loss_cfg.get("swap_detach_env", False))
+    swap_cfg.setdefault("freeze_predictor", True)
     model_cfg["swap"] = swap_cfg
     model_cfg["swap_detach_inv"] = bool(loss_cfg.get("swap_detach_inv", True))
     model_cfg["swap_detach_env"] = bool(swap_cfg.get("detach_env", False))

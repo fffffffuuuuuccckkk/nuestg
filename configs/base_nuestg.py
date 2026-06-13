@@ -347,6 +347,7 @@ CONFIG = {
         "avoid_self": True,
         "num_swaps": 1,
         "pair_mining": False,
+        "freeze_predictor": True,
         "history_sim_threshold": 0.5,
         "future_diff_threshold": 5.0,
         "future_same_threshold": 0.5,
