@@ -279,6 +279,7 @@ CONFIG = {
         "swap_margin": 0.01,
         "swap_weight_mode": "sgain",
         "swap_detach_inv": True,
+        "swap_detach_env": False,
         "swap_detach_full": True,
         "use_kl": True,
         "lambda_kl": 1e-4,

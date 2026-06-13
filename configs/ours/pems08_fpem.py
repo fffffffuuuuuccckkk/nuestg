@@ -110,7 +110,7 @@ CONFIG = deep_update(
             "lambda_swap": 0.05,
             "swap_margin": 0.01,
             "swap_weight_mode": "future_env_diff",
-            "swap_detach_env": True,
+            "swap_detach_env": False,
             "use_rank": False,
             "lambda_rank": 0.0,
             "rank_margin": 0.01,

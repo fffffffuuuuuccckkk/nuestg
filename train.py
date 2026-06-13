@@ -242,6 +242,8 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("peak_weight_enabled", False)
     loss_cfg.setdefault("peak_quantile", 0.75)
     loss_cfg.setdefault("peak_weight", 0.2)
+    loss_cfg.setdefault("swap_detach_inv", True)
+    loss_cfg.setdefault("swap_detach_env", False)
     ds_cfg.setdefault("null_to_num", 0.0)
     ds_cfg.setdefault("frequency_minutes", 5)
     ds_cfg.setdefault("auto_generate_timestamps", True)
@@ -377,8 +379,14 @@ def finalize_config(cfg: Dict) -> Dict:
         representation_dim = int(selected_cfg["representation_dim"])
     backbone_cfg["representation_dim"] = representation_dim
     model_cfg["hidden_dim"] = representation_dim
-    model_cfg["swap"] = cfg.get("SWAP", {})
-    model_cfg["swap_detach_inv"] = cfg.get("LOSS", {}).get("swap_detach_inv", True)
+    swap_cfg = cfg.setdefault("SWAP", {})
+    if "detach_env" in swap_cfg:
+        loss_cfg["swap_detach_env"] = bool(swap_cfg["detach_env"])
+    else:
+        swap_cfg["detach_env"] = bool(loss_cfg.get("swap_detach_env", False))
+    model_cfg["swap"] = swap_cfg
+    model_cfg["swap_detach_inv"] = bool(loss_cfg.get("swap_detach_inv", True))
+    model_cfg["swap_detach_env"] = bool(swap_cfg.get("detach_env", False))
     cfg["LOSS"]["z_dim"] = representation_dim
     cfg["LOSS"]["env_dim"] = int(model_cfg.get("env_dim", 32))
     return cfg

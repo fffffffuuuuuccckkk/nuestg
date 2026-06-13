@@ -94,6 +94,7 @@ case "${SWEEP_PROFILE}" in
 esac
 
 PERTURB_ENABLED="${PERTURB_ENABLED:-false}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 LAMBDA_Z_CONS_LIST="${LAMBDA_Z_CONS_LIST:-0}"
 LAMBDA_Y_CONS_LIST="${LAMBDA_Y_CONS_LIST:-0}"
 
@@ -606,6 +607,7 @@ lambda_mask_sparse=${lambda_mask_sparse}
 sparse_target=${sparse_target}
 train_loss_scale=${train_loss_scale}
 perturb_enabled=${PERTURB_ENABLED}
+swap_detach_env=${SWAP_DETACH_ENV}
 lambda_z_cons=${lambda_z_cons}
 lambda_y_cons=${lambda_y_cons}
 auto_resume=${AUTO_RESUME}
@@ -635,6 +637,7 @@ EOF
     "--set" "LOSS.sparse_target=${sparse_target}"
     "--set" "LOSS.train_loss_scale=${train_loss_scale}"
     "--set" "MODEL.perturb_enabled=${PERTURB_ENABLED}"
+    "--set" "LOSS.swap_detach_env=${SWAP_DETACH_ENV}"
     "--set" "LOSS.lambda_z_cons=${lambda_z_cons}"
     "--set" "LOSS.lambda_y_cons=${lambda_y_cons}"
     "--set" "METRICS.mape_threshold=${MAPE_THRESHOLD}"
@@ -651,7 +654,7 @@ EOF
   fi
   extra_args_string=$(printf "%q " "${extra_args[@]}")
 
-  echo "[sweep] ${combo_id}/${total} backbone=${backbone} profile=${BACKBONE_PROFILE} seed=${seed} lr=${effective_lr} wd=${effective_weight_decay} clip=${effective_grad_clip} dropout=${effective_dropout:-na} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} sparse=${lambda_mask_sparse} target=${sparse_target} perturb=${PERTURB_ENABLED} z_cons=${lambda_z_cons} y_cons=${lambda_y_cons}"
+  echo "[sweep] ${combo_id}/${total} backbone=${backbone} profile=${BACKBONE_PROFILE} seed=${seed} lr=${effective_lr} wd=${effective_weight_decay} clip=${effective_grad_clip} dropout=${effective_dropout:-na} envpred=${lambda_envpred} future_mi=${lambda_future_mi} swap=${lambda_swap} swap_detach_env=${SWAP_DETACH_ENV} sparse=${lambda_mask_sparse} target=${sparse_target} perturb=${PERTURB_ENABLED} z_cons=${lambda_z_cons} y_cons=${lambda_y_cons}"
 
   if truthy "${SKIP_COMPLETED}" && [[ -f "${complete_path}" ]]; then
     echo "[sweep] skip completed ${combo_id}: ${complete_path}"

@@ -20,6 +20,7 @@ COMPLETION_MARKER="${COMPLETION_MARKER:-run_complete.json}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 BEST_SELECT_SPLIT="${BEST_SELECT_SPLIT:-test}"
 BEST_SELECT_METRIC="${BEST_SELECT_METRIC:-mae}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 
 LR="${LR:-0.001}"
 OPTIMIZER="${OPTIMIZER:-adamw}"
@@ -56,6 +57,7 @@ append_common_args() {
     "--set" "TRAIN.lr_scheduler=${LR_SCHEDULER}"
     "--set" "TRAIN.lr_milestones=${LR_MILESTONES}"
     "--set" "TRAIN.lr_gamma=${LR_GAMMA}"
+    "--set" "LOSS.swap_detach_env=${SWAP_DETACH_ENV}"
   )
   if [[ -n "${EPOCHS}" ]]; then
     out_args+=("--set" "TRAIN.epochs=${EPOCHS}")
@@ -134,6 +136,7 @@ run_one() {
     printf "ablation=%s\n" "${ablation}"
     printf "backbone=%s\n" "${BACKBONE}"
     printf "seed=%s\n" "${SEED}"
+    printf "swap_detach_env=%s\n" "${SWAP_DETACH_ENV}"
     printf "command=%q train.py %s\n" "${PYTHON}" "${quoted}"
   } > "${ckpt_dir}/ablation_command.env"
 
@@ -168,6 +171,7 @@ fi
 echo "[perturb-ablation] project=${PROJECT_DIR}"
 echo "[perturb-ablation] config=${CONFIG}"
 echo "[perturb-ablation] dry_run=${DRY_RUN} backbone=${BACKBONE} seed=${SEED} device=${DEVICE}"
+echo "[perturb-ablation] swap_detach_env=${SWAP_DETACH_ENV}"
 echo "[perturb-ablation] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
 echo "[perturb-ablation] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
 echo "[perturb-ablation] selected=${selected_ablations[*]}"

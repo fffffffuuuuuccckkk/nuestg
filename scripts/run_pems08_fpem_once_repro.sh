@@ -12,6 +12,7 @@ DEVICE="${DEVICE:-cuda:0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 EPOCHS="${EPOCHS:-100}"
 CKPT_DIR="${CKPT_DIR:-${PROJECT_DIR}/checkpoints/pems08/fpem_once_seed${SEED}}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 
 export CUDA_VISIBLE_DEVICES
 export PYTHONHASHSEED="${SEED}"
@@ -24,6 +25,7 @@ echo "[FPEM once] config=${CONFIG}"
 echo "[FPEM once] seed=${SEED} epochs=${EPOCHS} batch_size=${BATCH_SIZE} num_workers=${NUM_WORKERS}"
 echo "[FPEM once] device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 echo "[FPEM once] ckpt_dir=${CKPT_DIR}"
+echo "[FPEM once] swap_detach_env=${SWAP_DETACH_ENV}"
 
 "${PYTHON}" -m compileall models configs train.py >/dev/null
 
@@ -36,7 +38,8 @@ set +e
   --set "TRAIN.num_workers=${NUM_WORKERS}" \
   --set "TRAIN.device=${DEVICE}" \
   --set "TRAIN.epochs=${EPOCHS}" \
-  --set "TRAIN.ckpt_dir=${CKPT_DIR}"
+  --set "TRAIN.ckpt_dir=${CKPT_DIR}" \
+  --set "LOSS.swap_detach_env=${SWAP_DETACH_ENV}"
 TRAIN_STATUS=$?
 set -e
 

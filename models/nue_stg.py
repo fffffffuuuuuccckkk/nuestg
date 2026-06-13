@@ -122,6 +122,7 @@ class NUESTGConfig(BasicTSModelConfig):
     perturb_edge_dropout_for_env_only: bool = True
     swap: Dict = field(default_factory=dict)
     swap_detach_inv: bool = True
+    swap_detach_env: bool = False
 
 
 class LatentFusion(nn.Module):
@@ -229,7 +230,8 @@ class NUESTG(nn.Module):
         self.use_shuffled_env_eval = config.use_shuffled_env_eval
         self.perturb_enabled = bool(config.perturb_enabled)
         self.swap_cfg = config.swap or {}
-        self.swap_detach_inv = config.swap_detach_inv
+        self.swap_detach_inv = bool(config.swap_detach_inv)
+        self.swap_detach_env = bool(config.swap_detach_env)
         self.backbone_name = config.backbone_name
         self.baseline_name = config.baseline_name or config.name or config.backbone_name
         self.reference_status = config.reference_status
@@ -761,8 +763,10 @@ class NUESTG(nn.Module):
         env_perm_index = None
         if compute_swap and (self.training or compute_aux) and self.swap_cfg.get("enabled", True):
             env_perm, env_perm_index = self._permute_env_with_indices(env_plus)
-            env_swap_decode = env_perm.detach() if bool(self.swap_cfg.get("detach_env", True)) else env_perm
-            swap_out = self.fpem_predict_from_z_env(z_inv, env_swap_decode)
+            z_swap_decode = z_inv.detach() if self.swap_detach_inv else z_inv
+            detach_env = bool(self.swap_cfg.get("detach_env", self.swap_detach_env))
+            env_swap_decode = env_perm.detach() if detach_env else env_perm
+            swap_out = self.fpem_predict_from_z_env(z_swap_decode, env_swap_decode)
             prediction_swap = swap_out["prediction"]
 
         expected_pred_shape = (batch_size, self.output_len, num_nodes, self.output_dim)

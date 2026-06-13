@@ -10,6 +10,7 @@ SEED="${SEED:-2026}"
 BATCH_SIZE="${BATCH_SIZE:-32}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 DEVICE="${DEVICE:-cuda:0}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 
 RUN_COMPILE="${RUN_COMPILE:-1}"
 RUN_OLD_NUE="${RUN_OLD_NUE:-1}"
@@ -23,11 +24,13 @@ COMMON_SET=(
   --set "TRAIN.batch_size=${BATCH_SIZE}"
   --set "TRAIN.num_workers=${NUM_WORKERS}"
   --set "TRAIN.device=${DEVICE}"
+  --set "LOSS.swap_detach_env=${SWAP_DETACH_ENV}"
 )
 
 echo "[FPEM repro] project: $PROJECT_DIR"
 echo "[FPEM repro] python:  $PYTHON"
 echo "[FPEM repro] seed=${SEED} batch_size=${BATCH_SIZE} device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
+echo "[FPEM repro] swap_detach_env=${SWAP_DETACH_ENV}"
 
 if [[ "$RUN_COMPILE" == "1" ]]; then
   echo "[FPEM repro] py_compile"

@@ -16,6 +16,7 @@ SKIP_COMPLETED="${SKIP_COMPLETED:-true}"
 COMPLETION_MARKER="${COMPLETION_MARKER:-run_complete.json}"
 BEST_SELECT_SPLIT="${BEST_SELECT_SPLIT:-test}"
 BEST_SELECT_METRIC="${BEST_SELECT_METRIC:-mae}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 export CUDA_VISIBLE_DEVICES
@@ -29,6 +30,7 @@ echo "[FPEM] seed=${SEED} device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_D
 echo "[FPEM] ckpt_dir=${CKPT_DIR}"
 echo "[FPEM] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER}"
 echo "[FPEM] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
+echo "[FPEM] swap_detach_env=${SWAP_DETACH_ENV}"
 
 if [[ "${SKIP_COMPLETED}" =~ ^([Tt][Rr][Uu][Ee]|1|yes|YES|y|Y|on|ON)$ && -f "${CKPT_DIR}/${COMPLETION_MARKER}" ]]; then
   echo "[FPEM] skip completed: ${CKPT_DIR}/${COMPLETION_MARKER}"
@@ -54,6 +56,7 @@ fi
   --set "TRAIN.weight_decay=1e-5" \
   --set "TRAIN.no_decay_for_bias_norm_emb=true" \
   --set "TRAIN.grad_clip=3.0" \
+  --set "LOSS.swap_detach_env=${SWAP_DETACH_ENV}" \
   --set "METRICS.mape_threshold=1.0" \
   --set "METRICS.mape_eps=1e-5" \
   --set "METRICS.mape_as_percent=true" \

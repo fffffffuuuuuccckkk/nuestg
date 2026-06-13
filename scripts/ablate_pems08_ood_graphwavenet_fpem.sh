@@ -40,6 +40,7 @@ COMPLETION_MARKER="${COMPLETION_MARKER:-run_complete.json}"
 CONTINUE_ON_FAILURE="${CONTINUE_ON_FAILURE:-true}"
 BEST_SELECT_SPLIT="${BEST_SELECT_SPLIT:-test}"
 BEST_SELECT_METRIC="${BEST_SELECT_METRIC:-mae}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 
 DEFAULT_DRY_RUN_ABLATIONS=(
   pure_graphwavenet
@@ -97,6 +98,7 @@ append_base_profile_args() {
     "--set" "TRAIN.lr_scheduler=${LR_SCHEDULER}"
     "--set" "TRAIN.lr_milestones=${LR_MILESTONES}"
     "--set" "TRAIN.lr_gamma=${LR_GAMMA}"
+    "--set" "LOSS.swap_detach_env=${SWAP_DETACH_ENV}"
     # Current code consumes graph_wavenet, not graphwavenet.
     "--set" "MODEL.backbone.graph_wavenet.dropout=${DROPOUT}"
     "--set" "MODEL.GWNET.dropout=${DROPOUT}"
@@ -292,6 +294,7 @@ run_one() {
     printf "config=%s\n" "${config_path}"
     printf "backbone=%s\n" "${BACKBONE}"
     printf "seed=%s\n" "${SEED}"
+    printf "swap_detach_env=%s\n" "${SWAP_DETACH_ENV}"
     printf "notes=%s\n" "${notes}"
     printf "command=%q train.py --config %q %s\n" "${PYTHON}" "${config_path}" "${quoted_args}"
   } > "${ckpt_dir}/ablation_command.env"
@@ -338,6 +341,7 @@ echo "[ablation] dry_run=${DRY_RUN} seed=${SEED} device=${DEVICE} gpu=${GPU} cud
 echo "[ablation] ckpt_root=${PROJECT_DIR}/${CKPT_ROOT}"
 echo "[ablation] fpm_config=${FPEM_CONFIG} pure_config=${PURE_GRAPHWAVENET_CONFIG} fallback_dataset_config=${DATASET_CONFIG}"
 echo "[ablation] backbone=${BACKBONE} optimizer=${OPTIMIZER} lr=${LR} wd=${WEIGHT_DECAY} clip=${GRAD_CLIP} dropout=${DROPOUT}"
+echo "[ablation] swap_detach_env=${SWAP_DETACH_ENV}"
 echo "[ablation] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
 echo "[ablation] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
 echo "[ablation] selected=${selected_ablations[*]}"

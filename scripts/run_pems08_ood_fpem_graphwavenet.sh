@@ -23,6 +23,7 @@ LR_GAMMA="${LR_GAMMA:-0.5}"
 LAMBDA_ENVPRED="${LAMBDA_ENVPRED:-0.05}"
 LAMBDA_FUTURE_MI="${LAMBDA_FUTURE_MI:-0.01}"
 LAMBDA_SWAP="${LAMBDA_SWAP:-0.05}"
+SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
 LAMBDA_MASK_SPARSE="${LAMBDA_MASK_SPARSE:-1e-3}"
 SPARSE_TARGET="${SPARSE_TARGET:-0.3}"
 TRAIN_LOSS_SCALE="${TRAIN_LOSS_SCALE:-normalized}"
@@ -44,6 +45,7 @@ echo "[FPEM-GraphWaveNet-OOD] config=${CONFIG}"
 echo "[FPEM-GraphWaveNet-OOD] seeds=${SEEDS} device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
 echo "[FPEM-GraphWaveNet-OOD] backbone=${BACKBONE_NAME} batch_size=${BATCH_SIZE} lr=${LR} optimizer=${OPTIMIZER} wd=${WEIGHT_DECAY} clip=${GRAD_CLIP} dropout=${DROPOUT}"
 echo "[FPEM-GraphWaveNet-OOD] lambdas envpred=${LAMBDA_ENVPRED} future_mi=${LAMBDA_FUTURE_MI} swap=${LAMBDA_SWAP} mask_sparse=${LAMBDA_MASK_SPARSE} sparse_target=${SPARSE_TARGET}"
+echo "[FPEM-GraphWaveNet-OOD] swap_detach_env=${SWAP_DETACH_ENV}"
 echo "[FPEM-GraphWaveNet-OOD] train_loss_scale=${TRAIN_LOSS_SCALE} scheduler=${LR_SCHEDULER} milestones=${LR_MILESTONES} gamma=${LR_GAMMA}"
 echo "[FPEM-GraphWaveNet-OOD] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
 echo "[FPEM-GraphWaveNet-OOD] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
@@ -83,6 +85,7 @@ for seed in ${SEEDS}; do
     --set "LOSS.lambda_envpred=${LAMBDA_ENVPRED}" \
     --set "LOSS.lambda_future_mi=${LAMBDA_FUTURE_MI}" \
     --set "LOSS.lambda_swap=${LAMBDA_SWAP}" \
+    --set "LOSS.swap_detach_env=${SWAP_DETACH_ENV}" \
     --set "LOSS.lambda_mask_sparse=${LAMBDA_MASK_SPARSE}" \
     --set "LOSS.sparse_target=${SPARSE_TARGET}" \
     --set "LOSS.train_loss_scale=${TRAIN_LOSS_SCALE}" \

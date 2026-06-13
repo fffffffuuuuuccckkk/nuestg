@@ -45,7 +45,7 @@ class NUESTGLossConfig:
     swap_weight_mode: str = "sgain"
     swap_detach_inv: bool = True
     swap_detach_full: bool = True
-    swap_detach_env: bool = True
+    swap_detach_env: bool = False
     use_kl: bool = True
     lambda_kl: float = 1e-4
     kl_warmup_epochs: int = 5
