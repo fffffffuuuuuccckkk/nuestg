@@ -96,6 +96,7 @@ class NUESTGConfig(BasicTSModelConfig):
     fusion_hidden_dim: int = 64
     fusion_dropout: float = 0.1
     fusion_zero_init: bool = True
+    env_fusion_scale: float = 0.1
     env_transition_hidden_dim: int = 64
     env_transition_dropout: float = 0.1
     future_decoder_hidden_dim: int = 64
@@ -137,12 +138,14 @@ class LatentFusion(nn.Module):
         hidden_dim: int = 64,
         dropout: float = 0.1,
         zero_init: bool = True,
+        env_fusion_scale: float = 0.1,
     ) -> None:
         super().__init__()
         self.z_dim = int(z_dim)
         self.env_dim = int(env_dim)
         self.fusion_type = str(fusion_type or "film").lower()
-        if self.fusion_type == "film":
+        self.env_fusion_scale = float(env_fusion_scale)
+        if self.fusion_type in {"film", "weak_film"}:
             self.net = nn.Sequential(
                 nn.Linear(env_dim, hidden_dim),
                 nn.GELU(),
@@ -159,12 +162,26 @@ class LatentFusion(nn.Module):
         elif self.fusion_type == "gated_add":
             self.gate = nn.Sequential(nn.Linear(env_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, z_dim))
             self.delta = nn.Sequential(nn.Linear(env_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, z_dim))
+        elif self.fusion_type == "env_residual":
+            self.delta = nn.Sequential(
+                nn.Linear(env_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, z_dim),
+            )
         else:
             raise NotImplementedError(
-                f"MODEL.fusion_type={fusion_type!r} is not implemented; expected film, concat, or gated_add."
+                f"MODEL.fusion_type={fusion_type!r} is not implemented; "
+                "expected film, concat, gated_add, weak_film, or env_residual."
             )
         if zero_init:
-            modules = [self.net[-1]] if hasattr(self, "net") else [self.gate[-1], self.delta[-1]]
+            modules = []
+            if hasattr(self, "net"):
+                modules.append(self.net[-1])
+            if hasattr(self, "gate"):
+                modules.append(self.gate[-1])
+            if hasattr(self, "delta"):
+                modules.append(self.delta[-1])
             for module in modules:
                 if isinstance(module, nn.Linear):
                     nn.init.zeros_(module.weight)
@@ -183,10 +200,22 @@ class LatentFusion(nn.Module):
             gamma, beta = self.net(env).chunk(2, dim=-1)
             hidden = (1.0 + gamma) * z_inv + beta
             return {"hidden": hidden, "fusion_gamma": gamma, "fusion_beta": beta}
+        if self.fusion_type == "weak_film":
+            gamma, beta = self.net(env).chunk(2, dim=-1)
+            scale = self.env_fusion_scale
+            gamma_scaled = scale * torch.tanh(gamma)
+            beta_scaled = scale * torch.tanh(beta)
+            hidden = (1.0 + gamma_scaled) * z_inv + beta_scaled
+            return {"hidden": hidden, "fusion_gamma": gamma_scaled, "fusion_beta": beta_scaled}
         if self.fusion_type == "concat":
             hidden = self.net(torch.cat([z_inv, env], dim=-1))
             zeros = torch.zeros_like(z_inv)
             return {"hidden": hidden, "fusion_gamma": zeros, "fusion_beta": zeros}
+        if self.fusion_type == "env_residual":
+            delta = self.delta(env)
+            hidden = z_inv + self.env_fusion_scale * delta
+            zeros = torch.zeros_like(z_inv)
+            return {"hidden": hidden, "fusion_gamma": zeros, "fusion_beta": delta}
         gate = torch.sigmoid(self.gate(env))
         delta = self.delta(env)
         hidden = z_inv + gate * delta
@@ -374,6 +403,7 @@ class NUESTG(nn.Module):
             hidden_dim=config.fusion_hidden_dim,
             dropout=config.fusion_dropout,
             zero_init=config.fusion_zero_init,
+            env_fusion_scale=config.env_fusion_scale,
         )
         self.fpem_predictor = nn.Linear(self.representation_dim, config.output_len * config.output_dim)
         if self.inv_head_from_z.in_features == self.fpem_predictor.in_features and (

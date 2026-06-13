@@ -231,6 +231,7 @@ CONFIG = {
         "fusion_hidden_dim": 64,
         "fusion_dropout": 0.1,
         "fusion_zero_init": True,
+        "env_fusion_scale": 0.1,
         "env_transition_hidden_dim": 64,
         "env_transition_dropout": 0.1,
         "future_decoder_hidden_dim": 64,
