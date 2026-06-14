@@ -284,7 +284,9 @@ class GraphWaveNetFullBackbone(BaseBackbone):
         aptonly: bool = False,
         engine_pad_input: bool = True,
         use_time_of_day_channel: bool = True,
+        use_day_of_week_channel: bool = False,
         num_time_in_day: int = 288,
+        num_day_in_week: int = 7,
     ) -> None:
         super().__init__(input_len, output_len, num_nodes, input_dim, output_dim, representation_dim)
         del hidden_dim
@@ -292,7 +294,9 @@ class GraphWaveNetFullBackbone(BaseBackbone):
         self.out_dim = int(out_dim) if out_dim is not None else int(output_len * output_dim)
         self.engine_pad_input = bool(engine_pad_input)
         self.use_time_of_day_channel = bool(use_time_of_day_channel)
+        self.use_day_of_week_channel = bool(use_day_of_week_channel)
         self.num_time_in_day = int(num_time_in_day)
+        self.num_day_in_week = int(num_day_in_week)
         self.gcn_bool = bool(gcn_bool)
         self.addaptadj = bool(addaptadj)
         self.aptonly = bool(aptonly)
@@ -397,14 +401,31 @@ class GraphWaveNetFullBackbone(BaseBackbone):
         tod = tod.clamp(0.0, 1.0)
         return tod.unsqueeze(-1).unsqueeze(2).expand(-1, -1, num_nodes, -1)
 
+    def _dow_channel(self, seq_time: Optional[torch.Tensor], x: torch.Tensor) -> torch.Tensor:
+        batch_size, input_len, num_nodes, _ = x.shape
+        if seq_time is None or not self.use_day_of_week_channel:
+            return torch.zeros(batch_size, input_len, num_nodes, 1, device=x.device, dtype=x.dtype)
+        dow = seq_time
+        if dow.dim() == 2:
+            dow = dow.unsqueeze(-1)
+        if dow.dim() != 3 or dow.shape[1] != input_len or dow.shape[-1] < 2:
+            return torch.zeros(batch_size, input_len, num_nodes, 1, device=x.device, dtype=x.dtype)
+        dow = dow.to(device=x.device, dtype=x.dtype)[..., 1]
+        if dow.detach().numel() > 0 and dow.detach().max() > 1.0 + 1e-4:
+            dow = dow.remainder(max(self.num_day_in_week, 1)) / max(self.num_day_in_week, 1)
+        dow = dow.clamp(0.0, 1.0)
+        return dow.unsqueeze(-1).unsqueeze(2).expand(-1, -1, num_nodes, -1)
+
     def _prepare_input(self, x: torch.Tensor, seq_time: Optional[torch.Tensor]) -> torch.Tensor:
         if x.shape[-1] == self.in_dim:
             return x
         if x.shape[-1] > self.in_dim:
             return x[..., : self.in_dim]
         parts = [x]
-        if self.in_dim > x.shape[-1]:
+        if self.in_dim > sum(part.shape[-1] for part in parts) and self.use_time_of_day_channel:
             parts.append(self._tod_channel(seq_time, x))
+        if self.in_dim > sum(part.shape[-1] for part in parts) and self.use_day_of_week_channel:
+            parts.append(self._dow_channel(seq_time, x))
         h = torch.cat(parts, dim=-1)
         if h.shape[-1] < self.in_dim:
             h = F.pad(h, (0, self.in_dim - h.shape[-1]))

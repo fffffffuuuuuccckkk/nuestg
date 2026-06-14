@@ -87,6 +87,7 @@ def build_backbone(cfg: Any) -> BaseBackbone:
         gw_full_cfg = dict(backbone_cfg.get("graph_wavenet_full", {}) or {})
         gw_full_cfg.setdefault("adj_path", model_cfg.get("adj_path", ""))
         gw_full_cfg.setdefault("num_time_in_day", model_cfg.get("num_time_in_day", 288))
+        gw_full_cfg.setdefault("num_day_in_week", model_cfg.get("num_day_in_week", 7))
         if "representation_dim" in gw_full_cfg:
             common["representation_dim"] = int(gw_full_cfg.pop("representation_dim"))
         return GraphWaveNetFullBackbone(**common, **gw_full_cfg)

@@ -221,6 +221,7 @@ def finalize_config(cfg: Dict) -> Dict:
     swap_cfg = cfg.get("SWAP", {})
     cfg.setdefault("EVAL", {}).setdefault("horizon_metrics", True)
     cfg.setdefault("EVAL", {}).setdefault("save_test_diagnostics", False)
+    cfg.setdefault("EVAL", {}).setdefault("metric_aggregation", "batch_mean")
     metrics_cfg = cfg.setdefault("METRICS", {})
     metrics_cfg.setdefault("mape_threshold", 1.0)
     metrics_cfg.setdefault("mape_eps", 1e-5)
@@ -232,6 +233,7 @@ def finalize_config(cfg: Dict) -> Dict:
     scaler_cfg.setdefault("rescale", True)
     scaler_cfg.setdefault("eps", 1e-5)
     train_cfg.setdefault("no_decay_for_bias_norm_emb", False)
+    train_cfg.setdefault("torch_num_threads", None)
     train_cfg.setdefault("curriculum_enabled", False)
     train_cfg.setdefault("curriculum_start_horizon", 3)
     train_cfg.setdefault("curriculum_full_horizon_epoch", 30)
@@ -239,6 +241,7 @@ def finalize_config(cfg: Dict) -> Dict:
     train_cfg.setdefault("tf_decay_steps", 2000)
     loss_cfg.setdefault("warmup_epochs", 0)
     loss_cfg.setdefault("aux_ramp_epochs", 0)
+    loss_cfg.setdefault("mask_value_mode", cfg["DATASET"].get("mask_value_mode", "null_val"))
     loss_cfg.setdefault("peak_weight_enabled", False)
     loss_cfg.setdefault("peak_quantile", 0.75)
     loss_cfg.setdefault("peak_weight", 0.2)
@@ -400,6 +403,13 @@ def get_device(train_cfg: Dict) -> torch.device:
     return torch.device(requested)
 
 
+def configure_torch_runtime(train_cfg: Dict) -> None:
+    num_threads = train_cfg.get("torch_num_threads")
+    if num_threads in (None, "", False):
+        return
+    torch.set_num_threads(max(1, int(num_threads)))
+
+
 def build_dataset(cfg: Dict, split: str) -> BasicTSForecastingDataset:
     ds_cfg = cfg["DATASET"]
     maybe_generate_timestamp_file(ds_cfg["data_file_path"], split, ds_cfg)
@@ -428,6 +438,26 @@ def build_loader(cfg: Dict, split: str, shuffle: bool) -> DataLoader:
     )
 
 
+def resolve_target_mask_value(targets: torch.Tensor, cfg: Dict):
+    ds_cfg = cfg["DATASET"]
+    loss_cfg = cfg["LOSS"]
+    null_val = ds_cfg.get("null_val", loss_cfg.get("null_val"))
+    mode = str(loss_cfg.get("mask_value_mode", ds_cfg.get("mask_value_mode", "null_val")) or "null_val").lower()
+    if mode in {"null_val", "config", "default"}:
+        return null_val
+    if mode in {"stexpert_min", "st_expert_min", "batch_min_if_lt_one"}:
+        finite = targets.detach()[torch.isfinite(targets.detach())]
+        if finite.numel() > 0:
+            min_value = finite.min()
+            if min_value < 1:
+                return min_value.to(device=targets.device, dtype=targets.dtype)
+        return targets.new_tensor(0.0)
+    raise ValueError(
+        "LOSS.mask_value_mode must be 'null_val' or 'stexpert_min', "
+        f"got {mode!r}"
+    )
+
+
 def get_scaler_cfg(cfg: Dict) -> Dict:
     scaler_cfg = cfg.get("SCALER")
     if scaler_cfg is None:
@@ -442,6 +472,13 @@ def build_data_scaler(cfg: Dict, device: torch.device) -> ZScoreDataScaler:
     scaler_type = str(scaler_cfg.get("type", "zscore")).lower()
     if scaler_type not in {"zscore", "standard", "standardization"}:
         raise NotImplementedError(f"Only zscore/standard scaler is implemented, got {scaler_type!r}")
+    if scaler_cfg.get("mean") is not None and scaler_cfg.get("std") is not None:
+        return ZScoreDataScaler(
+            scaler_cfg["mean"],
+            scaler_cfg["std"],
+            enabled=True,
+            eps=float(scaler_cfg.get("eps", 1e-5)),
+        ).to(device)
     train_data = build_dataset(cfg, "train").data
     scaler = ZScoreDataScaler.fit(
         train_data,
@@ -464,7 +501,8 @@ def preprocess_batch(
     processed = dict(batch)
 
     inputs_mask = make_valid_mask(batch[input_key], null_val)
-    targets_mask = make_valid_mask(batch[target_key], null_val)
+    target_null_val = resolve_target_mask_value(batch[target_key], cfg)
+    targets_mask = make_valid_mask(batch[target_key], target_null_val)
     inputs_scaled = data_scaler.transform(batch[input_key], inputs_mask)
     targets_scaled = data_scaler.transform(batch[target_key], targets_mask)
 
@@ -666,6 +704,11 @@ def describe_backbone_features(model: NUESTG) -> Dict[str, bool]:
             and int(getattr(backbone, "in_dim", getattr(backbone, "input_dim", 0)))
             > int(getattr(backbone, "input_dim", 0))
         ),
+        "day_of_week_channel": bool(
+            getattr(backbone, "use_day_of_week_channel", False)
+            and int(getattr(backbone, "in_dim", getattr(backbone, "input_dim", 0)))
+            > int(getattr(backbone, "input_dim", 0)) + 1
+        ),
     }
 
 
@@ -859,6 +902,7 @@ def print_metric_debug_diagnostics(
 def debug_batch(cfg: Dict) -> None:
     cfg = finalize_config(cfg)
     train_cfg = cfg["TRAIN"]
+    configure_torch_runtime(train_cfg)
     set_seed(train_cfg["seed"])
     device = get_device(train_cfg)
     data_scaler = build_data_scaler(cfg, device)
@@ -889,10 +933,12 @@ def debug_batch(cfg: Dict) -> None:
     print(f"backbone_uses_time_of_day_embedding: {backbone_features['time_of_day_embedding']}")
     print(f"backbone_uses_day_of_week_embedding: {backbone_features['day_of_week_embedding']}")
     print(f"backbone_uses_time_of_day_channel: {backbone_features['time_of_day_channel']}")
+    print(f"backbone_uses_day_of_week_channel: {backbone_features['day_of_week_channel']}")
     if cfg["MODEL"].get("required_timestamp", False) and not (
         backbone_features["time_of_day_embedding"]
         or backbone_features["day_of_week_embedding"]
         or backbone_features["time_of_day_channel"]
+        or backbone_features["day_of_week_channel"]
     ):
         print(
             "WARNING: current backbone does not consume TOD/DOW identity embeddings directly; "
@@ -929,6 +975,7 @@ def debug_batch(cfg: Dict) -> None:
         f"enabled={scaler_summary['enabled']} "
         f"mean={scaler_summary['mean']:.6f} std={scaler_summary['std']:.6f}"
     )
+    print(f"mask_value_mode: {cfg['LOSS'].get('mask_value_mode', 'null_val')}")
     print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
     print(f"{target_key}_raw: {tuple(raw_batch[target_key].shape)}")
     print(f"{input_key}_scaled: {tuple(batch[input_key].shape)}")
@@ -1177,6 +1224,11 @@ def evaluate(
     target_key = cfg["DATASET"].get("target_key", "targets")
     null_val = cfg["DATASET"].get("null_val", cfg["LOSS"].get("null_val"))
     full_eval = max_batches is None or int(max_batches) < 0
+    metric_aggregation = str(cfg.get("EVAL", {}).get("metric_aggregation", "batch_mean") or "batch_mean").lower()
+    concat_eval = metric_aggregation in {"concat", "stexpert", "stexpert_concat"}
+    pred_chunks = []
+    target_chunks = []
+    mask_chunks = []
     needs_future_time = bool(
         cfg["MODEL"].get("required_timestamp", False)
         or str(cfg["MODEL"].get("method_variant", "")).lower() == "fpem"
@@ -1192,6 +1244,12 @@ def evaluate(
         )
         prediction = data_scaler.inverse_transform(output["prediction"])
         targets = raw_batch[target_key]
+        if concat_eval:
+            pred_chunks.append(prediction.detach())
+            target_chunks.append(targets.detach())
+            if isinstance(batch.get("targets_mask"), torch.Tensor):
+                mask_chunks.append(batch["targets_mask"].detach())
+            continue
         batch_metrics = compute_metric_dict(
             prediction,
             targets,
@@ -1202,6 +1260,18 @@ def evaluate(
         for key, value in batch_metrics.items():
             values.setdefault(key, []).append(value)
     model.train()
+    if concat_eval:
+        if not pred_chunks:
+            return {"mae": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mape": float("nan"), "wape": float("nan")}
+        prediction = torch.cat(pred_chunks, dim=0)
+        targets = torch.cat(target_chunks, dim=0)
+        existing_mask = torch.cat(mask_chunks, dim=0) if len(mask_chunks) == len(pred_chunks) else None
+        metric_null_val = null_val
+        mode = str(cfg["LOSS"].get("mask_value_mode", cfg["DATASET"].get("mask_value_mode", "null_val")) or "null_val").lower()
+        if mode in {"stexpert_min", "st_expert_min", "batch_min_if_lt_one"}:
+            metric_null_val = resolve_target_mask_value(targets, cfg)
+            existing_mask = None
+        return compute_metric_dict(prediction, targets, metric_null_val, existing_mask, cfg.get("METRICS", {}))
     if not values.get("mae"):
         return {"mae": float("nan"), "mse": float("nan"), "rmse": float("nan"), "mape": float("nan"), "wape": float("nan")}
     result = {key: float(np.mean(item_values)) for key, item_values in values.items()}
@@ -1594,6 +1664,7 @@ def append_train_log(cfg: Dict, row: Dict) -> None:
 def train_local(cfg: Dict) -> None:
     cfg = finalize_config(cfg)
     train_cfg = cfg["TRAIN"]
+    configure_torch_runtime(train_cfg)
     set_seed(train_cfg["seed"])
     device = get_device(train_cfg)
     data_scaler = build_data_scaler(cfg, device)

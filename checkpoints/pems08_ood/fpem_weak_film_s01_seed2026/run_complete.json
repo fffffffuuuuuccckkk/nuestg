@@ -1,0 +1,14 @@
+{
+  "best_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood/fpem_weak_film_s01_seed2026/best_metrics.json",
+  "best_score": 23.077246061393193,
+  "best_select_metric": "mae",
+  "best_select_split": "test",
+  "best_test_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood/fpem_weak_film_s01_seed2026/best_test_metrics.json",
+  "best_val": 23.077246061393193,
+  "epoch": 49,
+  "global_step": 16366,
+  "last_checkpoint_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood/fpem_weak_film_s01_seed2026/last.pt",
+  "status": "complete",
+  "stopped_early": true,
+  "target_epochs": 100
+}

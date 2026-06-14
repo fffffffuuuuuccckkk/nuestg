@@ -21,6 +21,7 @@ class NUESTGLossConfig:
     loss_type: str = "mae"
     use_masked_mae: bool = True
     null_val: Optional[float] = None
+    mask_value_mode: str = "null_val"
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
     aux_ramp_epochs: int = 0
