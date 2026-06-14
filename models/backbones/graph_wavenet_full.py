@@ -455,7 +455,7 @@ class GraphWaveNetFullBackbone(BaseBackbone):
         raw_out, rep = self.model.forward_with_representation(x_gw)
         raw_last = raw_out[..., -1]
         y_inv = raw_last.view(batch_size, self.output_len, self.output_dim, self.num_nodes).permute(0, 1, 3, 2)
-        node_hidden = rep[..., -1].transpose(1, 2)
-        z_inv = self.representation_proj(node_hidden)
+        z_seq = self.representation_proj(rep.permute(0, 3, 2, 1).contiguous())
+        z_inv = z_seq[:, -1]
         self._assert_outputs(z_inv, y_inv, batch_size)
-        return {"z_inv": z_inv, "y_inv": y_inv}
+        return {"z_inv": z_inv, "z_seq": z_seq, "y_inv": y_inv}

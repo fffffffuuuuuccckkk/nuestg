@@ -728,6 +728,7 @@ class NUESTG(nn.Module):
             future_time=future_time,
         )
         z_raw = self._apply_time_to_z(backbone_out["z_inv"], time_out["cur_time_emb"])
+        z_seq = backbone_out.get("z_seq")
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(
             x,
@@ -869,6 +870,7 @@ class NUESTG(nn.Module):
             "rho": rho,
             "z_inv": z_inv,
             "z_raw": z_raw,
+            "z_seq": z_seq,
             "env_mu": env_mu_tokens,
             "env_logvar": env_logvar_tokens,
             "env": env_hist,
@@ -973,6 +975,7 @@ class NUESTG(nn.Module):
             future_time=future_time,
         )
         z_raw = backbone_out["z_inv"]
+        z_seq = backbone_out.get("z_seq")
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu, env_logvar, env_raw = self.env_encoder(x, adj)
         sep_out = self.separation(x=x, z_raw=z_raw, env_raw=env_raw, y_inv_raw=y_inv_raw)
@@ -1052,6 +1055,7 @@ class NUESTG(nn.Module):
             "rho": rho,
             "z_inv": z_inv,
             "z_raw": z_raw,
+            "z_seq": z_seq,
             "env_mu": env_mu,
             "env_logvar": env_logvar,
             "env": env,

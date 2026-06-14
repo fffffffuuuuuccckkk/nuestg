@@ -28,6 +28,18 @@ SWAP_FREEZE_PREDICTOR="${SWAP_FREEZE_PREDICTOR:-true}"
 LAMBDA_MASK_SPARSE="${LAMBDA_MASK_SPARSE:-1e-3}"
 SPARSE_TARGET="${SPARSE_TARGET:-0.3}"
 TRAIN_LOSS_SCALE="${TRAIN_LOSS_SCALE:-normalized}"
+GRAD_CONSENSUS_ENABLED="${GRAD_CONSENSUS_ENABLED:-false}"
+GRAD_CONSENSUS_TARGET="${GRAD_CONSENSUS_TARGET:-z_seq}"
+GRAD_CONSENSUS_APPLY_TO="${GRAD_CONSENSUS_APPLY_TO:-inv_branch}"
+GRAD_CONSENSUS_MODE="${GRAD_CONSENSUS_MODE:-time_channel}"
+GRAD_CONSENSUS_RHO_MAX="${GRAD_CONSENSUS_RHO_MAX:-0.1}"
+GRAD_CONSENSUS_GAMMA="${GRAD_CONSENSUS_GAMMA:-1.0}"
+GRAD_CONSENSUS_EMA_BETA="${GRAD_CONSENSUS_EMA_BETA:-0.95}"
+GRAD_CONSENSUS_WARMUP_EPOCHS="${GRAD_CONSENSUS_WARMUP_EPOCHS:-10}"
+GRAD_CONSENSUS_EPS="${GRAD_CONSENSUS_EPS:-1e-8}"
+GRAD_CONSENSUS_USE_EMA="${GRAD_CONSENSUS_USE_EMA:-true}"
+GRAD_CONSENSUS_LOSS_TYPE="${GRAD_CONSENSUS_LOSS_TYPE:-mse}"
+GRAD_CONSENSUS_LOG_STATS="${GRAD_CONSENSUS_LOG_STATS:-true}"
 AUTO_RESUME="${AUTO_RESUME:-true}"
 RESUME_FROM="${RESUME_FROM:-auto}"
 SKIP_COMPLETED="${SKIP_COMPLETED:-true}"
@@ -48,6 +60,7 @@ echo "[FPEM-GraphWaveNet-OOD] backbone=${BACKBONE_NAME} batch_size=${BATCH_SIZE}
 echo "[FPEM-GraphWaveNet-OOD] lambdas envpred=${LAMBDA_ENVPRED} future_mi=${LAMBDA_FUTURE_MI} swap=${LAMBDA_SWAP} mask_sparse=${LAMBDA_MASK_SPARSE} sparse_target=${SPARSE_TARGET}"
 echo "[FPEM-GraphWaveNet-OOD] swap_detach_env=${SWAP_DETACH_ENV} swap_freeze_predictor=${SWAP_FREEZE_PREDICTOR}"
 echo "[FPEM-GraphWaveNet-OOD] train_loss_scale=${TRAIN_LOSS_SCALE} scheduler=${LR_SCHEDULER} milestones=${LR_MILESTONES} gamma=${LR_GAMMA}"
+echo "[FPEM-GraphWaveNet-OOD] grad_consensus enabled=${GRAD_CONSENSUS_ENABLED} target=${GRAD_CONSENSUS_TARGET} mode=${GRAD_CONSENSUS_MODE} rho_max=${GRAD_CONSENSUS_RHO_MAX} gamma=${GRAD_CONSENSUS_GAMMA} ema_beta=${GRAD_CONSENSUS_EMA_BETA} warmup=${GRAD_CONSENSUS_WARMUP_EPOCHS}"
 echo "[FPEM-GraphWaveNet-OOD] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
 echo "[FPEM-GraphWaveNet-OOD] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC}"
 
@@ -91,6 +104,18 @@ for seed in ${SEEDS}; do
     --set "LOSS.lambda_mask_sparse=${LAMBDA_MASK_SPARSE}" \
     --set "LOSS.sparse_target=${SPARSE_TARGET}" \
     --set "LOSS.train_loss_scale=${TRAIN_LOSS_SCALE}" \
+    --set "LOSS.grad_consensus.enabled=${GRAD_CONSENSUS_ENABLED}" \
+    --set "LOSS.grad_consensus.target=${GRAD_CONSENSUS_TARGET}" \
+    --set "LOSS.grad_consensus.apply_to=${GRAD_CONSENSUS_APPLY_TO}" \
+    --set "LOSS.grad_consensus.mode=${GRAD_CONSENSUS_MODE}" \
+    --set "LOSS.grad_consensus.rho_max=${GRAD_CONSENSUS_RHO_MAX}" \
+    --set "LOSS.grad_consensus.gamma=${GRAD_CONSENSUS_GAMMA}" \
+    --set "LOSS.grad_consensus.ema_beta=${GRAD_CONSENSUS_EMA_BETA}" \
+    --set "LOSS.grad_consensus.warmup_epochs=${GRAD_CONSENSUS_WARMUP_EPOCHS}" \
+    --set "LOSS.grad_consensus.eps=${GRAD_CONSENSUS_EPS}" \
+    --set "LOSS.grad_consensus.use_ema=${GRAD_CONSENSUS_USE_EMA}" \
+    --set "LOSS.grad_consensus.loss_type=${GRAD_CONSENSUS_LOSS_TYPE}" \
+    --set "LOSS.grad_consensus.log_stats=${GRAD_CONSENSUS_LOG_STATS}" \
     --set "METRICS.mape_threshold=1.0" \
     --set "METRICS.mape_eps=1e-5" \
     --set "METRICS.mape_as_percent=true" \

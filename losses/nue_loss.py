@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -22,6 +22,7 @@ class NUESTGLossConfig:
     use_masked_mae: bool = True
     null_val: Optional[float] = None
     mask_value_mode: str = "null_val"
+    grad_consensus: Dict = field(default_factory=dict)
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
     aux_ramp_epochs: int = 0

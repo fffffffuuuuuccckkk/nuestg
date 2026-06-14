@@ -7,7 +7,7 @@ import random
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,12 +17,14 @@ from basicts.data import BasicTSForecastingDataset
 
 from losses import NUESTGLoss, make_basicts_loss, nue_mae_metric
 from models import NUESTG, NUESTGConfig
+from models.backbones import build_backbone
 from models.backbones.official_utils import OfficialBaselineSkip
 from utils import (
     AverageMeterDict,
     align_target,
     append_csv_log,
     assert_finite,
+    ensure_blnc,
     format_logs,
     masked_mae_value,
     masked_mape_value,
@@ -138,6 +140,14 @@ LOG_KEYS = [
     "seq_time_emb_norm",
     "future_time_emb_norm",
     "backbone_aux_loss",
+    "grad_consensus/agree_mean",
+    "grad_consensus/agree_std",
+    "grad_consensus/agree_min",
+    "grad_consensus/agree_max",
+    "grad_consensus/rho_mean",
+    "grad_consensus/rho_max",
+    "grad_consensus/using_fallback_z_inv",
+    "grad_consensus/ema_agree_mean",
     "curriculum_horizon",
     "cast_vq_loss",
     "cast_commit_loss",
@@ -242,6 +252,19 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("warmup_epochs", 0)
     loss_cfg.setdefault("aux_ramp_epochs", 0)
     loss_cfg.setdefault("mask_value_mode", cfg["DATASET"].get("mask_value_mode", "null_val"))
+    grad_consensus_cfg = loss_cfg.setdefault("grad_consensus", {})
+    grad_consensus_cfg.setdefault("enabled", False)
+    grad_consensus_cfg.setdefault("target", "z_seq")
+    grad_consensus_cfg.setdefault("apply_to", "inv_branch")
+    grad_consensus_cfg.setdefault("mode", "time_channel")
+    grad_consensus_cfg.setdefault("rho_max", 0.1)
+    grad_consensus_cfg.setdefault("gamma", 1.0)
+    grad_consensus_cfg.setdefault("ema_beta", 0.95)
+    grad_consensus_cfg.setdefault("warmup_epochs", 10)
+    grad_consensus_cfg.setdefault("eps", 1e-8)
+    grad_consensus_cfg.setdefault("use_ema", True)
+    grad_consensus_cfg.setdefault("loss_type", "mse")
+    grad_consensus_cfg.setdefault("log_stats", True)
     loss_cfg.setdefault("peak_weight_enabled", False)
     loss_cfg.setdefault("peak_quantile", 0.75)
     loss_cfg.setdefault("peak_weight", 0.2)
@@ -548,8 +571,262 @@ def get_time_kwargs(batch: Dict[str, torch.Tensor], cfg: Dict, include_future: b
     return out
 
 
-def build_model_and_loss(cfg: Dict, device: torch.device) -> Tuple[NUESTG, NUESTGLoss]:
-    model = NUESTG(NUESTGConfig(**cfg["MODEL"])).to(device)
+class TimeChannelSoftGradientConsensus:
+    """Gradient-level TC-SGC regularizer for invariant representations.
+
+    TC-SGC does not construct environments or add an explicit loss. It estimates
+    a batch-level time-channel consensus direction from the incoming prediction
+    gradient and softly interpolates the original gradient toward that direction.
+    Low-agreement positions keep most of their original gradient; no feature is
+    hard-masked, thresholded, or removed.
+    """
+
+    def __init__(self, cfg: Optional[Dict]) -> None:
+        cfg = cfg or {}
+        self.enabled = bool(cfg.get("enabled", False))
+        self.target = str(cfg.get("target", "z_seq") or "z_seq")
+        self.apply_to = str(cfg.get("apply_to", "inv_branch") or "inv_branch")
+        self.mode = str(cfg.get("mode", "time_channel") or "time_channel")
+        self.rho_max = max(0.0, float(cfg.get("rho_max", 0.1)))
+        self.gamma = max(0.0, float(cfg.get("gamma", 1.0)))
+        self.ema_beta = min(max(float(cfg.get("ema_beta", 0.95)), 0.0), 0.999999)
+        self.warmup_epochs = int(cfg.get("warmup_epochs", 10))
+        self.eps = max(float(cfg.get("eps", 1e-8)), 1e-12)
+        self.use_ema = bool(cfg.get("use_ema", True))
+        self.log_stats = bool(cfg.get("log_stats", True))
+        self.loss_type = str(cfg.get("loss_type", "mse") or "mse")
+        self.ema: Optional[torch.Tensor] = None
+        self.latest_stats = self._empty_stats(False)
+        self._warned: set[str] = set()
+
+    @staticmethod
+    def _empty_stats(using_fallback: bool) -> Dict[str, float]:
+        return {
+            "grad_consensus/agree_mean": 0.0,
+            "grad_consensus/agree_std": 0.0,
+            "grad_consensus/agree_min": 0.0,
+            "grad_consensus/agree_max": 0.0,
+            "grad_consensus/rho_mean": 0.0,
+            "grad_consensus/rho_max": 0.0,
+            "grad_consensus/using_fallback_z_inv": float(using_fallback),
+            "grad_consensus/ema_agree_mean": 0.0,
+        }
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key not in self._warned:
+            warnings.warn(message, RuntimeWarning)
+            self._warned.add(key)
+
+    def _to_btnd(self, grad: torch.Tensor):
+        if grad.dim() == 3:
+            return grad.unsqueeze(1), lambda item: item.squeeze(1)
+        if grad.dim() != 4:
+            return None, None
+        # Expected z_seq is [B,T,N,D]. Some backbones may expose [B,D,N,T];
+        # use the channel/time size heuristic and restore the original layout.
+        if grad.shape[1] > grad.shape[-1]:
+            return grad.permute(0, 3, 2, 1).contiguous(), lambda item: item.permute(0, 3, 2, 1).contiguous()
+        return grad, lambda item: item
+
+    def _make_hook(self, current_epoch: Optional[int], using_fallback: bool):
+        def hook(grad: torch.Tensor) -> torch.Tensor:
+            if grad is None:
+                return grad
+            if current_epoch is not None and int(current_epoch) <= self.warmup_epochs:
+                self.latest_stats = self._empty_stats(using_fallback)
+                return grad
+            with torch.no_grad():
+                grad_btnd, restore = self._to_btnd(grad)
+                if grad_btnd is None or restore is None:
+                    self._warn_once(
+                        "bad_grad_shape",
+                        f"TC-SGC expected grad rank 3 or 4, got {tuple(grad.shape)}; skipping consensus.",
+                    )
+                    self.latest_stats = self._empty_stats(using_fallback)
+                    return grad
+
+                grad_float = grad_btnd.detach().float()
+                sign_g = grad_float.sign()
+                if self.mode == "time_channel":
+                    m_td = sign_g.mean(dim=(0, 2))
+                elif self.mode == "channel":
+                    m_d = sign_g.mean(dim=(0, 1, 2))
+                    m_td = m_d.unsqueeze(0).expand(grad_float.shape[1], -1)
+                else:
+                    self._warn_once(
+                        "bad_mode",
+                        f"TC-SGC mode={self.mode!r} is unsupported; expected 'time_channel' or 'channel'.",
+                    )
+                    self.latest_stats = self._empty_stats(using_fallback)
+                    return grad
+
+                if self.use_ema:
+                    if self.ema is None or tuple(self.ema.shape) != tuple(m_td.shape):
+                        self.ema = torch.zeros_like(m_td)
+                    self.ema = self.ema.to(device=m_td.device, dtype=m_td.dtype)
+                    self.ema.mul_(self.ema_beta).add_(m_td.detach(), alpha=1.0 - self.ema_beta)
+                    consensus_map = self.ema
+                else:
+                    consensus_map = m_td.detach()
+
+                agreement = consensus_map.abs().clamp(0.0, 1.0)
+                direction = consensus_map.sign()
+                rho = (self.rho_max * agreement.clamp_min(0.0).pow(self.gamma)).clamp(0.0, self.rho_max)
+
+                view_shape = (1, agreement.shape[0], 1, agreement.shape[1])
+                consensus_grad = grad_float.abs() * direction.view(view_shape)
+                rho_view = rho.view(view_shape)
+                new_grad = (1.0 - rho_view) * grad_float + rho_view * consensus_grad
+
+                if self.log_stats:
+                    agreement_cpu = agreement.detach().cpu()
+                    rho_cpu = rho.detach().cpu()
+                    self.latest_stats = {
+                        "grad_consensus/agree_mean": float(agreement_cpu.mean()),
+                        "grad_consensus/agree_std": float(agreement_cpu.std(unbiased=False)),
+                        "grad_consensus/agree_min": float(agreement_cpu.min()),
+                        "grad_consensus/agree_max": float(agreement_cpu.max()),
+                        "grad_consensus/rho_mean": float(rho_cpu.mean()),
+                        "grad_consensus/rho_max": float(rho_cpu.max()),
+                        "grad_consensus/using_fallback_z_inv": float(using_fallback),
+                        "grad_consensus/ema_agree_mean": (
+                            float(self.ema.detach().abs().mean().cpu()) if self.use_ema and self.ema is not None else 0.0
+                        ),
+                    }
+                return restore(new_grad.to(dtype=grad.dtype))
+
+        return hook
+
+    def register(self, z_tensor: Optional[torch.Tensor], current_epoch: Optional[int] = None, using_fallback: bool = False):
+        self.latest_stats = self._empty_stats(using_fallback)
+        if not self.enabled:
+            return None
+        if self.apply_to != "inv_branch":
+            self._warn_once("apply_to", "TC-SGC currently supports apply_to='inv_branch' only; skipping consensus.")
+            return None
+        if not isinstance(z_tensor, torch.Tensor):
+            self._warn_once("missing_tensor", "TC-SGC target tensor is missing; skipping consensus.")
+            return None
+        if not z_tensor.requires_grad:
+            self._warn_once("no_grad", "TC-SGC target tensor does not require grad; skipping consensus.")
+            return None
+        # First implementation operates on the total gradient arriving at the
+        # invariant representation. In current FPEM this includes the y_inv
+        # auxiliary prediction path and any other enabled losses that flow into
+        # z; no second backward pass or explicit loss is introduced.
+        return z_tensor.register_hook(self._make_hook(current_epoch, using_fallback))
+
+    def log_tensors(self, like: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if not self.enabled or not self.log_stats:
+            return {}
+        return {
+            key: like.new_tensor(float(value))
+            for key, value in self.latest_stats.items()
+        }
+
+
+def register_grad_consensus_hook(
+    output: Dict[str, torch.Tensor],
+    grad_consensus: TimeChannelSoftGradientConsensus,
+    epoch: Optional[int],
+) -> None:
+    if not grad_consensus.enabled:
+        return
+    grad_consensus.latest_stats = grad_consensus._empty_stats(False)
+    target = grad_consensus.target
+    using_fallback = False
+    z_tensor = output.get(target)
+    if target == "z_seq" and not isinstance(z_tensor, torch.Tensor):
+        z_tensor = output.get("z_inv")
+        using_fallback = True
+        grad_consensus._warn_once(
+            "fallback_z_inv",
+            "TC-SGC target z_seq is unavailable; falling back to z_inv as T=1.",
+        )
+    elif target == "z_inv":
+        z_tensor = output.get("z_inv")
+    if not isinstance(z_tensor, torch.Tensor):
+        grad_consensus.latest_stats = grad_consensus._empty_stats(using_fallback)
+        grad_consensus._warn_once("missing_target", f"TC-SGC target {target!r} is unavailable; skipping consensus.")
+        return
+    grad_consensus.register(z_tensor, current_epoch=epoch, using_fallback=using_fallback)
+
+
+class BackboneOnlyForecastModel(torch.nn.Module):
+    """Forecast directly from the configured backbone without NUE/FPEM modules."""
+
+    def __init__(self, model_cfg: Dict) -> None:
+        super().__init__()
+        self.model_cfg = dict(model_cfg)
+        self.backbone = build_backbone({"MODEL": model_cfg})
+        self.output_len = int(model_cfg["output_len"])
+        self.output_dim = int(model_cfg["output_dim"])
+        self.env_dim = int(model_cfg.get("env_dim", 1))
+        self.baseline_name = model_cfg.get("baseline_name") or model_cfg.get("name") or model_cfg.get("backbone_name", "")
+        self.reference_status = model_cfg.get("reference_status", "")
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        y_true: torch.Tensor | None = None,
+        seq_time: torch.Tensor | None = None,
+        cur_time: torch.Tensor | None = None,
+        future_time: torch.Tensor | None = None,
+        **kwargs,
+    ) -> Dict[str, torch.Tensor | None]:
+        del y_true, kwargs
+        x = ensure_blnc(inputs, "inputs")
+        backbone_out = self.backbone(
+            x,
+            seq_time=seq_time,
+            cur_time=cur_time,
+            future_time=future_time,
+        )
+        prediction = backbone_out["y_inv"]
+        z_inv = backbone_out["z_inv"]
+        batch_size, _, num_nodes, _ = prediction.shape
+        env = prediction.new_zeros(batch_size, num_nodes, self.env_dim)
+        rho = prediction.new_zeros(batch_size, self.output_len, num_nodes, 1)
+        r_env = prediction.new_zeros(batch_size, self.output_len, num_nodes, self.output_dim)
+        return {
+            "method_variant": "backbone_only",
+            "baseline_name": self.baseline_name,
+            "reference_status": self.reference_status,
+            "prediction": prediction,
+            "y_inv": prediction,
+            "y_potential": prediction,
+            "r_env": r_env,
+            "rho": rho,
+            "z_inv": z_inv,
+            "z_raw": z_inv,
+            "env_mu": env,
+            "env_logvar": env,
+            "env": env,
+            "env_hist": env,
+            "env_raw": env,
+            "y_inv_raw": prediction,
+            "separation_mode": "none",
+            "separation_extra": {},
+            "env_fut": None,
+            "persist_q": None,
+            "persist_k": None,
+            "persist_score": None,
+            "persistence_enabled": False,
+            "prediction_swap": None,
+            "rho_swap": None,
+            "env_perm": None,
+            "env_perm_index": None,
+            "backbone_aux_losses": backbone_out.get("backbone_aux_losses", {}),
+            "backbone_aux_weights": backbone_out.get("backbone_aux_weights", {}),
+        }
+
+
+def build_model_and_loss(cfg: Dict, device: torch.device) -> Tuple[torch.nn.Module, NUESTGLoss]:
+    method_variant = str(cfg["MODEL"].get("method_variant", "nue") or "nue").lower()
+    if method_variant in {"backbone_only", "backbone", "graphwavenet_only", "pure_graphwavenet"}:
+        model = BackboneOnlyForecastModel(cfg["MODEL"]).to(device)
+    else:
+        model = NUESTG(NUESTGConfig(**cfg["MODEL"])).to(device)
     loss_fn = NUESTGLoss(**cfg["LOSS"]).to(device)
     return model, loss_fn
 
@@ -754,6 +1031,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
                 raise AssertionError(f"{key} expected {expected_shape}, got {tuple(value.shape)}")
             assert_finite(value, key)
         for key in [
+            "z_seq",
             "env_fut",
             "env_fut_tokens",
             "env_fut_mu_tokens",
@@ -799,7 +1077,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         if tuple(value.shape) != expected_shape:
             raise AssertionError(f"{key} expected {expected_shape}, got {tuple(value.shape)}")
         assert_finite(value, key)
-    for key in ["prediction_swap", "rho_swap", "env_perm"]:
+    for key in ["z_seq", "prediction_swap", "rho_swap", "env_perm"]:
         value = output.get(key)
         if value is None:
             print(f"{key}: None")
@@ -914,6 +1192,7 @@ def debug_batch(cfg: Dict) -> None:
         print(f"reference_status: {exc.reference_status}")
         print(f"unsupported_reason: {exc.reason}")
         return
+    grad_consensus = TimeChannelSoftGradientConsensus(cfg["LOSS"].get("grad_consensus", {}))
     loss_fn.set_epoch(1)
     model.train()
 
@@ -976,6 +1255,15 @@ def debug_batch(cfg: Dict) -> None:
         f"mean={scaler_summary['mean']:.6f} std={scaler_summary['std']:.6f}"
     )
     print(f"mask_value_mode: {cfg['LOSS'].get('mask_value_mode', 'null_val')}")
+    print(
+        "grad_consensus: "
+        f"enabled={grad_consensus.enabled} "
+        f"target={grad_consensus.target} "
+        f"mode={grad_consensus.mode} "
+        f"rho_max={grad_consensus.rho_max} "
+        f"warmup_epochs={grad_consensus.warmup_epochs} "
+        f"use_ema={grad_consensus.use_ema}"
+    )
     print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
     print(f"{target_key}_raw: {tuple(raw_batch[target_key].shape)}")
     print(f"{input_key}_scaled: {tuple(batch[input_key].shape)}")
@@ -1006,6 +1294,7 @@ def debug_batch(cfg: Dict) -> None:
         y_true=batch[target_key],
         **get_time_kwargs(batch, cfg, include_future=True),
     )
+    register_grad_consensus_hook(output, grad_consensus, epoch=1)
     check_output_shapes(output, batch[target_key], cfg)
     debug_horizon = curriculum_horizon(train_cfg, 1, cfg["DATASET"]["output_len"])
     loss_output, loss_targets, loss_mask, loss_raw_targets = slice_for_train_horizon(
@@ -1061,6 +1350,7 @@ def debug_batch(cfg: Dict) -> None:
         )
     logs["curriculum_horizon"] = output["prediction"].new_tensor(float(debug_horizon))
     loss.backward()
+    logs.update(grad_consensus.log_tensors(output["prediction"]))
     assert_finite(loss, "total_loss")
     assert_finite(output["rho"], "rho")
     pred_original = data_scaler.inverse_transform(output["prediction"])
@@ -1682,6 +1972,7 @@ def train_local(cfg: Dict) -> None:
         return
     optimizer = build_optimizer(cfg, model)
     lr_scheduler = build_lr_scheduler(cfg, optimizer)
+    grad_consensus = TimeChannelSoftGradientConsensus(cfg["LOSS"].get("grad_consensus", {}))
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", False) and device.type == "cuda")
     autocast_ctx = (
         torch.cuda.amp.autocast
@@ -1762,6 +2053,7 @@ def train_local(cfg: Dict) -> None:
                     y_true=batch[target_key],
                     **get_time_kwargs(batch, cfg, include_future=True),
                 )
+                register_grad_consensus_hook(output, grad_consensus, epoch=epoch)
                 train_horizon = curriculum_horizon(train_cfg, epoch, cfg["DATASET"]["output_len"])
                 loss_output, loss_targets, loss_mask, loss_raw_targets = slice_for_train_horizon(
                     output,
@@ -1779,6 +2071,7 @@ def train_local(cfg: Dict) -> None:
                 )
                 logs["curriculum_horizon"] = output["prediction"].new_tensor(float(train_horizon))
             scaler.scale(loss).backward()
+            logs.update(grad_consensus.log_tensors(output["prediction"]))
             grad_clip = train_cfg.get("grad_clip")
             if grad_clip:
                 scaler.unscale_(optimizer)

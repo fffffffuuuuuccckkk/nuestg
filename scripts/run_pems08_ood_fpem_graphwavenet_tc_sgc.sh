@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${PROJECT_DIR:-/data/OuXiaoyu/mystg/nue_stg_project}"
+
+export PROJECT_DIR
+export CKPT_ROOT="${CKPT_ROOT:-${PROJECT_DIR}/checkpoints/pems08_ood_graphwavenet_ablation}"
+export CKPT_NAME_PREFIX="${CKPT_NAME_PREFIX:-fpem_z_tc_sgc}"
+export GRAD_CONSENSUS_ENABLED="${GRAD_CONSENSUS_ENABLED:-true}"
+export GRAD_CONSENSUS_TARGET="${GRAD_CONSENSUS_TARGET:-z_seq}"
+export GRAD_CONSENSUS_APPLY_TO="${GRAD_CONSENSUS_APPLY_TO:-inv_branch}"
+export GRAD_CONSENSUS_MODE="${GRAD_CONSENSUS_MODE:-time_channel}"
+export GRAD_CONSENSUS_RHO_MAX="${GRAD_CONSENSUS_RHO_MAX:-0.1}"
+export GRAD_CONSENSUS_GAMMA="${GRAD_CONSENSUS_GAMMA:-1.0}"
+export GRAD_CONSENSUS_EMA_BETA="${GRAD_CONSENSUS_EMA_BETA:-0.95}"
+export GRAD_CONSENSUS_WARMUP_EPOCHS="${GRAD_CONSENSUS_WARMUP_EPOCHS:-10}"
+export GRAD_CONSENSUS_EPS="${GRAD_CONSENSUS_EPS:-1e-8}"
+export GRAD_CONSENSUS_USE_EMA="${GRAD_CONSENSUS_USE_EMA:-true}"
+export GRAD_CONSENSUS_LOSS_TYPE="${GRAD_CONSENSUS_LOSS_TYPE:-mse}"
+export GRAD_CONSENSUS_LOG_STATS="${GRAD_CONSENSUS_LOG_STATS:-true}"
+
+exec bash "${PROJECT_DIR}/scripts/run_pems08_ood_fpem_graphwavenet.sh"

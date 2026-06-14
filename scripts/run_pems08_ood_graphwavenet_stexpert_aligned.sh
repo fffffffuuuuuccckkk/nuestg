@@ -3,12 +3,12 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/data/OuXiaoyu/mystg/nue_stg_project}"
 PYTHON="${PYTHON:-/data/OuXiaoyu/miniconda3/envs/basicts/bin/python}"
-CONFIG="${CONFIG:-configs/ours/pems08_ood_fpem_graphwavenet.py}"
+CONFIG="${CONFIG:-configs/baselines/pems08_ood/graphwavenet.py}"
 SEEDS="${SEEDS:-2023}"
 GPU="${GPU:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-${GPU}}"
-CKPT_DIR="${CKPT_DIR:-${PROJECT_DIR}/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_graphwavenet}"
+CKPT_DIR="${CKPT_DIR:-${PROJECT_DIR}/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_pure_graphwavenet}"
 BACKBONE_NAME="${BACKBONE_NAME:-graphwavenet_full}"
 
 BATCH_SIZE="${BATCH_SIZE:-64}"
@@ -42,14 +42,6 @@ USE_STATIC_ADJ="${USE_STATIC_ADJ:-true}"
 SUPPORTS_LEN="${SUPPORTS_LEN:-2}"
 ADJTYPE="${ADJTYPE:-doubletransition}"
 
-LAMBDA_ENVPRED="${LAMBDA_ENVPRED:-0.05}"
-LAMBDA_FUTURE_MI="${LAMBDA_FUTURE_MI:-0.01}"
-LAMBDA_SWAP="${LAMBDA_SWAP:-0.05}"
-SWAP_DETACH_ENV="${SWAP_DETACH_ENV:-false}"
-SWAP_FREEZE_PREDICTOR="${SWAP_FREEZE_PREDICTOR:-true}"
-LAMBDA_MASK_SPARSE="${LAMBDA_MASK_SPARSE:-1e-3}"
-SPARSE_TARGET="${SPARSE_TARGET:-0.3}"
-
 DROP_LAST_TRAIN="${DROP_LAST_TRAIN:-true}"
 DROP_LAST_VAL="${DROP_LAST_VAL:-true}"
 DROP_LAST_TEST="${DROP_LAST_TEST:-true}"
@@ -74,19 +66,18 @@ cd "${PROJECT_DIR}"
 
 seed_count="$(awk '{print NF}' <<< "${SEEDS}")"
 
-echo "[FPEM-GraphWaveNet-STExpertAligned] project=${PROJECT_DIR}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] config=${CONFIG}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] seeds=${SEEDS} device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] ckpt_dir=${CKPT_DIR}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] backbone=${BACKBONE_NAME} in_dim=${IN_DIM} tod=${USE_TIME_OF_DAY_CHANNEL} dow=${USE_DAY_OF_WEEK_CHANNEL} engine_pad=${ENGINE_PAD_INPUT}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] supports=${ADJTYPE}/${SUPPORTS_LEN} addaptadj=${ADDAPTADJ} randomadj=${RANDOMADJ} static_adj=${USE_STATIC_ADJ}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] batch_size=${BATCH_SIZE} lr=${LR} optimizer=${OPTIMIZER} wd=${WEIGHT_DECAY} clip=${GRAD_CLIP} dropout=${DROPOUT}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] epochs=${EPOCHS} patience=${EARLY_STOP_PATIENCE} scheduler=${LR_SCHEDULER} torch_threads=${TORCH_NUM_THREADS}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] loss_scale=${TRAIN_LOSS_SCALE} mask_value_mode=${MASK_VALUE_MODE} mape_threshold=${MAPE_THRESHOLD} mape_as_percent=${MAPE_AS_PERCENT}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] scaler_mean=${SCALER_MEAN} scaler_std=${SCALER_STD}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC} eval_test_on_best=${EVAL_TEST_ON_BEST}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] lambdas envpred=${LAMBDA_ENVPRED} future_mi=${LAMBDA_FUTURE_MI} swap=${LAMBDA_SWAP} mask_sparse=${LAMBDA_MASK_SPARSE} sparse_target=${SPARSE_TARGET}"
-echo "[FPEM-GraphWaveNet-STExpertAligned] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
+echo "[PureGraphWaveNet-STExpertAligned] project=${PROJECT_DIR}"
+echo "[PureGraphWaveNet-STExpertAligned] config=${CONFIG}"
+echo "[PureGraphWaveNet-STExpertAligned] seeds=${SEEDS} device=${DEVICE} cuda_visible_devices=${CUDA_VISIBLE_DEVICES}"
+echo "[PureGraphWaveNet-STExpertAligned] ckpt_dir=${CKPT_DIR}"
+echo "[PureGraphWaveNet-STExpertAligned] backbone=${BACKBONE_NAME} in_dim=${IN_DIM} tod=${USE_TIME_OF_DAY_CHANNEL} dow=${USE_DAY_OF_WEEK_CHANNEL} engine_pad=${ENGINE_PAD_INPUT}"
+echo "[PureGraphWaveNet-STExpertAligned] supports=${ADJTYPE}/${SUPPORTS_LEN} addaptadj=${ADDAPTADJ} randomadj=${RANDOMADJ} static_adj=${USE_STATIC_ADJ}"
+echo "[PureGraphWaveNet-STExpertAligned] batch_size=${BATCH_SIZE} lr=${LR} optimizer=${OPTIMIZER} wd=${WEIGHT_DECAY} clip=${GRAD_CLIP} dropout=${DROPOUT}"
+echo "[PureGraphWaveNet-STExpertAligned] epochs=${EPOCHS} patience=${EARLY_STOP_PATIENCE} scheduler=${LR_SCHEDULER} torch_threads=${TORCH_NUM_THREADS}"
+echo "[PureGraphWaveNet-STExpertAligned] loss_scale=${TRAIN_LOSS_SCALE} mask_value_mode=${MASK_VALUE_MODE} mape_threshold=${MAPE_THRESHOLD} mape_as_percent=${MAPE_AS_PERCENT}"
+echo "[PureGraphWaveNet-STExpertAligned] scaler_mean=${SCALER_MEAN} scaler_std=${SCALER_STD}"
+echo "[PureGraphWaveNet-STExpertAligned] best_select_split=${BEST_SELECT_SPLIT} best_select_metric=${BEST_SELECT_METRIC} eval_test_on_best=${EVAL_TEST_ON_BEST}"
+echo "[PureGraphWaveNet-STExpertAligned] auto_resume=${AUTO_RESUME} resume_from=${RESUME_FROM} skip_completed=${SKIP_COMPLETED} completion_marker=${COMPLETION_MARKER} continue_on_failure=${CONTINUE_ON_FAILURE}"
 
 for seed in ${SEEDS}; do
   export PYTHONHASHSEED="${seed}"
@@ -96,19 +87,23 @@ for seed in ${SEEDS}; do
     run_ckpt_dir="${CKPT_DIR}"
   fi
   if [[ "${SKIP_COMPLETED}" =~ ^([Tt][Rr][Uu][Ee]|1|yes|YES|y|Y|on|ON)$ && -f "${run_ckpt_dir}/${COMPLETION_MARKER}" ]]; then
-    echo "[FPEM-GraphWaveNet-STExpertAligned] skip completed seed=${seed}: ${run_ckpt_dir}/${COMPLETION_MARKER}"
+    echo "[PureGraphWaveNet-STExpertAligned] skip completed seed=${seed}: ${run_ckpt_dir}/${COMPLETION_MARKER}"
     continue
   fi
-  echo "[FPEM-GraphWaveNet-STExpertAligned] run seed=${seed} ckpt_dir=${run_ckpt_dir}"
+  echo "[PureGraphWaveNet-STExpertAligned] run seed=${seed} ckpt_dir=${run_ckpt_dir}"
 
   set +e
   "${PYTHON}" train.py \
     --config "${CONFIG}" \
-    --set "RUN.ablation=stexpert_aligned_graphwavenet" \
-    --set "RUN.reference_status=stexpert_aligned_gwnet_protocol_no_expert_modules" \
-    --set "MODEL.reference_status=stexpert_aligned_gwnet_protocol_no_expert_modules" \
+    --set "RUN.method=GraphWaveNet-STExpertAligned-OOD" \
+    --set "RUN.ablation=stexpert_aligned_pure_graphwavenet" \
+    --set "RUN.reference_status=stexpert_aligned_pure_gwnet_backbone_only" \
+    --set "MODEL.method_variant=backbone_only" \
+    --set "MODEL.reference_status=stexpert_aligned_pure_gwnet_backbone_only" \
     --set "MODEL.backbone_name=${BACKBONE_NAME}" \
     --set "MODEL.backbone.name=${BACKBONE_NAME}" \
+    --set "MODEL.use_timestamp=true" \
+    --set "MODEL.required_timestamp=false" \
     --set "MODEL.backbone.graph_wavenet_full.dropout=${DROPOUT}" \
     --set "MODEL.backbone.graph_wavenet_full.blocks=4" \
     --set "MODEL.backbone.graph_wavenet_full.layers=2" \
@@ -156,19 +151,33 @@ for seed in ${SEEDS}; do
     --set "TRAIN.test_batches=${TEST_BATCHES}" \
     --set "TRAIN.curriculum_enabled=${CURRICULUM_ENABLED}" \
     --set "TRAIN.save_completion_marker=true" \
-    --set "LOSS.lambda_envpred=${LAMBDA_ENVPRED}" \
-    --set "LOSS.lambda_future_mi=${LAMBDA_FUTURE_MI}" \
-    --set "LOSS.lambda_swap=${LAMBDA_SWAP}" \
-    --set "LOSS.swap_detach_env=${SWAP_DETACH_ENV}" \
-    --set "SWAP.freeze_predictor=${SWAP_FREEZE_PREDICTOR}" \
-    --set "LOSS.lambda_mask_sparse=${LAMBDA_MASK_SPARSE}" \
-    --set "LOSS.sparse_target=${SPARSE_TARGET}" \
     --set "LOSS.train_loss_scale=${TRAIN_LOSS_SCALE}" \
     --set "LOSS.mask_value_mode=${MASK_VALUE_MODE}" \
+    --set "LOSS.lambda_pred=1.0" \
+    --set "LOSS.use_inv=false" \
+    --set "LOSS.lambda_inv=0.0" \
+    --set "LOSS.use_gate=false" \
+    --set "LOSS.lambda_gate=0.0" \
+    --set "LOSS.use_swap=false" \
+    --set "LOSS.lambda_swap=0.0" \
+    --set "LOSS.use_kl=false" \
+    --set "LOSS.lambda_kl=0.0" \
+    --set "LOSS.use_ind=false" \
+    --set "LOSS.lambda_ind=0.0" \
+    --set "LOSS.use_sparse=false" \
+    --set "LOSS.lambda_sparse=0.0" \
+    --set "LOSS.use_envpred=false" \
+    --set "LOSS.lambda_envpred=0.0" \
+    --set "LOSS.use_future_mi=false" \
+    --set "LOSS.lambda_future_mi=0.0" \
+    --set "LOSS.use_mask_sparse=false" \
+    --set "LOSS.lambda_mask_sparse=0.0" \
+    --set "SWAP.enabled=false" \
     --set "METRICS.mape_threshold=${MAPE_THRESHOLD}" \
     --set "METRICS.mape_eps=${MAPE_EPS}" \
     --set "METRICS.mape_as_percent=${MAPE_AS_PERCENT}" \
     --set "EVAL.metric_aggregation=concat" \
+    --set "EVAL.save_test_diagnostics=true" \
     --set "SCALER.enabled=true" \
     --set "SCALER.type=zscore" \
     --set "SCALER.norm_each_channel=false" \
@@ -191,7 +200,7 @@ PY
     fi
   else
     printf "exit_code=%s\n" "${exit_code}" > "${run_ckpt_dir}/last_exit_code.txt"
-    echo "[FPEM-GraphWaveNet-STExpertAligned] seed=${seed} failed with exit_code=${exit_code}; rerun the same script to auto-resume." >&2
+    echo "[PureGraphWaveNet-STExpertAligned] seed=${seed} failed with exit_code=${exit_code}; rerun the same script to auto-resume." >&2
     if [[ ! "${CONTINUE_ON_FAILURE}" =~ ^([Tt][Rr][Uu][Ee]|1|yes|YES|y|Y|on|ON)$ ]]; then
       exit "${exit_code}"
     fi
