@@ -574,11 +574,11 @@ def get_time_kwargs(batch: Dict[str, torch.Tensor], cfg: Dict, include_future: b
 class TimeChannelSoftGradientConsensus:
     """Gradient-level TC-SGC regularizer for invariant representations.
 
-    TC-SGC does not construct environments or add an explicit loss. It estimates
-    a batch-level time-channel consensus direction from the incoming prediction
-    gradient and softly interpolates the original gradient toward that direction.
-    Low-agreement positions keep most of their original gradient; no feature is
-    hard-masked, thresholded, or removed.
+    TC-SGC does not construct environments or add an explicit loss. It is
+    registered only on invariant encoder outputs and softly interpolates the
+    grad_z returned to that encoder. Downstream modules still compute their own
+    parameter gradients, losses, and optimizer updates through the original
+    training graph; no feature is hard-masked, thresholded, or removed.
     """
 
     def __init__(self, cfg: Optional[Dict]) -> None:
@@ -710,10 +710,9 @@ class TimeChannelSoftGradientConsensus:
         if not z_tensor.requires_grad:
             self._warn_once("no_grad", "TC-SGC target tensor does not require grad; skipping consensus.")
             return None
-        # First implementation operates on the total gradient arriving at the
-        # invariant representation. In current FPEM this includes the y_inv
-        # auxiliary prediction path and any other enabled losses that flow into
-        # z; no second backward pass or explicit loss is introduced.
+        # The hook only replaces the gradient sent to this tensor's creators.
+        # Parameter gradients in environment, mask, fusion, predictor, losses,
+        # and optimizer logic are left to the original backward pass.
         return z_tensor.register_hook(self._make_hook(current_epoch, using_fallback))
 
     def log_tensors(self, like: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -735,19 +734,29 @@ def register_grad_consensus_hook(
     grad_consensus.latest_stats = grad_consensus._empty_stats(False)
     target = grad_consensus.target
     using_fallback = False
-    z_tensor = output.get(target)
-    if target == "z_seq" and not isinstance(z_tensor, torch.Tensor):
-        z_tensor = output.get("z_inv")
-        using_fallback = True
-        grad_consensus._warn_once(
-            "fallback_z_inv",
-            "TC-SGC target z_seq is unavailable; falling back to z_inv as T=1.",
-        )
+    if target == "z_seq":
+        z_tensor = output.get("grad_consensus_z_seq")
+        if not isinstance(z_tensor, torch.Tensor):
+            z_tensor = output.get("grad_consensus_z_inv")
+            using_fallback = True
+            grad_consensus._warn_once(
+                "fallback_z_inv",
+                "TC-SGC hook target z_seq is unavailable; falling back to invariant-encoder z_inv as T=1.",
+            )
     elif target == "z_inv":
-        z_tensor = output.get("z_inv")
+        z_tensor = output.get("grad_consensus_z_inv")
+    else:
+        z_tensor = None
+        grad_consensus._warn_once(
+            "bad_target",
+            "TC-SGC target must be 'z_seq' or 'z_inv'; skipping consensus.",
+        )
     if not isinstance(z_tensor, torch.Tensor):
         grad_consensus.latest_stats = grad_consensus._empty_stats(using_fallback)
-        grad_consensus._warn_once("missing_target", f"TC-SGC target {target!r} is unavailable; skipping consensus.")
+        grad_consensus._warn_once(
+            "missing_target",
+            f"TC-SGC hook tensor for target {target!r} is unavailable; skipping consensus.",
+        )
         return
     grad_consensus.register(z_tensor, current_epoch=epoch, using_fallback=using_fallback)
 
@@ -784,6 +793,7 @@ class BackboneOnlyForecastModel(torch.nn.Module):
         )
         prediction = backbone_out["y_inv"]
         z_inv = backbone_out["z_inv"]
+        z_seq = backbone_out.get("z_seq")
         batch_size, _, num_nodes, _ = prediction.shape
         env = prediction.new_zeros(batch_size, num_nodes, self.env_dim)
         rho = prediction.new_zeros(batch_size, self.output_len, num_nodes, 1)
@@ -799,6 +809,9 @@ class BackboneOnlyForecastModel(torch.nn.Module):
             "rho": rho,
             "z_inv": z_inv,
             "z_raw": z_inv,
+            "z_seq": z_seq,
+            "grad_consensus_z_inv": z_inv,
+            "grad_consensus_z_seq": z_seq,
             "env_mu": env,
             "env_logvar": env,
             "env": env,

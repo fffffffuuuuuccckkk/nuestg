@@ -727,7 +727,8 @@ class NUESTG(nn.Module):
             cur_time=cur_time,
             future_time=future_time,
         )
-        z_raw = self._apply_time_to_z(backbone_out["z_inv"], time_out["cur_time_emb"])
+        z_encoder = backbone_out["z_inv"]
+        z_raw = self._apply_time_to_z(z_encoder, time_out["cur_time_emb"])
         z_seq = backbone_out.get("z_seq")
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu_tokens, env_logvar_tokens, env_tokens = self.env_token_encoder(
@@ -871,6 +872,11 @@ class NUESTG(nn.Module):
             "z_inv": z_inv,
             "z_raw": z_raw,
             "z_seq": z_seq,
+            # Hook-only invariant encoder tensors for TC-SGC. These are not
+            # consumed by losses/predictors; a tensor hook here only changes
+            # grad_z returned to the invariant encoder.
+            "grad_consensus_z_inv": z_encoder,
+            "grad_consensus_z_seq": z_seq,
             "env_mu": env_mu_tokens,
             "env_logvar": env_logvar_tokens,
             "env": env_hist,
@@ -974,7 +980,8 @@ class NUESTG(nn.Module):
             cur_time=cur_time,
             future_time=future_time,
         )
-        z_raw = backbone_out["z_inv"]
+        z_encoder = backbone_out["z_inv"]
+        z_raw = z_encoder
         z_seq = backbone_out.get("z_seq")
         y_inv_raw = self._apply_prediction_activation(backbone_out["y_inv"])
         env_mu, env_logvar, env_raw = self.env_encoder(x, adj)
@@ -1056,6 +1063,8 @@ class NUESTG(nn.Module):
             "z_inv": z_inv,
             "z_raw": z_raw,
             "z_seq": z_seq,
+            "grad_consensus_z_inv": z_encoder,
+            "grad_consensus_z_seq": z_seq,
             "env_mu": env_mu,
             "env_logvar": env_logvar,
             "env": env,
