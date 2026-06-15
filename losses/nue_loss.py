@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
@@ -23,6 +24,24 @@ class NUESTGLossConfig:
     null_val: Optional[float] = None
     mask_value_mode: str = "null_val"
     grad_consensus: Dict = field(default_factory=dict)
+    grad_surgery: Dict = field(default_factory=dict)
+    z_inv_bottleneck: Dict = field(default_factory=dict)
+    use_pseudo_env_heads: bool = False
+    pseudo_env_k: int = 3
+    pseudo_env_tau: float = 1.0
+    pseudo_env_lambda_head: float = 0.0
+    pseudo_env_lambda_var: float = 0.0
+    pseudo_env_lambda_balance: float = 0.0
+    pseudo_env_lambda_entropy: float = 0.0
+    pseudo_env_lambda_diverse: float = 0.0
+    pseudo_env_warmup_epochs: int = 0
+    pseudo_env_update_interval: int = 1
+    pseudo_env_detach_assignment: bool = True
+    pseudo_env_use_global_cache: bool = True
+    pseudo_env_use_temporal_smoothing: bool = True
+    pseudo_env_smooth_radius: int = 2
+    pseudo_env_assignment_mode: str = "cached_soft"
+    pseudo_env_level: str = "window"
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
     aux_ramp_epochs: int = 0
@@ -249,9 +268,10 @@ class NUESTGLoss(nn.Module):
             raise NotImplementedError(
                 "NUE-STG currently supports only LOSS.gate_label_mode='potential_gain'. "
                 "Gate targets must be computed from y_potential = y_inv + r_env, not gated prediction."
-            )
+        )
         self.epoch = 0
         self.latest_log_dict: Dict[str, float] = {}
+        self._pseudo_env_warned_collapse = False
         self.sep_z_proj = (
             nn.Linear(self.cfg.z_dim, self.cfg.sep_proj_dim, bias=False)
             if self.cfg.z_dim > 0 and self.cfg.sep_proj_dim > 0
@@ -338,6 +358,218 @@ class NUESTGLoss(nn.Module):
         elem = (abs_error * mask.to(abs_error.dtype)).sum(dim=-1, keepdim=True) / valid_counts
         elem_mask = mask.any(dim=-1, keepdim=True)
         return elem, elem_mask
+
+    @staticmethod
+    def _ensure_bhnc(tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if tensor.dim() == 3:
+            return tensor.unsqueeze(-1)
+        if tensor.dim() == 4:
+            return tensor
+        raise AssertionError(f"{name} must be [B,H,N] or [B,H,N,C], got {tuple(tensor.shape)}")
+
+    def _pseudo_env_head_losses(
+        self,
+        head_pred: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if head_pred.dim() != 5:
+            raise AssertionError(f"pseudo_env_head_pred must be [B,K,H,N,C], got {tuple(head_pred.shape)}")
+        targets = self._ensure_bhnc(targets, "pseudo_env_targets")
+        horizon = head_pred.shape[2]
+        if targets.shape[1] != horizon:
+            targets = targets[:, :horizon]
+        if tuple(targets.shape) != (
+            head_pred.shape[0],
+            horizon,
+            head_pred.shape[3],
+            head_pred.shape[4],
+        ):
+            raise AssertionError(
+                f"pseudo-env target shape must align to {(head_pred.shape[0], horizon, head_pred.shape[3], head_pred.shape[4])}, "
+                f"got {tuple(targets.shape)}"
+            )
+        if targets_mask is None:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+        else:
+            mask = targets_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(-1)
+            if mask.shape[1] != horizon:
+                mask = mask[:, :horizon]
+            mask = mask.to(device=head_pred.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(targets.shape):
+                mask = mask.expand_as(targets)
+        abs_error = (head_pred - targets.unsqueeze(1)).abs()
+        mask_5d = mask.unsqueeze(1).expand_as(abs_error)
+        if str(self.cfg.pseudo_env_level).lower() == "node":
+            counts = mask_5d.to(abs_error.dtype).sum(dim=(2, 4)).clamp_min(1.0)
+            loss_node = (abs_error * mask_5d.to(abs_error.dtype)).sum(dim=(2, 4)) / counts
+            valid_node = mask_5d.any(dim=4).any(dim=2)
+            return loss_node.permute(0, 2, 1).contiguous(), valid_node.permute(0, 2, 1).contiguous(), mask
+        counts = mask_5d.to(abs_error.dtype).sum(dim=(2, 3, 4)).clamp_min(1.0)
+        loss_window = (abs_error * mask_5d.to(abs_error.dtype)).sum(dim=(2, 3, 4)) / counts
+        valid_window = mask_5d.any(dim=4).any(dim=3).any(dim=2)
+        return loss_window, valid_window, mask
+
+    def _pseudo_env_inv_losses(
+        self,
+        y_inv_prediction: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        targets = self._ensure_bhnc(targets, "pseudo_env_inv_targets")
+        if targets.shape[1] != y_inv_prediction.shape[1]:
+            targets = targets[:, : y_inv_prediction.shape[1]]
+        if targets_mask is None:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+        else:
+            mask = targets_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(-1)
+            if mask.shape[1] != y_inv_prediction.shape[1]:
+                mask = mask[:, : y_inv_prediction.shape[1]]
+            mask = mask.to(device=y_inv_prediction.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(targets.shape):
+                mask = mask.expand_as(targets)
+        abs_error = (y_inv_prediction - targets).abs()
+        if str(self.cfg.pseudo_env_level).lower() == "node":
+            counts = mask.to(abs_error.dtype).sum(dim=(1, 3)).clamp_min(1.0)
+            return (abs_error * mask.to(abs_error.dtype)).sum(dim=(1, 3)) / counts
+        counts = mask.to(abs_error.dtype).sum(dim=(1, 2, 3)).clamp_min(1.0)
+        return (abs_error * mask.to(abs_error.dtype)).sum(dim=(1, 2, 3)) / counts
+
+    def _pseudo_env_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        y_loss_view: torch.Tensor,
+        y_inv_loss_view: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+        data_scaler=None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        prediction = output["prediction"]
+        zero = self._zero(prediction)
+        if not bool(self.cfg.use_pseudo_env_heads):
+            return zero, {}
+        logs: Dict[str, torch.Tensor] = {
+            "pseudo_env/enabled": prediction.new_tensor(1.0),
+            "pseudo_env/cache_updated": prediction.new_tensor(float(bool(output.get("pseudo_env_cache_updated", False)))),
+            "pseudo_env/smoothing_enabled": prediction.new_tensor(float(bool(output.get("pseudo_env_smoothing_enabled", False)))),
+        }
+        k = int(self.cfg.pseudo_env_k)
+        if self.epoch < int(self.cfg.pseudo_env_warmup_epochs):
+            logs.update({
+                "pseudo_env/head_loss": zero,
+                "pseudo_env/var_loss": zero,
+                "pseudo_env/balance_loss": zero,
+                "pseudo_env/entropy": zero,
+                "pseudo_env/q_entropy": zero,
+                "pseudo_env/diverse_loss": zero,
+                "pseudo_env/q_max_mean": zero,
+                "pseudo_env/r_var": zero,
+                "pseudo_env/collapse_warning": zero,
+            })
+            for idx in range(k):
+                logs[f"pseudo_env/count_head_{idx}"] = zero
+                logs[f"pseudo_env/per_head_mae_{idx}"] = zero
+                logs[f"pseudo_env/risk_head_{idx}"] = zero
+            return zero, logs
+
+        head_pred = output.get("pseudo_env_head_pred")
+        if head_pred is None:
+            raise RuntimeError("LOSS.use_pseudo_env_heads=True requires model output 'pseudo_env_head_pred'.")
+        head_pred_loss_view = head_pred
+        if str(self.cfg.train_loss_scale or "normalized").lower() == "original":
+            if data_scaler is None:
+                raise ValueError("Pseudo-env original-scale loss requires data_scaler.")
+            head_pred_loss_view = data_scaler.inverse_transform(head_pred)
+
+        level = str(self.cfg.pseudo_env_level or "window").lower()
+        if level not in {"window", "node"}:
+            raise ValueError("LOSS.pseudo_env_level must be 'window' or 'node'")
+        loss_head, valid_assign, _ = self._pseudo_env_head_losses(head_pred_loss_view, y_loss_view, targets_mask)
+        q_env = torch.softmax(-loss_head / max(float(self.cfg.pseudo_env_tau), 1e-6), dim=-1)
+        q_env = torch.where(valid_assign, q_env, torch.full_like(q_env, 1.0 / max(k, 1)))
+        hard_env = q_env.argmax(dim=-1)
+        q_weight = output.get("pseudo_env_q_weight")
+        if not isinstance(q_weight, torch.Tensor):
+            mode = str(self.cfg.pseudo_env_assignment_mode or "cached_soft").lower()
+            if mode.endswith("hard") or mode == "hard":
+                q_weight = F.one_hot(hard_env, num_classes=k).to(dtype=q_env.dtype, device=q_env.device)
+            else:
+                q_weight = q_env
+        else:
+            q_weight = q_weight.to(device=q_env.device, dtype=q_env.dtype)
+            if tuple(q_weight.shape) != tuple(q_env.shape):
+                raise AssertionError(f"pseudo_env_q_weight shape {tuple(q_weight.shape)} must match q_env {tuple(q_env.shape)}")
+        if bool(self.cfg.pseudo_env_detach_assignment):
+            q_weight = q_weight.detach()
+
+        weighted_head = (q_weight * loss_head).sum(dim=-1)
+        head_loss = weighted_head.mean()
+        reduce_dims = (0, 1) if level == "node" else (0,)
+        q_mean = q_env.mean(dim=reduce_dims)
+        balance_loss = (q_mean - (1.0 / k)).pow(2).mean()
+        entropy = -(q_env * (q_env + 1e-8).log()).sum(dim=-1).mean()
+        q_max_mean = q_env.max(dim=-1).values.mean()
+
+        flat_pred = head_pred_loss_view.permute(1, 0, 2, 3, 4).reshape(k, -1)
+        flat_pred = F.normalize(flat_pred.float(), dim=-1, eps=1e-8)
+        if k > 1:
+            sim = flat_pred @ flat_pred.t()
+            diverse_loss = sim[~torch.eye(k, dtype=torch.bool, device=sim.device)].mean().to(prediction.dtype)
+        else:
+            diverse_loss = zero
+
+        inv_loss = self._pseudo_env_inv_losses(y_inv_loss_view, y_loss_view, targets_mask)
+        if level == "node":
+            inv_view = inv_loss.unsqueeze(-1)
+            denom = q_weight.sum(dim=(0, 1)).clamp_min(1e-8)
+            risk = (q_weight * inv_view).sum(dim=(0, 1)) / denom
+            hard_flat = hard_env.reshape(-1)
+        else:
+            inv_view = inv_loss.unsqueeze(-1)
+            denom = q_weight.sum(dim=0).clamp_min(1e-8)
+            risk = (q_weight * inv_view).sum(dim=0) / denom
+            hard_flat = hard_env.reshape(-1)
+        var_loss = risk.var(unbiased=False)
+        counts = torch.bincount(hard_flat, minlength=k).to(device=prediction.device, dtype=prediction.dtype)
+        per_head_mae = (q_weight * loss_head).sum(dim=reduce_dims) / q_weight.sum(dim=reduce_dims).clamp_min(1e-8)
+        collapse_warning = (q_mean.max() > 0.98).to(dtype=prediction.dtype)
+        if (
+            bool(collapse_warning.detach().cpu().item())
+            and float(self.cfg.pseudo_env_lambda_balance) > 0
+            and not self._pseudo_env_warned_collapse
+        ):
+            warnings.warn(
+                "Pseudo-env assignment is nearly collapsed to one head; balance loss is active.",
+                RuntimeWarning,
+            )
+            self._pseudo_env_warned_collapse = True
+
+        total = (
+            float(self.cfg.pseudo_env_lambda_head) * head_loss
+            + float(self.cfg.pseudo_env_lambda_var) * var_loss
+            + float(self.cfg.pseudo_env_lambda_balance) * balance_loss
+            + float(self.cfg.pseudo_env_lambda_entropy) * entropy
+            + float(self.cfg.pseudo_env_lambda_diverse) * diverse_loss
+        )
+        logs.update({
+            "pseudo_env/head_loss": head_loss.detach(),
+            "pseudo_env/var_loss": var_loss.detach(),
+            "pseudo_env/balance_loss": balance_loss.detach(),
+            "pseudo_env/entropy": entropy.detach(),
+            "pseudo_env/q_entropy": entropy.detach(),
+            "pseudo_env/diverse_loss": diverse_loss.detach(),
+            "pseudo_env/q_max_mean": q_max_mean.detach(),
+            "pseudo_env/r_var": var_loss.detach(),
+            "pseudo_env/collapse_warning": collapse_warning.detach(),
+        })
+        for idx in range(k):
+            logs[f"pseudo_env/count_head_{idx}"] = counts[idx].detach()
+            logs[f"pseudo_env/per_head_mae_{idx}"] = per_head_mae[idx].detach()
+            logs[f"pseudo_env/risk_head_{idx}"] = risk[idx].detach()
+        return total, logs
 
     @staticmethod
     def _independence_loss(z_inv: torch.Tensor, env: torch.Tensor) -> torch.Tensor:
@@ -454,6 +686,53 @@ class NUESTGLoss(nn.Module):
         if default == "mae":
             return (source_view - target_view).abs().mean()
         return (source_view - target_view).pow(2).mean()
+
+    def _z_inv_bottleneck_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        cfg = self.cfg.z_inv_bottleneck or {}
+        if not bool(cfg.get("enabled", False)):
+            return self._zero(like), {}
+        kind = str(cfg.get("type", "vib") or "vib").lower()
+        beta = float(cfg.get("beta", 1.0e-4))
+        free_bits = max(float(cfg.get("kl_free_bits", 0.0)), 0.0)
+        zero = self._zero(like)
+        type_id = output.get("z_inv_ib_type_id", like.new_tensor({"vib": 1.0, "gaussian_noise": 2.0, "l2_norm": 3.0}.get(kind, 0.0)))
+        z_sample_std = output.get("z_inv_ib_z_sample_std", zero)
+        z_mu_abs_mean = output.get("z_inv_ib_z_mu_abs_mean", zero)
+        z_logvar_mean = output.get("z_inv_ib_z_logvar_mean", zero)
+
+        if kind == "vib":
+            kl_raw = output.get("z_inv_ib_kl")
+            if kl_raw is None:
+                raise RuntimeError("LOSS.z_inv_bottleneck.type='vib' requires model output 'z_inv_ib_kl'.")
+            kl_value = F.relu(kl_raw - free_bits)
+            loss = beta * kl_value
+        elif kind == "gaussian_noise":
+            kl_value = zero
+            loss = zero
+        elif kind == "l2_norm":
+            l2_raw = output.get("z_inv_ib_l2")
+            if l2_raw is None:
+                raise RuntimeError("LOSS.z_inv_bottleneck.type='l2_norm' requires model output 'z_inv_ib_l2'.")
+            kl_value = l2_raw
+            loss = beta * l2_raw
+        else:
+            raise ValueError("LOSS.z_inv_bottleneck.type must be one of: vib, gaussian_noise, l2_norm.")
+
+        logs = {
+            "loss_z_inv_ib": loss.detach(),
+            "z_inv_ib/enabled": like.new_tensor(1.0),
+            "z_inv_ib/type": type_id.detach() if isinstance(type_id, torch.Tensor) else like.new_tensor(float(type_id)),
+            "z_inv_ib/kl": kl_value.detach(),
+            "z_inv_ib/beta": like.new_tensor(beta),
+            "z_inv_ib/z_mu_abs_mean": z_mu_abs_mean.detach() if isinstance(z_mu_abs_mean, torch.Tensor) else zero,
+            "z_inv_ib/z_logvar_mean": z_logvar_mean.detach() if isinstance(z_logvar_mean, torch.Tensor) else zero,
+            "z_inv_ib/z_sample_std": z_sample_std.detach() if isinstance(z_sample_std, torch.Tensor) else zero,
+        }
+        return loss, logs
 
     def _persistence_terms(
         self,
@@ -907,6 +1186,14 @@ class NUESTGLoss(nn.Module):
         )
         z_cons_loss = z_cons_loss_raw if effective_lambda_z_cons != 0 else zero
         y_cons_loss = y_cons_loss_raw if effective_lambda_y_cons != 0 else zero
+        loss_z_inv_ib, z_inv_ib_logs = self._z_inv_bottleneck_terms(output, prediction)
+        pseudo_env_loss, pseudo_env_logs = self._pseudo_env_terms(
+            output,
+            y_loss_view,
+            y_inv_loss_view,
+            targets_mask,
+            data_scaler=data_scaler,
+        )
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
@@ -921,6 +1208,8 @@ class NUESTGLoss(nn.Module):
             + self.cfg.lambda_backbone_aux * backbone_aux_loss
             + effective_lambda_z_cons * z_cons_loss
             + effective_lambda_y_cons * y_cons_loss
+            + loss_z_inv_ib
+            + pseudo_env_loss
         )
 
         rho = output.get("rho")
@@ -1014,8 +1303,25 @@ class NUESTGLoss(nn.Module):
         logs.update({key: value.detach() for key, value in future_mi_logs.items()})
         logs.update({key: value.detach() for key, value in sep_logs.items()})
         logs.update({key: value.detach() for key, value in backbone_aux_logs.items()})
+        logs.update({key: value.detach() for key, value in z_inv_ib_logs.items()})
+        logs.update({key: value.detach() for key, value in pseudo_env_logs.items()})
         logs.update(self._separation_logs(output, prediction))
-        self.latest_log_dict = {key: float(value.cpu()) for key, value in logs.items()}
+        logs["__loss_terms__"] = {
+            "pred": self.cfg.lambda_pred * pred_loss,
+            "inv": self.cfg.lambda_inv * inv_loss,
+            "envpred": effective_lambda_envpred * envpred_loss,
+            "future_mi": effective_lambda_future_mi * future_mi_loss,
+            "swap": effective_lambda_swap * swap_loss,
+            "sep": effective_lambda_sep * ind_loss,
+            "sparse": effective_lambda_mask_sparse * sparse_loss,
+            "z_inv_ib": loss_z_inv_ib,
+            "pseudo_env": pseudo_env_loss,
+        }
+        self.latest_log_dict = {
+            key: float(value.cpu())
+            for key, value in logs.items()
+            if key != "__loss_terms__"
+        }
         return total_loss, logs
 
     def forward(

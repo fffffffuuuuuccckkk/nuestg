@@ -125,6 +125,8 @@ class NUESTGConfig(BasicTSModelConfig):
     swap: Dict = field(default_factory=dict)
     swap_detach_inv: bool = True
     swap_detach_env: bool = False
+    z_inv_bottleneck: Dict = field(default_factory=dict)
+    pseudo_env: Dict = field(default_factory=dict)
 
 
 class LatentFusion(nn.Module):
@@ -222,6 +224,49 @@ class LatentFusion(nn.Module):
         return {"hidden": hidden, "fusion_gamma": gate, "fusion_beta": delta}
 
 
+class PseudoEnvHeads(nn.Module):
+    """Competing prediction heads that read environment representations only."""
+
+    def __init__(
+        self,
+        env_dim: int,
+        output_len: int,
+        output_dim: int,
+        num_heads: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.env_dim = int(env_dim)
+        self.output_len = int(output_len)
+        self.output_dim = int(output_dim)
+        self.num_heads = int(num_heads)
+        self.heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(self.env_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, self.output_len * self.output_dim),
+                )
+                for _ in range(self.num_heads)
+            ]
+        )
+
+    def forward(self, env: torch.Tensor) -> torch.Tensor:
+        if env.dim() != 3:
+            raise AssertionError(f"pseudo env heads expect env [B,N,D], got {tuple(env.shape)}")
+        if env.shape[-1] != self.env_dim:
+            raise AssertionError(f"pseudo env dim mismatch: expected {self.env_dim}, got {env.shape[-1]}")
+        preds = []
+        batch_size, num_nodes, _ = env.shape
+        for head in self.heads:
+            pred = head(env)
+            pred = pred.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
+            preds.append(pred)
+        return torch.stack(preds, dim=1)
+
+
 class NUESTG(nn.Module):
     """NUE-STG: Node-wise Utility-aware Environment Learning.
 
@@ -304,6 +349,24 @@ class NUESTG(nn.Module):
         self.backbone = build_backbone({"MODEL": model_cfg})
         self.representation_dim = int(self.backbone.representation_dim)
         self.hidden_dim = self.representation_dim
+        self.z_inv_bottleneck_cfg = dict(config.z_inv_bottleneck or {})
+        self.z_inv_ib_enabled = bool(self.z_inv_bottleneck_cfg.get("enabled", False))
+        self.z_inv_ib_type = str(self.z_inv_bottleneck_cfg.get("type", "vib") or "vib").lower()
+        self.z_inv_ib_apply_to = str(self.z_inv_bottleneck_cfg.get("apply_to", "z_inv") or "z_inv").lower()
+        self.z_inv_ib_noise_std = float(self.z_inv_bottleneck_cfg.get("noise_std", 0.05))
+        self.z_inv_ib_predict_from_sampled_z = bool(
+            self.z_inv_bottleneck_cfg.get("predict_from_sampled_z", True)
+        )
+        self.pseudo_env_cfg = dict(config.pseudo_env or {})
+        self.pseudo_env_enabled = bool(self.pseudo_env_cfg.get("enabled", False))
+        self.pseudo_env_k = int(self.pseudo_env_cfg.get("k", 3))
+        if self.z_inv_ib_enabled:
+            if self.z_inv_ib_apply_to != "z_inv":
+                raise ValueError("LOSS.z_inv_bottleneck.apply_to currently supports 'z_inv' only.")
+            if self.z_inv_ib_type not in {"vib", "gaussian_noise", "l2_norm"}:
+                raise ValueError("LOSS.z_inv_bottleneck.type must be one of: vib, gaussian_noise, l2_norm.")
+        if self.pseudo_env_enabled and self.pseudo_env_k < 1:
+            raise ValueError("LOSS.pseudo_env_k must be >= 1 when pseudo-env heads are enabled.")
         self.time_encoder = TimestampEncoder(
             encoding_type=config.time_encoding_type if self.use_timestamp else "none",
             time_emb_dim=self.time_emb_dim,
@@ -329,6 +392,13 @@ class NUESTG(nn.Module):
                 and self.backbone.inv_head.out_features == self.inv_head_from_z.out_features
             ):
                 self.inv_head_from_z.load_state_dict(self.backbone.inv_head.state_dict())
+        if self.z_inv_ib_enabled and self.z_inv_ib_type == "vib":
+            self.z_inv_ib_mu = nn.Linear(self.representation_dim, self.representation_dim)
+            self.z_inv_ib_logvar = nn.Linear(self.representation_dim, self.representation_dim)
+            self._init_z_inv_ib_vib()
+        else:
+            self.z_inv_ib_mu = None
+            self.z_inv_ib_logvar = None
 
         if config.env_encoder_type != "temporal_mlp":
             raise ValueError("Only env_encoder_type='temporal_mlp' is implemented in this version.")
@@ -451,6 +521,18 @@ class NUESTG(nn.Module):
             nn.Dropout(config.residual_dropout),
             nn.Linear(config.residual_hidden_dim, config.output_len * config.output_dim),
         )
+        self.pseudo_env_heads = (
+            PseudoEnvHeads(
+                env_dim=config.env_dim,
+                output_len=config.output_len,
+                output_dim=config.output_dim,
+                num_heads=self.pseudo_env_k,
+                hidden_dim=int(self.pseudo_env_cfg.get("hidden_dim", config.residual_hidden_dim)),
+                dropout=float(self.pseudo_env_cfg.get("dropout", config.residual_dropout)),
+            )
+            if self.pseudo_env_enabled
+            else None
+        )
         gate_out_dim = config.output_len if config.gate_horizon_aware else 1
         self.gate_net = nn.Sequential(
             nn.Linear(decode_in_dim, config.gate_hidden_dim),
@@ -499,6 +581,66 @@ class NUESTG(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_dim),
         )
+
+    def _init_z_inv_ib_vib(self) -> None:
+        if isinstance(self.z_inv_ib_mu, nn.Linear):
+            if self.z_inv_ib_mu.weight.shape[0] == self.z_inv_ib_mu.weight.shape[1]:
+                nn.init.eye_(self.z_inv_ib_mu.weight)
+            else:
+                nn.init.xavier_uniform_(self.z_inv_ib_mu.weight)
+            nn.init.zeros_(self.z_inv_ib_mu.bias)
+        if isinstance(self.z_inv_ib_logvar, nn.Linear):
+            nn.init.zeros_(self.z_inv_ib_logvar.weight)
+            nn.init.zeros_(self.z_inv_ib_logvar.bias)
+
+    @staticmethod
+    def _z_inv_ib_type_id(kind: str) -> float:
+        return {"vib": 1.0, "gaussian_noise": 2.0, "l2_norm": 3.0}.get(kind, 0.0)
+
+    def _apply_z_inv_bottleneck(self, z_inv: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if not self.z_inv_ib_enabled:
+            return {"z": z_inv}
+        if self.z_inv_ib_type == "vib":
+            if self.z_inv_ib_mu is None or self.z_inv_ib_logvar is None:
+                raise RuntimeError("z_inv VIB is enabled but its mu/logvar heads are missing.")
+            z_mu = self.z_inv_ib_mu(z_inv)
+            z_logvar = self.z_inv_ib_logvar(z_inv)
+            if self.training:
+                eps = torch.randn_like(z_mu)
+                z_sample = z_mu + eps * torch.exp(0.5 * z_logvar)
+            else:
+                z_sample = z_mu
+            use_sample = self.training and self.z_inv_ib_predict_from_sampled_z
+            z_for_prediction = z_sample if use_sample else z_mu
+            kl = -0.5 * (1.0 + z_logvar - z_mu.pow(2) - z_logvar.exp()).mean()
+            return {
+                "z": z_for_prediction,
+                "z_inv_before_bottleneck": z_inv,
+                "z_inv_ib_kl": kl,
+                "z_inv_ib_type_id": z_inv.new_tensor(self._z_inv_ib_type_id(self.z_inv_ib_type)),
+                "z_inv_ib_z_mu_abs_mean": z_mu.detach().abs().mean(),
+                "z_inv_ib_z_logvar_mean": z_logvar.detach().mean(),
+                "z_inv_ib_z_sample_std": z_sample.detach().std(unbiased=False),
+            }
+        if self.z_inv_ib_type == "gaussian_noise":
+            if self.training and self.z_inv_ib_noise_std > 0:
+                z_for_prediction = z_inv + torch.randn_like(z_inv) * self.z_inv_ib_noise_std
+            else:
+                z_for_prediction = z_inv
+            return {
+                "z": z_for_prediction,
+                "z_inv_before_bottleneck": z_inv,
+                "z_inv_ib_type_id": z_inv.new_tensor(self._z_inv_ib_type_id(self.z_inv_ib_type)),
+                "z_inv_ib_z_sample_std": z_for_prediction.detach().std(unbiased=False),
+            }
+        l2 = z_inv.pow(2).mean()
+        return {
+            "z": z_inv,
+            "z_inv_before_bottleneck": z_inv,
+            "z_inv_ib_l2": l2,
+            "z_inv_ib_type_id": z_inv.new_tensor(self._z_inv_ib_type_id(self.z_inv_ib_type)),
+            "z_inv_ib_z_sample_std": z_inv.detach().std(unbiased=False),
+        }
 
     def invariant_predict_from_z(self, z_inv: torch.Tensor) -> torch.Tensor:
         batch_size, num_nodes, _ = z_inv.shape
@@ -744,16 +886,19 @@ class NUESTG(nn.Module):
         z_inv = sep_out["z_inv"]
         env_hist = sep_out["env"]
         separation_extra = sep_out["extra"]
+        z_inv_ib_out = self._apply_z_inv_bottleneck(z_inv)
+        z_for_prediction = z_inv_ib_out["z"]
 
         mask = mask_out["mask"]
         env_plus = mask_out["env_plus"]
         env_minus = mask_out["env_minus"]
 
-        pred_out = self.fpem_predict_from_z_env(z_inv, env_plus)
+        pred_out = self.fpem_predict_from_z_env(z_for_prediction, env_plus)
         prediction = pred_out["prediction"]
         zero_env = torch.zeros_like(env_plus)
-        inv_out = self.fpem_predict_from_z_env(z_inv, zero_env)
+        inv_out = self.fpem_predict_from_z_env(z_for_prediction, zero_env)
         y_inv = inv_out["prediction"]
+        pseudo_env_head_pred = self.pseudo_env_heads(env_plus) if self.pseudo_env_heads is not None else None
 
         env_fut_tokens = None
         env_fut_mu_tokens = None
@@ -810,7 +955,7 @@ class NUESTG(nn.Module):
         env_perm_index = None
         if compute_swap and (self.training or compute_aux) and self.swap_cfg.get("enabled", True):
             env_perm, env_perm_index = self._permute_env_with_indices(env_plus)
-            z_swap_decode = z_inv.detach() if self.swap_detach_inv else z_inv
+            z_swap_decode = z_for_prediction.detach() if self.swap_detach_inv else z_for_prediction
             detach_env = bool(self.swap_cfg.get("detach_env", self.swap_detach_env))
             env_swap_decode = env_perm.detach() if detach_env else env_perm
             if bool(self.swap_cfg.get("freeze_predictor", True)):
@@ -853,6 +998,12 @@ class NUESTG(nn.Module):
         }.items():
             if tensor is not None and tuple(tensor.shape) != expected_fut_token_shape:
                 raise AssertionError(f"{name} must be {expected_fut_token_shape}, got {tuple(tensor.shape)}")
+        if pseudo_env_head_pred is not None:
+            expected_pseudo_shape = (batch_size, self.pseudo_env_k, self.output_len, num_nodes, self.output_dim)
+            if tuple(pseudo_env_head_pred.shape) != expected_pseudo_shape:
+                raise AssertionError(
+                    f"pseudo_env_head_pred must be {expected_pseudo_shape}, got {tuple(pseudo_env_head_pred.shape)}"
+                )
 
         rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)
         if tuple(rho.shape) != expected_gate_shape:
@@ -869,7 +1020,7 @@ class NUESTG(nn.Module):
             "y_potential": y_potential,
             "r_env": r_env,
             "rho": rho,
-            "z_inv": z_inv,
+            "z_inv": z_for_prediction,
             "z_raw": z_raw,
             "z_seq": z_seq,
             # Hook-only invariant encoder tensors for TC-SGC. These are not
@@ -925,6 +1076,10 @@ class NUESTG(nn.Module):
             "backbone_aux_losses": backbone_out.get("backbone_aux_losses", {}),
             "backbone_aux_weights": backbone_out.get("backbone_aux_weights", {}),
         }
+        if self.z_inv_ib_enabled:
+            output.update({key: value for key, value in z_inv_ib_out.items() if key != "z"})
+        if pseudo_env_head_pred is not None:
+            output["pseudo_env_head_pred"] = pseudo_env_head_pred
         if apply_perturb:
             output["perturb_info"] = {"enabled": self.perturb_enabled, "applied": False}
         if apply_perturb and self.training and self.perturb_enabled:

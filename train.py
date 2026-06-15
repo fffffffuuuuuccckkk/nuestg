@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import warnings
 from contextlib import nullcontext
@@ -11,7 +12,7 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from basicts.data import BasicTSForecastingDataset
 
@@ -148,6 +149,12 @@ LOG_KEYS = [
     "grad_consensus/rho_max",
     "grad_consensus/using_fallback_z_inv",
     "grad_consensus/ema_agree_mean",
+    "grad_surgery/enabled",
+    "grad_surgery/conflict_cos",
+    "grad_surgery/conflict_dot",
+    "grad_surgery/projection_norm",
+    "grad_surgery/aux_grad_norm",
+    "grad_surgery/primary_grad_norm",
     "curriculum_horizon",
     "cast_vq_loss",
     "cast_commit_loss",
@@ -155,6 +162,30 @@ LOG_KEYS = [
     "stone_graph_perturb_loss",
     "stone_spatial_graph_entropy",
     "stone_temporal_graph_entropy",
+]
+Z_INV_IB_LOG_KEYS = [
+    "loss_z_inv_ib",
+    "z_inv_ib/enabled",
+    "z_inv_ib/type",
+    "z_inv_ib/kl",
+    "z_inv_ib/beta",
+    "z_inv_ib/z_mu_abs_mean",
+    "z_inv_ib/z_logvar_mean",
+    "z_inv_ib/z_sample_std",
+]
+PSEUDO_ENV_BASE_LOG_KEYS = [
+    "pseudo_env/enabled",
+    "pseudo_env/head_loss",
+    "pseudo_env/var_loss",
+    "pseudo_env/balance_loss",
+    "pseudo_env/entropy",
+    "pseudo_env/q_entropy",
+    "pseudo_env/diverse_loss",
+    "pseudo_env/q_max_mean",
+    "pseudo_env/r_var",
+    "pseudo_env/cache_updated",
+    "pseudo_env/smoothing_enabled",
+    "pseudo_env/collapse_warning",
 ]
 HORIZON_EVAL_STEPS = (3, 6, 12)
 METRIC_FIELDS = [
@@ -182,6 +213,41 @@ METRIC_FIELDS = [
     "lr",
 ]
 CSV_FIELDS = ["epoch", "step", "split", *LOG_KEYS, *METRIC_FIELDS]
+
+
+def z_inv_bottleneck_enabled(cfg: Dict) -> bool:
+    return bool(cfg.get("LOSS", {}).get("z_inv_bottleneck", {}).get("enabled", False))
+
+
+def pseudo_env_enabled(cfg: Dict) -> bool:
+    return bool(cfg.get("LOSS", {}).get("use_pseudo_env_heads", False))
+
+
+def pseudo_env_log_keys(cfg: Dict) -> list[str]:
+    if not pseudo_env_enabled(cfg):
+        return []
+    k = int(cfg.get("LOSS", {}).get("pseudo_env_k", 3))
+    keys = list(PSEUDO_ENV_BASE_LOG_KEYS)
+    for idx in range(k):
+        keys.extend([
+            f"pseudo_env/count_head_{idx}",
+            f"pseudo_env/per_head_mae_{idx}",
+            f"pseudo_env/risk_head_{idx}",
+        ])
+    return keys
+
+
+def log_keys_for_config(cfg: Dict) -> list[str]:
+    keys = list(LOG_KEYS)
+    if z_inv_bottleneck_enabled(cfg):
+        keys.extend(Z_INV_IB_LOG_KEYS)
+    keys.extend(pseudo_env_log_keys(cfg))
+    return keys
+
+
+def csv_fields_for_config(cfg: Dict) -> list[str]:
+    return ["epoch", "step", "split", *log_keys_for_config(cfg), *METRIC_FIELDS]
+
 
 BACKBONE_DESCRIPTIONS = {
     "stid": "faithful_native_adapter STID backbone with spatial identity and TOD/DOW embeddings",
@@ -249,6 +315,7 @@ def finalize_config(cfg: Dict) -> Dict:
     train_cfg.setdefault("curriculum_full_horizon_epoch", 30)
     train_cfg.setdefault("teacher_forcing_enabled", False)
     train_cfg.setdefault("tf_decay_steps", 2000)
+    train_cfg.setdefault("resume_allow_missing_pseudo_env", True)
     loss_cfg.setdefault("warmup_epochs", 0)
     loss_cfg.setdefault("aux_ramp_epochs", 0)
     loss_cfg.setdefault("mask_value_mode", cfg["DATASET"].get("mask_value_mode", "null_val"))
@@ -266,6 +333,70 @@ def finalize_config(cfg: Dict) -> Dict:
     grad_consensus_cfg.setdefault("use_ema", True)
     grad_consensus_cfg.setdefault("loss_type", "mse")
     grad_consensus_cfg.setdefault("log_stats", True)
+    grad_surgery_cfg = loss_cfg.setdefault("grad_surgery", {})
+    grad_surgery_cfg.setdefault("enabled", False)
+    grad_surgery_cfg.setdefault("method", "pcgrad")
+    grad_surgery_cfg.setdefault("apply_to", "inv_encoder")
+    grad_surgery_cfg.setdefault("primary_losses", ["pred", "inv"])
+    grad_surgery_cfg.setdefault("aux_losses", ["envpred", "future_mi", "swap", "sep", "sparse"])
+    z_inv_ib_cfg = loss_cfg.setdefault("z_inv_bottleneck", {})
+    z_inv_ib_cfg.setdefault("enabled", False)
+    z_inv_ib_cfg.setdefault("type", "vib")
+    z_inv_ib_cfg.setdefault("beta", 1.0e-4)
+    z_inv_ib_cfg.setdefault("noise_std", 0.05)
+    z_inv_ib_cfg.setdefault("kl_free_bits", 0.0)
+    z_inv_ib_cfg.setdefault("apply_to", "z_inv")
+    z_inv_ib_cfg.setdefault("predict_from_sampled_z", True)
+    z_inv_ib_cfg["type"] = str(z_inv_ib_cfg.get("type", "vib") or "vib").lower()
+    z_inv_ib_cfg["apply_to"] = str(z_inv_ib_cfg.get("apply_to", "z_inv") or "z_inv").lower()
+    if z_inv_ib_cfg["type"] not in {"vib", "gaussian_noise", "l2_norm"}:
+        raise ValueError("LOSS.z_inv_bottleneck.type must be one of: vib, gaussian_noise, l2_norm")
+    if z_inv_ib_cfg["apply_to"] != "z_inv":
+        raise ValueError("LOSS.z_inv_bottleneck.apply_to currently supports 'z_inv' only")
+    if bool(z_inv_ib_cfg.get("enabled", False)) and bool(grad_surgery_cfg.get("enabled", False)):
+        primary_losses = list(grad_surgery_cfg.get("primary_losses", ["pred", "inv"]) or [])
+        aux_losses = list(grad_surgery_cfg.get("aux_losses", []) or [])
+        if "z_inv_ib" not in primary_losses and "z_inv_ib" not in aux_losses:
+            primary_losses.append("z_inv_ib")
+        grad_surgery_cfg["primary_losses"] = primary_losses
+    model_cfg["z_inv_bottleneck"] = dict(z_inv_ib_cfg)
+    loss_cfg.setdefault("use_pseudo_env_heads", False)
+    loss_cfg.setdefault("pseudo_env_k", 3)
+    loss_cfg.setdefault("pseudo_env_tau", 1.0)
+    loss_cfg.setdefault("pseudo_env_lambda_head", 0.0)
+    loss_cfg.setdefault("pseudo_env_lambda_var", 0.0)
+    loss_cfg.setdefault("pseudo_env_lambda_balance", 0.0)
+    loss_cfg.setdefault("pseudo_env_lambda_entropy", 0.0)
+    loss_cfg.setdefault("pseudo_env_lambda_diverse", 0.0)
+    loss_cfg.setdefault("pseudo_env_warmup_epochs", 0)
+    loss_cfg.setdefault("pseudo_env_update_interval", 1)
+    loss_cfg.setdefault("pseudo_env_detach_assignment", True)
+    loss_cfg.setdefault("pseudo_env_use_global_cache", True)
+    loss_cfg.setdefault("pseudo_env_use_temporal_smoothing", True)
+    loss_cfg.setdefault("pseudo_env_smooth_radius", 2)
+    loss_cfg.setdefault("pseudo_env_assignment_mode", "cached_soft")
+    loss_cfg.setdefault("pseudo_env_level", "window")
+    loss_cfg["pseudo_env_k"] = int(loss_cfg.get("pseudo_env_k", 3))
+    if loss_cfg["pseudo_env_k"] < 1:
+        raise ValueError("LOSS.pseudo_env_k must be >= 1")
+    loss_cfg["pseudo_env_assignment_mode"] = str(loss_cfg.get("pseudo_env_assignment_mode", "cached_soft")).lower()
+    if loss_cfg["pseudo_env_assignment_mode"] not in {"soft", "hard", "cached_soft", "cached_hard"}:
+        raise ValueError("LOSS.pseudo_env_assignment_mode must be soft/hard/cached_soft/cached_hard")
+    loss_cfg["pseudo_env_level"] = str(loss_cfg.get("pseudo_env_level", "window")).lower()
+    if loss_cfg["pseudo_env_level"] not in {"window", "node"}:
+        raise ValueError("LOSS.pseudo_env_level must be 'window' or 'node'")
+    if bool(loss_cfg.get("use_pseudo_env_heads", False)) and bool(grad_surgery_cfg.get("enabled", False)):
+        aux_losses = list(grad_surgery_cfg.get("aux_losses", []) or [])
+        primary_losses = list(grad_surgery_cfg.get("primary_losses", ["pred", "inv"]) or [])
+        if "pseudo_env" not in aux_losses and "pseudo_env" not in primary_losses:
+            aux_losses.append("pseudo_env")
+        grad_surgery_cfg["aux_losses"] = aux_losses
+    model_cfg["pseudo_env"] = {
+        "enabled": bool(loss_cfg.get("use_pseudo_env_heads", False)),
+        "k": int(loss_cfg.get("pseudo_env_k", 3)),
+        "hidden_dim": int(loss_cfg.get("pseudo_env_hidden_dim", model_cfg.get("residual_hidden_dim", 64))),
+        "dropout": float(loss_cfg.get("pseudo_env_dropout", model_cfg.get("residual_dropout", 0.1))),
+    }
     loss_cfg.setdefault("peak_weight_enabled", False)
     loss_cfg.setdefault("peak_quantile", 0.75)
     loss_cfg.setdefault("peak_weight", 0.2)
@@ -434,10 +565,37 @@ def configure_torch_runtime(train_cfg: Dict) -> None:
     torch.set_num_threads(max(1, int(num_threads)))
 
 
+class IndexedForecastingDataset(Dataset):
+    """Add original window-order sample_index while preserving BasicTS items."""
+
+    def __init__(self, dataset: Dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    @property
+    def data(self):
+        return getattr(self.dataset, "data")
+
+    def __getitem__(self, index: int):
+        item = self.dataset[index]
+        sample_index = torch.as_tensor(index, dtype=torch.long)
+        if isinstance(item, dict):
+            out = dict(item)
+            out["sample_index"] = sample_index
+            return out
+        if isinstance(item, tuple):
+            return (*item, sample_index)
+        if isinstance(item, list):
+            return [*item, sample_index]
+        raise TypeError(f"Unsupported dataset item type for sample_index wrapping: {type(item)!r}")
+
+
 def build_dataset(cfg: Dict, split: str) -> BasicTSForecastingDataset:
     ds_cfg = cfg["DATASET"]
     maybe_generate_timestamp_file(ds_cfg["data_file_path"], split, ds_cfg)
-    return BasicTSForecastingDataset(
+    dataset = BasicTSForecastingDataset(
         dataset_name=ds_cfg["name"],
         input_len=ds_cfg["input_len"],
         output_len=ds_cfg["output_len"],
@@ -446,6 +604,9 @@ def build_dataset(cfg: Dict, split: str) -> BasicTSForecastingDataset:
         data_file_path=ds_cfg["data_file_path"],
         memmap=ds_cfg.get("memmap", True),
     )
+    if split == "train" and pseudo_env_enabled(cfg):
+        return IndexedForecastingDataset(dataset)
+    return dataset
 
 
 def build_loader(cfg: Dict, split: str, shuffle: bool) -> DataLoader:
@@ -549,7 +710,10 @@ def to_device_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dic
     out = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            out[key] = value.to(device=device, dtype=torch.float32)
+            if torch.is_floating_point(value):
+                out[key] = value.to(device=device, dtype=torch.float32)
+            else:
+                out[key] = value.to(device=device)
         else:
             out[key] = value
     return out
@@ -570,6 +734,213 @@ def get_time_kwargs(batch: Dict[str, torch.Tensor], cfg: Dict, include_future: b
     else:
         out["future_time"] = None
     return out
+
+
+def pseudo_env_is_active(cfg: Dict, epoch: int) -> bool:
+    loss_cfg = cfg.get("LOSS", {})
+    return bool(loss_cfg.get("use_pseudo_env_heads", False)) and int(epoch) >= int(loss_cfg.get("pseudo_env_warmup_epochs", 0))
+
+
+class PseudoEnvCache:
+    """CPU cache for pseudo-env assignments keyed by original sample_index."""
+
+    def __init__(self, num_samples: int, num_heads: int) -> None:
+        self.num_samples = int(num_samples)
+        self.num_heads = int(num_heads)
+        self.cached_q = torch.full((self.num_samples, self.num_heads), 1.0 / self.num_heads, dtype=torch.float32)
+        self.cached_hard_env = torch.zeros(self.num_samples, dtype=torch.long)
+        self.cached_loss_head = torch.zeros((self.num_samples, self.num_heads), dtype=torch.float32)
+        self.updated = torch.zeros(self.num_samples, dtype=torch.bool)
+
+    def read(self, sample_index: torch.Tensor, device: torch.device, hard: bool = False) -> torch.Tensor:
+        idx = sample_index.detach().long().cpu().clamp(0, self.num_samples - 1)
+        if hard:
+            q = torch.nn.functional.one_hot(self.cached_hard_env[idx], num_classes=self.num_heads).float()
+        else:
+            q = self.cached_q[idx].float()
+        return q.to(device=device)
+
+    def write(self, sample_index: torch.Tensor, loss_head: torch.Tensor, q_env: torch.Tensor) -> None:
+        idx = sample_index.detach().long().cpu().clamp(0, self.num_samples - 1)
+        self.cached_loss_head[idx] = loss_head.detach().float().cpu()
+        self.cached_q[idx] = q_env.detach().float().cpu()
+        self.cached_hard_env[idx] = q_env.detach().argmax(dim=-1).long().cpu()
+        self.updated[idx] = True
+
+    def smooth_hard_assignments(self, radius: int) -> None:
+        radius = max(0, int(radius))
+        if radius <= 0 or self.num_samples == 0:
+            return
+        hard = self.cached_hard_env.clone()
+        smoothed = hard.clone()
+        for index in range(self.num_samples):
+            lo = max(0, index - radius)
+            hi = min(self.num_samples, index + radius + 1)
+            counts = torch.bincount(hard[lo:hi], minlength=self.num_heads)
+            smoothed[index] = counts.argmax()
+        self.cached_hard_env = smoothed
+        self.cached_q = torch.nn.functional.one_hot(smoothed, num_classes=self.num_heads).float()
+
+    def state_dict(self) -> Dict[str, torch.Tensor | int]:
+        return {
+            "num_samples": self.num_samples,
+            "num_heads": self.num_heads,
+            "cached_q": self.cached_q,
+            "cached_hard_env": self.cached_hard_env,
+            "cached_loss_head": self.cached_loss_head,
+            "updated": self.updated,
+        }
+
+    def load_state_dict(self, state: Dict) -> None:
+        if not isinstance(state, dict):
+            return
+        if int(state.get("num_samples", self.num_samples)) != self.num_samples:
+            warnings.warn("PseudoEnvCache sample count differs from checkpoint; ignoring cached assignments.", RuntimeWarning)
+            return
+        if int(state.get("num_heads", self.num_heads)) != self.num_heads:
+            warnings.warn("PseudoEnvCache head count differs from checkpoint; ignoring cached assignments.", RuntimeWarning)
+            return
+        for name in ["cached_q", "cached_hard_env", "cached_loss_head", "updated"]:
+            value = state.get(name)
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(getattr(self, name).shape):
+                setattr(self, name, value.detach().cpu().clone())
+
+    def summary(self) -> Dict[str, float | list[int]]:
+        active = self.updated if bool(self.updated.any()) else torch.ones_like(self.updated, dtype=torch.bool)
+        q = self.cached_q[active]
+        hard = self.cached_hard_env[active]
+        counts = torch.bincount(hard, minlength=self.num_heads).tolist()
+        entropy = (-(q * (q + 1e-8).log()).sum(dim=-1).mean()).item() if q.numel() else 0.0
+        qmax = q.max(dim=-1).values.mean().item() if q.numel() else 0.0
+        return {
+            "counts": [int(value) for value in counts],
+            "entropy": float(entropy),
+            "qmax": float(qmax),
+            "updated": int(active.sum().item()),
+        }
+
+
+def _ensure_bhnc_for_pseudo(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dim() == 3:
+        return tensor.unsqueeze(-1)
+    if tensor.dim() == 4:
+        return tensor
+    raise AssertionError(f"pseudo-env cache target must be [B,H,N] or [B,H,N,C], got {tuple(tensor.shape)}")
+
+
+def compute_pseudo_env_loss_head_for_cache(
+    output: Dict[str, torch.Tensor],
+    targets: torch.Tensor,
+    targets_mask: torch.Tensor | None,
+    cfg: Dict,
+    data_scaler: ZScoreDataScaler,
+) -> torch.Tensor:
+    head_pred = output.get("pseudo_env_head_pred")
+    if not isinstance(head_pred, torch.Tensor):
+        raise RuntimeError("Pseudo-env cache update requires output['pseudo_env_head_pred'].")
+    if str(cfg["LOSS"].get("train_loss_scale", "normalized")).lower() == "original":
+        head_pred = data_scaler.inverse_transform(head_pred)
+    targets = _ensure_bhnc_for_pseudo(targets)
+    horizon = head_pred.shape[2]
+    if targets.shape[1] != horizon:
+        targets = targets[:, :horizon]
+    if targets_mask is None:
+        mask = torch.ones_like(targets, dtype=torch.bool)
+    else:
+        mask = targets_mask
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(-1)
+        if mask.shape[1] != horizon:
+            mask = mask[:, :horizon]
+        mask = mask.to(device=head_pred.device, dtype=torch.bool)
+        if tuple(mask.shape) != tuple(targets.shape):
+            mask = mask.expand_as(targets)
+    abs_error = (head_pred - targets.unsqueeze(1)).abs()
+    mask_5d = mask.unsqueeze(1).expand_as(abs_error)
+    counts = mask_5d.to(abs_error.dtype).sum(dim=(2, 3, 4)).clamp_min(1.0)
+    return (abs_error * mask_5d.to(abs_error.dtype)).sum(dim=(2, 3, 4)) / counts
+
+
+def maybe_attach_pseudo_env_assignment(
+    output: Dict[str, torch.Tensor],
+    batch: Dict[str, torch.Tensor],
+    cfg: Dict,
+    cache: PseudoEnvCache | None,
+    epoch: int,
+    cache_updated: bool,
+) -> None:
+    if not pseudo_env_is_active(cfg, epoch):
+        return
+    loss_cfg = cfg["LOSS"]
+    output["pseudo_env_cache_updated"] = bool(cache_updated)
+    output["pseudo_env_smoothing_enabled"] = bool(loss_cfg.get("pseudo_env_use_temporal_smoothing", True))
+    if (
+        cache is None
+        or not bool(loss_cfg.get("pseudo_env_use_global_cache", True))
+        or str(loss_cfg.get("pseudo_env_level", "window")).lower() != "window"
+        or "sample_index" not in batch
+    ):
+        return
+    mode = str(loss_cfg.get("pseudo_env_assignment_mode", "cached_soft")).lower()
+    if mode not in {"cached_soft", "cached_hard"}:
+        return
+    output["pseudo_env_q_weight"] = cache.read(
+        batch["sample_index"],
+        device=output["prediction"].device,
+        hard=(mode == "cached_hard"),
+    )
+
+
+@torch.no_grad()
+def update_pseudo_env_cache(
+    model: torch.nn.Module,
+    train_dataset: Dataset,
+    cfg: Dict,
+    device: torch.device,
+    data_scaler: ZScoreDataScaler,
+    cache: PseudoEnvCache,
+) -> None:
+    loss_cfg = cfg["LOSS"]
+    if str(loss_cfg.get("pseudo_env_level", "window")).lower() != "window":
+        warnings.warn("Pseudo-env global cache currently supports window-level assignments only; using batch assignments.", RuntimeWarning)
+        return
+    loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["TRAIN"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["TRAIN"].get("num_workers", 0),
+        pin_memory=cfg["TRAIN"].get("pin_memory", True) and torch.cuda.is_available(),
+        drop_last=False,
+    )
+    was_training = model.training
+    model.eval()
+    input_key = cfg["DATASET"].get("input_key", "inputs")
+    target_key = cfg["DATASET"].get("target_key", "targets")
+    tau = max(float(loss_cfg.get("pseudo_env_tau", 1.0)), 1e-6)
+    for raw_batch in loader:
+        raw_batch = to_device_batch(raw_batch, device)
+        if "sample_index" not in raw_batch:
+            continue
+        batch = preprocess_batch(raw_batch, cfg, data_scaler)
+        output = model(
+            batch[input_key],
+            y_true=batch[target_key],
+            **get_time_kwargs(batch, cfg, include_future=True),
+        )
+        targets_for_loss = raw_batch[target_key] if str(loss_cfg.get("train_loss_scale", "normalized")).lower() == "original" else batch[target_key]
+        loss_head = compute_pseudo_env_loss_head_for_cache(
+            output,
+            targets_for_loss,
+            batch.get("targets_mask"),
+            cfg,
+            data_scaler,
+        )
+        q_env = torch.softmax(-loss_head / tau, dim=-1)
+        cache.write(raw_batch["sample_index"], loss_head, q_env)
+    if bool(loss_cfg.get("pseudo_env_use_temporal_smoothing", True)):
+        cache.smooth_hard_assignments(int(loss_cfg.get("pseudo_env_smooth_radius", 2)))
+    if was_training:
+        model.train()
 
 
 class TimeChannelSoftGradientConsensus:
@@ -814,6 +1185,176 @@ def register_grad_consensus_hook(
     grad_consensus.register(z_tensor, current_epoch=epoch, using_fallback=using_fallback)
 
 
+class InvariantGradientSurgery:
+    """Conflict-aware gradient surgery for invariant encoder parameters only.
+
+    This module does not alter the forward graph and does not introduce any
+    environment/domain/group/proxy partition. It computes primary and auxiliary
+    gradients for the selected invariant encoder parameters, lets the normal
+    total loss backward populate every module's gradients, then replaces only
+    those invariant encoder gradients with the PCGrad-composed result.
+    """
+
+    def __init__(self, cfg: Optional[Dict]) -> None:
+        cfg = cfg or {}
+        self.enabled = bool(cfg.get("enabled", False))
+        self.method = str(cfg.get("method", "pcgrad") or "pcgrad").lower()
+        self.apply_to = str(cfg.get("apply_to", "inv_encoder") or "inv_encoder")
+        self.primary_losses = list(cfg.get("primary_losses", ["pred", "inv"]) or [])
+        self.aux_losses = list(cfg.get("aux_losses", ["envpred", "future_mi", "swap", "sep", "sparse"]) or [])
+        self.eps = max(float(cfg.get("eps", 1e-12)), 1e-12)
+        self.latest_stats = self._empty_stats()
+        self._warned: set[str] = set()
+
+    @staticmethod
+    def _empty_stats() -> Dict[str, float]:
+        return {
+            "grad_surgery/enabled": 0.0,
+            "grad_surgery/conflict_cos": 0.0,
+            "grad_surgery/conflict_dot": 0.0,
+            "grad_surgery/projection_norm": 0.0,
+            "grad_surgery/aux_grad_norm": 0.0,
+            "grad_surgery/primary_grad_norm": 0.0,
+        }
+
+    def _warn_once(self, key: str, message: str) -> None:
+        if key not in self._warned:
+            warnings.warn(message, RuntimeWarning)
+            self._warned.add(key)
+
+    def select_params(self, model: torch.nn.Module) -> list[torch.nn.Parameter]:
+        if not self.enabled:
+            return []
+        if self.apply_to != "inv_encoder":
+            self._warn_once(
+                "apply_to",
+                "grad_surgery currently supports apply_to='inv_encoder' only; skipping surgery.",
+            )
+            return []
+        modules = []
+        backbone = getattr(model, "backbone", None)
+        if isinstance(backbone, torch.nn.Module):
+            modules.append(backbone)
+        z_time_adapter = getattr(model, "z_time_adapter", None)
+        if isinstance(z_time_adapter, torch.nn.Module):
+            modules.append(z_time_adapter)
+        params: list[torch.nn.Parameter] = []
+        seen = set()
+        for module in modules:
+            for param in module.parameters():
+                if param.requires_grad and id(param) not in seen:
+                    params.append(param)
+                    seen.add(id(param))
+        if not params:
+            self._warn_once("no_params", "grad_surgery found no invariant encoder parameters; skipping surgery.")
+        return params
+
+    @staticmethod
+    def _sum_terms(terms: Dict[str, torch.Tensor], names: list[str], like: torch.Tensor) -> torch.Tensor:
+        total = like.new_zeros(())
+        for name in names:
+            value = terms.get(name)
+            if isinstance(value, torch.Tensor):
+                total = total + value
+        return total
+
+    def _flat_grads(
+        self,
+        loss: torch.Tensor,
+        params: list[torch.nn.Parameter],
+        scale: float,
+        retain_graph: bool,
+    ) -> torch.Tensor:
+        if not loss.requires_grad:
+            flat_zeros = [
+                torch.zeros_like(param, memory_format=torch.preserve_format).reshape(-1)
+                for param in params
+            ]
+            if not flat_zeros:
+                return loss.new_zeros((0,))
+            return torch.cat(flat_zeros)
+        grads = torch.autograd.grad(
+            loss * scale,
+            params,
+            retain_graph=retain_graph,
+            allow_unused=True,
+        )
+        flat = []
+        for param, grad in zip(params, grads):
+            if grad is None:
+                flat.append(torch.zeros_like(param, memory_format=torch.preserve_format).reshape(-1))
+            else:
+                flat.append(grad.reshape(-1))
+        if not flat:
+            return loss.new_zeros((0,))
+        return torch.cat(flat)
+
+    def prepare(
+        self,
+        loss_terms: Optional[Dict[str, torch.Tensor]],
+        params: list[torch.nn.Parameter],
+        scale: float,
+        like: torch.Tensor,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        self.latest_stats = self._empty_stats()
+        if not self.enabled:
+            return None
+        if self.method == "cagrad":
+            self._warn_once("cagrad", "grad_surgery method='cagrad' is not implemented; falling back to pcgrad.")
+        elif self.method != "pcgrad":
+            raise ValueError("LOSS.grad_surgery.method must be 'pcgrad' or 'cagrad'")
+        if not params or not isinstance(loss_terms, dict):
+            return None
+
+        primary_loss = self._sum_terms(loss_terms, self.primary_losses, like)
+        aux_loss = self._sum_terms(loss_terms, self.aux_losses, like)
+        primary_grad = self._flat_grads(primary_loss, params, scale, retain_graph=True)
+        aux_grad = self._flat_grads(aux_loss, params, scale, retain_graph=True)
+        if primary_grad.numel() == 0:
+            return None
+
+        dot = torch.dot(aux_grad.float(), primary_grad.float())
+        primary_norm = primary_grad.float().norm()
+        aux_norm = aux_grad.float().norm()
+        projection_norm = primary_grad.new_zeros(())
+        aux_projected = aux_grad
+        has_conflict = bool((dot < 0).detach().item()) and bool((primary_norm > self.eps).detach().item())
+        if has_conflict:
+            projection = (dot / primary_norm.pow(2).clamp_min(self.eps)).to(aux_grad.dtype) * primary_grad
+            aux_projected = aux_grad - projection
+            projection_norm = projection.float().norm().to(primary_grad.dtype)
+        final_grad = primary_grad + aux_projected
+        cos = dot / (primary_norm * aux_norm).clamp_min(self.eps)
+        self.latest_stats = {
+            "grad_surgery/enabled": 1.0,
+            "grad_surgery/conflict_cos": float(cos.detach().cpu()),
+            "grad_surgery/conflict_dot": float(dot.detach().cpu()),
+            "grad_surgery/projection_norm": float(projection_norm.detach().cpu()),
+            "grad_surgery/aux_grad_norm": float(aux_norm.detach().cpu()),
+            "grad_surgery/primary_grad_norm": float(primary_norm.detach().cpu()),
+        }
+        return {"final_grad": final_grad.detach()}
+
+    def apply(self, params: list[torch.nn.Parameter], prepared: Optional[Dict[str, torch.Tensor]]) -> None:
+        if not self.enabled or prepared is None:
+            return
+        flat = prepared["final_grad"]
+        offset = 0
+        for param in params:
+            numel = param.numel()
+            grad = flat[offset: offset + numel].view_as(param).to(device=param.device, dtype=param.dtype)
+            if param.grad is None:
+                param.grad = grad.clone(memory_format=torch.preserve_format)
+            else:
+                param.grad.detach().copy_(grad)
+            offset += numel
+
+    def log_tensors(self, like: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if not self.enabled:
+            return {}
+        return {key: like.new_tensor(float(value)) for key, value in self.latest_stats.items()}
+
+
 class BackboneOnlyForecastModel(torch.nn.Module):
     """Forecast directly from the configured backbone without NUE/FPEM modules."""
 
@@ -1010,12 +1551,16 @@ def slice_for_train_horizon(
         "pred_fut_mu_minus",
         "pred_fut_logvar_minus",
         "future_time_emb",
+        "pseudo_env_head_pred",
     }
     sliced = dict(output)
     for key in horizon_keys:
         value = sliced.get(key)
         if isinstance(value, torch.Tensor) and value.dim() >= 2 and value.shape[1] == full_horizon:
             sliced[key] = value[:, :horizon]
+    pseudo_head = sliced.get("pseudo_env_head_pred")
+    if isinstance(pseudo_head, torch.Tensor) and pseudo_head.dim() == 5 and pseudo_head.shape[2] == full_horizon:
+        sliced["pseudo_env_head_pred"] = pseudo_head[:, :, :horizon]
     y_true_sliced = y_true[:, :horizon] if isinstance(y_true, torch.Tensor) and y_true.shape[1] >= horizon else y_true
     mask_sliced = (
         targets_mask[:, :horizon]
@@ -1111,6 +1656,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             "seq_time_emb",
             "cur_time_emb",
             "future_time_emb",
+            "pseudo_env_head_pred",
         ]:
             value = output.get(key)
             if value is None:
@@ -1118,6 +1664,11 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             else:
                 print(f"{key}: {tuple(value.shape)}")
                 assert_finite(value, key)
+        if pseudo_env_enabled(cfg):
+            expected_pseudo = (batch_size, int(cfg["LOSS"].get("pseudo_env_k", 3)), output_len, num_nodes, output_dim)
+            value = output.get("pseudo_env_head_pred")
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pseudo:
+                raise AssertionError(f"pseudo_env_head_pred expected {expected_pseudo}, got {None if value is None else tuple(value.shape)}")
         aligned = align_target(targets, output["prediction"])
         print(f"aligned_targets: {tuple(aligned.shape)}")
         return
@@ -1143,13 +1694,18 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         if tuple(value.shape) != expected_shape:
             raise AssertionError(f"{key} expected {expected_shape}, got {tuple(value.shape)}")
         assert_finite(value, key)
-    for key in ["z_seq", "prediction_swap", "rho_swap", "env_perm"]:
+    for key in ["z_seq", "prediction_swap", "rho_swap", "env_perm", "pseudo_env_head_pred"]:
         value = output.get(key)
         if value is None:
             print(f"{key}: None")
         else:
             print(f"{key}: {tuple(value.shape)}")
             assert_finite(value, key)
+    if pseudo_env_enabled(cfg):
+        expected_pseudo = (batch_size, int(cfg["LOSS"].get("pseudo_env_k", 3)), output_len, num_nodes, output_dim)
+        value = output.get("pseudo_env_head_pred")
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pseudo:
+            raise AssertionError(f"pseudo_env_head_pred expected {expected_pseudo}, got {None if value is None else tuple(value.shape)}")
     for key in ["env_fut", "persist_q", "persist_k", "persist_score"]:
         value = output.get(key)
         if value is None:
@@ -1259,6 +1815,8 @@ def debug_batch(cfg: Dict) -> None:
         print(f"unsupported_reason: {exc.reason}")
         return
     grad_consensus = TimeChannelSoftGradientConsensus(cfg["LOSS"].get("grad_consensus", {}))
+    grad_surgery = InvariantGradientSurgery(cfg["LOSS"].get("grad_surgery", {}))
+    grad_surgery_params = grad_surgery.select_params(model)
     loss_fn.set_epoch(1)
     model.train()
 
@@ -1330,6 +1888,33 @@ def debug_batch(cfg: Dict) -> None:
         f"warmup_epochs={grad_consensus.warmup_epochs} "
         f"use_ema={grad_consensus.use_ema}"
     )
+    print(
+        "grad_surgery: "
+        f"enabled={grad_surgery.enabled} "
+        f"method={grad_surgery.method} "
+        f"apply_to={grad_surgery.apply_to} "
+        f"num_params={len(grad_surgery_params)}"
+    )
+    z_inv_ib_cfg = cfg["LOSS"].get("z_inv_bottleneck", {})
+    if bool(z_inv_ib_cfg.get("enabled", False)):
+        print(
+            "z_inv_bottleneck: "
+            f"enabled=True "
+            f"type={z_inv_ib_cfg.get('type', 'vib')} "
+            f"beta={float(z_inv_ib_cfg.get('beta', 1.0e-4))} "
+            f"predict_from_sampled_z={bool(z_inv_ib_cfg.get('predict_from_sampled_z', True))}"
+        )
+    if pseudo_env_enabled(cfg):
+        print(
+            "pseudo_env_heads: "
+            f"enabled=True "
+            f"k={cfg['LOSS'].get('pseudo_env_k', 3)} "
+            f"tau={cfg['LOSS'].get('pseudo_env_tau', 1.0)} "
+            f"assignment_mode={cfg['LOSS'].get('pseudo_env_assignment_mode', 'cached_soft')} "
+            f"global_cache={cfg['LOSS'].get('pseudo_env_use_global_cache', True)} "
+            f"temporal_smoothing={cfg['LOSS'].get('pseudo_env_use_temporal_smoothing', True)} "
+            f"level={cfg['LOSS'].get('pseudo_env_level', 'window')}"
+        )
     print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
     print(f"{target_key}_raw: {tuple(raw_batch[target_key].shape)}")
     print(f"{input_key}_scaled: {tuple(batch[input_key].shape)}")
@@ -1360,6 +1945,7 @@ def debug_batch(cfg: Dict) -> None:
         y_true=batch[target_key],
         **get_time_kwargs(batch, cfg, include_future=True),
     )
+    maybe_attach_pseudo_env_assignment(output, batch, cfg, None, epoch=1, cache_updated=False)
     register_grad_consensus_hook(output, grad_consensus, epoch=1)
     check_output_shapes(output, batch[target_key], cfg)
     debug_horizon = curriculum_horizon(train_cfg, 1, cfg["DATASET"]["output_len"])
@@ -1376,6 +1962,43 @@ def debug_batch(cfg: Dict) -> None:
         loss_mask,
         raw_y_true=loss_raw_targets,
         data_scaler=data_scaler,
+    )
+    if pseudo_env_enabled(cfg):
+        head_pred = loss_output.get("pseudo_env_head_pred")
+        if not isinstance(head_pred, torch.Tensor):
+            raise AssertionError("pseudo_env_heads enabled but pseudo_env_head_pred is missing.")
+        loss_cfg = cfg["LOSS"]
+        targets_for_debug = (
+            loss_raw_targets
+            if str(loss_cfg.get("train_loss_scale", "normalized")).lower() == "original"
+            else loss_targets
+        )
+        loss_head = compute_pseudo_env_loss_head_for_cache(
+            loss_output,
+            targets_for_debug,
+            loss_mask,
+            cfg,
+            data_scaler,
+        )
+        expected_shape = (head_pred.shape[0], int(loss_cfg.get("pseudo_env_k", 3)))
+        if tuple(loss_head.shape) != expected_shape:
+            raise AssertionError(f"loss_head must be [B,K]={expected_shape}, got {tuple(loss_head.shape)}")
+        q_env = torch.softmax(-loss_head / max(float(loss_cfg.get("pseudo_env_tau", 1.0)), 1e-6), dim=-1)
+        q_row_sum_error = (q_env.sum(dim=-1) - 1.0).abs().max().item()
+        if q_row_sum_error > 1e-5:
+            raise AssertionError(f"pseudo_env q_env rows do not sum to 1 (max_error={q_row_sum_error:.6e})")
+        print(
+            "pseudo_env_debug: "
+            f"head_pred_shape={tuple(head_pred.shape)} "
+            f"loss_head_shape={tuple(loss_head.shape)} "
+            f"q_row_sum_max_error={q_row_sum_error:.6e}"
+        )
+    loss_terms = logs.pop("__loss_terms__", None)
+    surgery_prepared = grad_surgery.prepare(
+        loss_terms,
+        grad_surgery_params,
+        scale=1.0,
+        like=output["prediction"],
     )
     perturb_enabled = bool(cfg["MODEL"].get("perturb_enabled", False))
     print(f"perturb_enabled={perturb_enabled}")
@@ -1416,7 +2039,46 @@ def debug_batch(cfg: Dict) -> None:
         )
     logs["curriculum_horizon"] = output["prediction"].new_tensor(float(debug_horizon))
     loss.backward()
+    non_surgery_grad_snapshots = []
+    surgery_grad_snapshots = []
+    if grad_surgery.enabled:
+        surgery_param_ids = {id(param) for param in grad_surgery_params}
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if id(param) in surgery_param_ids:
+                surgery_grad_snapshots.append((name, param, param.grad.detach().clone()))
+            else:
+                non_surgery_grad_snapshots.append((name, param, param.grad.detach().clone()))
+    grad_surgery.apply(grad_surgery_params, surgery_prepared)
+    if grad_surgery.enabled:
+        max_non_surgery_delta = 0.0
+        for _name, param, grad_before in non_surgery_grad_snapshots:
+            if param.grad is None:
+                delta = grad_before.float().abs().max()
+            else:
+                delta = (param.grad.detach().float() - grad_before.float()).abs().max()
+            max_non_surgery_delta = max(max_non_surgery_delta, float(delta.cpu()))
+        surgery_delta_sq = 0.0
+        for _name, param, grad_before in surgery_grad_snapshots:
+            if param.grad is None:
+                delta = grad_before.float()
+            else:
+                delta = param.grad.detach().float() - grad_before.float()
+            surgery_delta_sq += float(delta.pow(2).sum().cpu())
+        surgery_delta_norm = math.sqrt(surgery_delta_sq)
+        print(
+            "grad_surgery_debug: "
+            f"non_inv_grad_max_delta={max_non_surgery_delta:.6e} "
+            f"inv_grad_delta_norm={surgery_delta_norm:.6e}"
+        )
+        if max_non_surgery_delta > 0.0:
+            raise AssertionError(
+                "grad_surgery changed gradients outside invariant encoder parameters "
+                f"(max_delta={max_non_surgery_delta:.6e})"
+            )
     logs.update(grad_consensus.log_tensors(output["prediction"]))
+    logs.update(grad_surgery.log_tensors(output["prediction"]))
     assert_finite(loss, "total_loss")
     assert_finite(output["rho"], "rho")
     pred_original = data_scaler.inverse_transform(output["prediction"])
@@ -1453,10 +2115,22 @@ def debug_batch(cfg: Dict) -> None:
     print(f"debug_original_scale_rmse={float(original_rmse.detach().cpu()):.6f}")
     print(f"debug_original_scale_mape={float(original_mape.detach().cpu()):.6f}")
     print_metric_debug_diagnostics(cfg, raw_batch, batch, output, data_scaler)
-    debug_log_keys = LOG_KEYS
+    ib_enabled = z_inv_bottleneck_enabled(cfg)
+    ib_log_keys = [key for key in logs if key == "loss_z_inv_ib" or key.startswith("z_inv_ib/")]
+    if ib_enabled:
+        if "loss_z_inv_ib" not in logs:
+            raise AssertionError("z_inv_bottleneck is enabled but loss_z_inv_ib was not logged.")
+        ib_type = str(cfg["LOSS"]["z_inv_bottleneck"].get("type", "vib")).lower()
+        ib_loss_value = float(logs["loss_z_inv_ib"].detach().cpu())
+        print(f"z_inv_bottleneck_debug: enabled=True type={ib_type} loss_z_inv_ib={ib_loss_value:.6e}")
+        if ib_type != "gaussian_noise" and ib_loss_value <= 0.0:
+            raise AssertionError("z_inv_bottleneck expected a positive loss_z_inv_ib for vib/l2_norm debug mode.")
+    elif ib_log_keys:
+        raise AssertionError(f"z_inv_bottleneck is disabled but logged keys appeared: {ib_log_keys}")
+    debug_log_keys = log_keys_for_config(cfg)
     if not perturb_enabled:
         debug_log_keys = [
-            key for key in LOG_KEYS
+            key for key in debug_log_keys
             if key not in {"z_cons_loss", "y_cons_loss", "effective_lambda_z_cons", "effective_lambda_y_cons"}
         ]
     print(format_logs(logs, debug_log_keys))
@@ -1899,6 +2573,7 @@ def make_checkpoint_payload(
     global_step: int,
     best_val: float,
     patience: int,
+    pseudo_env_cache: PseudoEnvCache | None = None,
     extra: Dict | None = None,
 ) -> Dict:
     payload = {
@@ -1917,6 +2592,8 @@ def make_checkpoint_payload(
         "best_select_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
         "patience": patience,
     }
+    if pseudo_env_cache is not None:
+        payload["pseudo_env_cache"] = pseudo_env_cache.state_dict()
     if extra:
         payload.update(extra)
     return payload
@@ -1961,7 +2638,17 @@ def restore_training_state(
     train_cfg: Dict,
 ) -> tuple[int, int, float, int]:
     strict = bool(train_cfg.get("resume_strict", True))
-    model.load_state_dict(checkpoint["model"], strict=strict)
+    try:
+        model.load_state_dict(checkpoint["model"], strict=strict)
+    except RuntimeError as exc:
+        if not strict or not bool(train_cfg.get("resume_allow_missing_pseudo_env", True)):
+            raise
+        warnings.warn(
+            f"Checkpoint {path} is missing or has extra pseudo-env head parameters; "
+            "loading model weights with strict=False.",
+            RuntimeWarning,
+        )
+        model.load_state_dict(checkpoint["model"], strict=False)
     if bool(train_cfg.get("resume_load_optimizer", True)) and checkpoint.get("optimizer") is not None:
         optimizer.load_state_dict(checkpoint["optimizer"])
     if (
@@ -2014,7 +2701,7 @@ def append_train_log(cfg: Dict, row: Dict) -> None:
     if not cfg["LOGGING"].get("save_csv_log", True):
         return
     csv_path = Path(cfg["TRAIN"]["ckpt_dir"]) / cfg["LOGGING"].get("csv_log_path", "train_log.csv")
-    append_csv_log(csv_path, row, CSV_FIELDS)
+    append_csv_log(csv_path, row, csv_fields_for_config(cfg))
 
 
 def train_local(cfg: Dict) -> None:
@@ -2039,6 +2726,20 @@ def train_local(cfg: Dict) -> None:
     optimizer = build_optimizer(cfg, model)
     lr_scheduler = build_lr_scheduler(cfg, optimizer)
     grad_consensus = TimeChannelSoftGradientConsensus(cfg["LOSS"].get("grad_consensus", {}))
+    grad_surgery = InvariantGradientSurgery(cfg["LOSS"].get("grad_surgery", {}))
+    grad_surgery_params = grad_surgery.select_params(model)
+    pseudo_env_cache = None
+    if (
+        pseudo_env_enabled(cfg)
+        and bool(cfg["LOSS"].get("pseudo_env_use_global_cache", True))
+        and str(cfg["LOSS"].get("pseudo_env_level", "window")).lower() == "window"
+    ):
+        pseudo_env_cache = PseudoEnvCache(len(train_loader.dataset), int(cfg["LOSS"].get("pseudo_env_k", 3)))
+        print(
+            "[pseudo-env] global cache enabled "
+            f"samples={pseudo_env_cache.num_samples} heads={pseudo_env_cache.num_heads} "
+            f"assignment_mode={cfg['LOSS'].get('pseudo_env_assignment_mode', 'cached_soft')}"
+        )
     scaler = torch.cuda.amp.GradScaler(enabled=train_cfg.get("amp", False) and device.type == "cuda")
     autocast_ctx = (
         torch.cuda.amp.autocast
@@ -2075,6 +2776,9 @@ def train_local(cfg: Dict) -> None:
                 scaler,
                 train_cfg,
             )
+            if pseudo_env_cache is not None and isinstance(checkpoint.get("pseudo_env_cache"), dict):
+                pseudo_env_cache.load_state_dict(checkpoint["pseudo_env_cache"])
+                print(f"[pseudo-env] restored cache from {resume_path}")
             ckpt_select_split = checkpoint.get("best_select_split")
             ckpt_select_metric = checkpoint.get("best_select_metric")
             if ckpt_select_split != best_select_split or ckpt_select_metric != best_select_metric:
@@ -2104,6 +2808,20 @@ def train_local(cfg: Dict) -> None:
         last_epoch_ran = epoch
         if hasattr(loss_fn, "set_epoch"):
             loss_fn.set_epoch(epoch)
+        pseudo_env_cache_updated = False
+        if pseudo_env_cache is not None and pseudo_env_is_active(cfg, epoch):
+            update_interval = max(1, int(cfg["LOSS"].get("pseudo_env_update_interval", 1)))
+            if epoch % update_interval == 0:
+                update_pseudo_env_cache(model, train_loader.dataset, cfg, device, data_scaler, pseudo_env_cache)
+                pseudo_env_cache_updated = True
+                cache_summary = pseudo_env_cache.summary()
+                print(
+                    "[pseudo-env] "
+                    f"epoch={epoch} cache_updated=True "
+                    f"counts={cache_summary['counts']} "
+                    f"entropy={cache_summary['entropy']:.6f} "
+                    f"qmax={cache_summary['qmax']:.6f}"
+                )
         model.train()
         meters = AverageMeterDict()
         for batch_idx, batch in enumerate(train_loader, start=1):
@@ -2118,6 +2836,14 @@ def train_local(cfg: Dict) -> None:
                     batch[input_key],
                     y_true=batch[target_key],
                     **get_time_kwargs(batch, cfg, include_future=True),
+                )
+                maybe_attach_pseudo_env_assignment(
+                    output,
+                    batch,
+                    cfg,
+                    pseudo_env_cache,
+                    epoch=epoch,
+                    cache_updated=pseudo_env_cache_updated,
                 )
                 register_grad_consensus_hook(output, grad_consensus, epoch=epoch)
                 train_horizon = curriculum_horizon(train_cfg, epoch, cfg["DATASET"]["output_len"])
@@ -2135,9 +2861,18 @@ def train_local(cfg: Dict) -> None:
                     raw_y_true=loss_raw_targets,
                     data_scaler=data_scaler,
                 )
+                loss_terms = logs.pop("__loss_terms__", None)
+                surgery_prepared = grad_surgery.prepare(
+                    loss_terms,
+                    grad_surgery_params,
+                    scale=float(scaler.get_scale()) if scaler.is_enabled() else 1.0,
+                    like=output["prediction"],
+                )
                 logs["curriculum_horizon"] = output["prediction"].new_tensor(float(train_horizon))
             scaler.scale(loss).backward()
+            grad_surgery.apply(grad_surgery_params, surgery_prepared)
             logs.update(grad_consensus.log_tensors(output["prediction"]))
+            logs.update(grad_surgery.log_tensors(output["prediction"]))
             grad_clip = train_cfg.get("grad_clip")
             if grad_clip:
                 scaler.unscale_(optimizer)
@@ -2156,7 +2891,7 @@ def train_local(cfg: Dict) -> None:
                     **make_val_metric_row({}, lr=current_lr(optimizer)),
                 }
                 append_train_log(cfg, row)
-                print(f"epoch={epoch} step={global_step} {format_logs(scalar_logs, LOG_KEYS)}")
+                print(f"epoch={epoch} step={global_step} {format_logs(scalar_logs, log_keys_for_config(cfg))}")
 
         epoch_logs = meters.mean()
         append_train_log(
@@ -2261,7 +2996,8 @@ def train_local(cfg: Dict) -> None:
                             global_step,
                             best_val,
                             patience,
-                            {
+                            pseudo_env_cache=pseudo_env_cache,
+                            extra={
                                 "best_select_split": best_select_split,
                                 "best_select_metric": best_select_metric,
                                 "best_select_score": best_val,
@@ -2364,6 +3100,7 @@ def train_local(cfg: Dict) -> None:
                     global_step,
                     best_val,
                     patience,
+                    pseudo_env_cache=pseudo_env_cache,
                 ),
                 ckpt_dir / "last.pt",
             )
@@ -2421,6 +3158,63 @@ def train_with_basicts_launcher(cfg: Dict) -> None:
     BasicTSLauncher.launch_training(basicts_cfg)
 
 
+def _parse_optional_bool(value) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Expected boolean value, got {value!r}")
+
+
+def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
+    loss_cfg = cfg.setdefault("LOSS", {})
+    bool_fields = {
+        "use_pseudo_env_heads": "use_pseudo_env_heads",
+        "pseudo_env_detach_assignment": "pseudo_env_detach_assignment",
+        "pseudo_env_use_global_cache": "pseudo_env_use_global_cache",
+        "pseudo_env_use_temporal_smoothing": "pseudo_env_use_temporal_smoothing",
+    }
+    int_fields = {
+        "pseudo_env_k": "pseudo_env_k",
+        "pseudo_env_warmup_epochs": "pseudo_env_warmup_epochs",
+        "pseudo_env_update_interval": "pseudo_env_update_interval",
+        "pseudo_env_smooth_radius": "pseudo_env_smooth_radius",
+    }
+    float_fields = {
+        "pseudo_env_tau": "pseudo_env_tau",
+        "pseudo_env_lambda_head": "pseudo_env_lambda_head",
+        "pseudo_env_lambda_var": "pseudo_env_lambda_var",
+        "pseudo_env_lambda_balance": "pseudo_env_lambda_balance",
+        "pseudo_env_lambda_entropy": "pseudo_env_lambda_entropy",
+        "pseudo_env_lambda_diverse": "pseudo_env_lambda_diverse",
+    }
+    str_fields = {
+        "pseudo_env_assignment_mode": "pseudo_env_assignment_mode",
+        "pseudo_env_level": "pseudo_env_level",
+    }
+    for arg_name, cfg_name in bool_fields.items():
+        parsed = _parse_optional_bool(getattr(args, arg_name, None))
+        if parsed is not None:
+            loss_cfg[cfg_name] = parsed
+    for arg_name, cfg_name in int_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            loss_cfg[cfg_name] = int(value)
+    for arg_name, cfg_name in float_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            loss_cfg[cfg_name] = float(value)
+    for arg_name, cfg_name in str_fields.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            loss_cfg[cfg_name] = str(value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="NUE-STG experiment entrypoint.")
     parser.add_argument("--config", "--config_file", dest="config", required=True, help="Path to Python config file.")
@@ -2428,9 +3222,26 @@ def main() -> None:
     parser.add_argument("--runner", choices=["local", "basicts"], default="local")
     parser.add_argument("--set", dest="dotlist", action="append", default=[], help="Override config, e.g. LOSS.lambda_kl=1e-5")
     parser.add_argument("--ablation", action="append", default=[], help="Apply named ablation.")
+    parser.add_argument("--use_pseudo_env_heads", nargs="?", const="True", default=None)
+    parser.add_argument("--pseudo_env_k", type=int, default=None)
+    parser.add_argument("--pseudo_env_tau", type=float, default=None)
+    parser.add_argument("--pseudo_env_lambda_head", type=float, default=None)
+    parser.add_argument("--pseudo_env_lambda_var", type=float, default=None)
+    parser.add_argument("--pseudo_env_lambda_balance", type=float, default=None)
+    parser.add_argument("--pseudo_env_lambda_entropy", type=float, default=None)
+    parser.add_argument("--pseudo_env_lambda_diverse", type=float, default=None)
+    parser.add_argument("--pseudo_env_warmup_epochs", type=int, default=None)
+    parser.add_argument("--pseudo_env_update_interval", type=int, default=None)
+    parser.add_argument("--pseudo_env_detach_assignment", nargs="?", const="True", default=None)
+    parser.add_argument("--pseudo_env_use_global_cache", nargs="?", const="True", default=None)
+    parser.add_argument("--pseudo_env_use_temporal_smoothing", nargs="?", const="True", default=None)
+    parser.add_argument("--pseudo_env_smooth_radius", type=int, default=None)
+    parser.add_argument("--pseudo_env_assignment_mode", default=None)
+    parser.add_argument("--pseudo_env_level", default=None)
     args = parser.parse_args()
 
     cfg = resolve_cli_config(args.config, args.ablation, args.dotlist)
+    apply_pseudo_env_cli_args(cfg, args)
     if args.debug_batch:
         debug_batch(cfg)
         return

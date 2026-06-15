@@ -1,0 +1,14 @@
+{
+  "best_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/fpem_env_residual_z_inv_ib_vib_stexpert_protocol/best_metrics.json",
+  "best_score": 19.587779998779297,
+  "best_select_metric": "mae",
+  "best_select_split": "test",
+  "best_test_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/fpem_env_residual_z_inv_ib_vib_stexpert_protocol/best_test_metrics.json",
+  "best_val": 19.587779998779297,
+  "epoch": 39,
+  "global_step": 6513,
+  "last_checkpoint_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/fpem_env_residual_z_inv_ib_vib_stexpert_protocol/last.pt",
+  "status": "complete",
+  "stopped_early": true,
+  "target_epochs": 100
+}

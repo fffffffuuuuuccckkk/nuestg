@@ -1,0 +1,1 @@
+ABLATIONS="weak_film env_residual weak_film_no_swap weak_film_tc_sgc" bash scripts/run_pems08_ood_fpem_weak_fusion_stexpert_protocol.sh
