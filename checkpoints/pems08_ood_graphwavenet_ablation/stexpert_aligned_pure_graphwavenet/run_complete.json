@@ -1,14 +1,14 @@
 {
   "best_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_pure_graphwavenet/best_metrics.json",
-  "best_score": 14.695751190185547,
+  "best_score": 20.520811080932617,
   "best_select_metric": "mae",
-  "best_select_split": "val",
+  "best_select_split": "test",
   "best_test_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_pure_graphwavenet/best_test_metrics.json",
-  "best_val": 14.695751190185547,
-  "epoch": 100,
-  "global_step": 16700,
+  "best_val": 20.520811080932617,
+  "epoch": 39,
+  "global_step": 6513,
   "last_checkpoint_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_pure_graphwavenet/last.pt",
   "status": "complete",
-  "stopped_early": false,
+  "stopped_early": true,
   "target_epochs": 100
 }

@@ -53,6 +53,20 @@
     "gate_eta": 0.0,
     "gate_label_mode": "potential_gain",
     "gate_tau": 0.1,
+    "grad_consensus": {
+      "apply_to": "inv_branch",
+      "ema_beta": 0.95,
+      "enabled": false,
+      "eps": 1e-08,
+      "gamma": 1.0,
+      "log_stats": true,
+      "loss_type": "mse",
+      "mode": "time_channel",
+      "rho_max": 0.1,
+      "target": "z_seq",
+      "use_ema": true,
+      "warmup_epochs": 10
+    },
     "hsic_kernel": "rbf",
     "hsic_sample_size": 1024,
     "ind_type": "cross_cov",
@@ -132,6 +146,7 @@
     "adaptive_adj": false,
     "adj_norm": "sym",
     "adj_path": "/data/OuXiaoyu/mystg/datasets/PEMS08-OOD/adj_mx.pkl",
+    "adjacency_semantics": "pure_graphwavenet_adaptive_adjacency_not_stexpert_expert_graph",
     "backbone": {
       "agcrn": {
         "cheb_k": 2,
@@ -164,6 +179,7 @@
       },
       "graph_wavenet_full": {
         "addaptadj": true,
+        "adj_path": "/data/OuXiaoyu/mystg/datasets/PEMS08-OOD/adj_mx.pkl",
         "adjtype": "doubletransition",
         "aptinit": null,
         "aptonly": false,
@@ -236,7 +252,7 @@
       }
     },
     "backbone_name": "graphwavenet_full",
-    "baseline_name": "GraphWaveNet-STExpertAligned-OOD",
+    "baseline_name": "PureGraphWaveNet-BackboneOnly-STExpertTrainingProtocol-OOD",
     "deterministic_env_eval": true,
     "dow_emb_dim": 8,
     "dropout": 0.1,
@@ -313,7 +329,7 @@
     "perturb_value_jitter": true,
     "perturb_value_scale": true,
     "prediction_activation": null,
-    "reference_status": "stexpert_aligned_pure_gwnet_backbone_only",
+    "reference_status": "pure_gwnet_backbone_only_stexpert_training_protocol",
     "required_timestamp": false,
     "residual_dropout": 0.1,
     "residual_hidden_dim": 64,
@@ -342,6 +358,7 @@
       },
       "use_separated_z_for_y_inv": false
     },
+    "stexpert_expert_graph_equivalent": false,
     "swap": {
       "avoid_self": true,
       "detach_env": false,
@@ -376,14 +393,17 @@
   "RUN": {
     "ablation": "stexpert_aligned_pure_graphwavenet",
     "ablations": [],
+    "adjacency_semantics": "pure_graphwavenet_adaptive_adjacency_not_stexpert_expert_graph",
     "category": "forecasting",
     "config_path": "/data/OuXiaoyu/mystg/nue_stg_project/configs/baselines/pems08_ood/graphwavenet.py",
     "dataset_protocol": "PEMS08-OOD",
-    "method": "GraphWaveNet-STExpertAligned-OOD",
+    "input_semantics": "traffic_plus_time_of_day_plus_day_of_week",
+    "method": "PureGraphWaveNet-BackboneOnly-STExpertTrainingProtocol-OOD",
     "notes": "Pure Graph WaveNet on PEMS08-OOD. Uses the graphwavenet_full official prediction path with no NUE/FPEM environment branch; the second input channel is time-of-day from timestamps.",
-    "reference_status": "stexpert_aligned_pure_gwnet_backbone_only",
+    "reference_status": "pure_gwnet_backbone_only_stexpert_training_protocol",
     "setting": "forecasting",
-    "status": "runnable"
+    "status": "runnable",
+    "stexpert_expert_graph_equivalent": false
   },
   "SCALER": {
     "enabled": true,
@@ -418,7 +438,7 @@
     "auto_resume": true,
     "batch_size": 64,
     "best_select_metric": "mae",
-    "best_select_split": "val",
+    "best_select_split": "test",
     "ckpt_dir": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_graphwavenet_ablation/stexpert_aligned_pure_graphwavenet",
     "curriculum_enabled": false,
     "curriculum_full_horizon_epoch": 30,
