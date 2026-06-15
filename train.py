@@ -262,6 +262,7 @@ def finalize_config(cfg: Dict) -> Dict:
     grad_consensus_cfg.setdefault("ema_beta", 0.95)
     grad_consensus_cfg.setdefault("warmup_epochs", 10)
     grad_consensus_cfg.setdefault("eps", 1e-8)
+    grad_consensus_cfg.setdefault("sand_alpha", 1.0)
     grad_consensus_cfg.setdefault("use_ema", True)
     grad_consensus_cfg.setdefault("loss_type", "mse")
     grad_consensus_cfg.setdefault("log_stats", True)
@@ -592,6 +593,7 @@ class TimeChannelSoftGradientConsensus:
         self.ema_beta = min(max(float(cfg.get("ema_beta", 0.95)), 0.0), 0.999999)
         self.warmup_epochs = int(cfg.get("warmup_epochs", 10))
         self.eps = max(float(cfg.get("eps", 1e-8)), 1e-12)
+        self.sand_alpha = max(0.0, float(cfg.get("sand_alpha", cfg.get("alpha", 1.0))))
         self.use_ema = bool(cfg.get("use_ema", True))
         self.log_stats = bool(cfg.get("log_stats", True))
         self.loss_type = str(cfg.get("loss_type", "mse") or "mse")
@@ -610,6 +612,8 @@ class TimeChannelSoftGradientConsensus:
             "grad_consensus/rho_max": 0.0,
             "grad_consensus/using_fallback_z_inv": float(using_fallback),
             "grad_consensus/ema_agree_mean": 0.0,
+            "grad_consensus/mag_var_mean": 0.0,
+            "grad_consensus/mag_stability_mean": 0.0,
         }
 
     def _warn_once(self, key: str, message: str) -> None:
@@ -647,40 +651,85 @@ class TimeChannelSoftGradientConsensus:
 
                 grad_float = grad_btnd.detach().float()
                 sign_g = grad_float.sign()
-                if self.mode == "time_channel":
+                mag_var = None
+                mag_stability = None
+                if self.mode == "sand_tc":
+                    # Advanced SAND-TC mode stays strictly inside the z hook:
+                    # it uses only the batch-node distribution of grad_z for
+                    # each time-channel location, with no environment/domain/
+                    # group labels, proxy task, or virtual partition.
+                    mean_sign = sign_g.mean(dim=(0, 2))
+                    sign_agree = mean_sign.abs().clamp(0.0, 1.0)
+                    abs_grad = grad_float.abs()
+                    mag_var = abs_grad.var(dim=(0, 2), unbiased=False)
+                    norm_mag_var = mag_var / mag_var.mean().clamp_min(self.eps)
+                    mag_stability = torch.exp(-self.sand_alpha * norm_mag_var).clamp(0.0, 1.0)
+                    agreement_input = (sign_agree * mag_stability).detach()
+                    if self.ema is None or tuple(self.ema.shape) != tuple(agreement_input.shape):
+                        self.ema = torch.zeros_like(agreement_input)
+                    self.ema = self.ema.to(device=agreement_input.device, dtype=agreement_input.dtype)
+                    self.ema.mul_(self.ema_beta).add_(agreement_input, alpha=1.0 - self.ema_beta)
+                    agreement = self.ema.abs().clamp(0.0, 1.0)
+                    direction = grad_float.mean(dim=(0, 2)).sign()
+                    rho = (self.rho_max * agreement.clamp_min(0.0).pow(self.gamma)).clamp(0.0, self.rho_max)
+                    view_shape = (1, agreement.shape[0], 1, agreement.shape[1])
+                    consensus_grad = grad_float.abs() * direction.view(view_shape)
+                    rho_view = rho.view(view_shape)
+                    new_grad = (1.0 - rho_view) * grad_float + rho_view * consensus_grad
+                elif self.mode == "time_channel":
                     m_td = sign_g.mean(dim=(0, 2))
+                    if self.use_ema:
+                        if self.ema is None or tuple(self.ema.shape) != tuple(m_td.shape):
+                            self.ema = torch.zeros_like(m_td)
+                        self.ema = self.ema.to(device=m_td.device, dtype=m_td.dtype)
+                        self.ema.mul_(self.ema_beta).add_(m_td.detach(), alpha=1.0 - self.ema_beta)
+                        consensus_map = self.ema
+                    else:
+                        consensus_map = m_td.detach()
+
+                    agreement = consensus_map.abs().clamp(0.0, 1.0)
+                    direction = consensus_map.sign()
+                    rho = (self.rho_max * agreement.clamp_min(0.0).pow(self.gamma)).clamp(0.0, self.rho_max)
+
+                    view_shape = (1, agreement.shape[0], 1, agreement.shape[1])
+                    consensus_grad = grad_float.abs() * direction.view(view_shape)
+                    rho_view = rho.view(view_shape)
+                    new_grad = (1.0 - rho_view) * grad_float + rho_view * consensus_grad
                 elif self.mode == "channel":
                     m_d = sign_g.mean(dim=(0, 1, 2))
                     m_td = m_d.unsqueeze(0).expand(grad_float.shape[1], -1)
+                    if self.use_ema:
+                        if self.ema is None or tuple(self.ema.shape) != tuple(m_td.shape):
+                            self.ema = torch.zeros_like(m_td)
+                        self.ema = self.ema.to(device=m_td.device, dtype=m_td.dtype)
+                        self.ema.mul_(self.ema_beta).add_(m_td.detach(), alpha=1.0 - self.ema_beta)
+                        consensus_map = self.ema
+                    else:
+                        consensus_map = m_td.detach()
+
+                    agreement = consensus_map.abs().clamp(0.0, 1.0)
+                    direction = consensus_map.sign()
+                    rho = (self.rho_max * agreement.clamp_min(0.0).pow(self.gamma)).clamp(0.0, self.rho_max)
+
+                    view_shape = (1, agreement.shape[0], 1, agreement.shape[1])
+                    consensus_grad = grad_float.abs() * direction.view(view_shape)
+                    rho_view = rho.view(view_shape)
+                    new_grad = (1.0 - rho_view) * grad_float + rho_view * consensus_grad
                 else:
                     self._warn_once(
                         "bad_mode",
-                        f"TC-SGC mode={self.mode!r} is unsupported; expected 'time_channel' or 'channel'.",
+                        f"TC-SGC mode={self.mode!r} is unsupported; expected 'time_channel', 'channel', or 'sand_tc'.",
                     )
                     self.latest_stats = self._empty_stats(using_fallback)
                     return grad
 
-                if self.use_ema:
-                    if self.ema is None or tuple(self.ema.shape) != tuple(m_td.shape):
-                        self.ema = torch.zeros_like(m_td)
-                    self.ema = self.ema.to(device=m_td.device, dtype=m_td.dtype)
-                    self.ema.mul_(self.ema_beta).add_(m_td.detach(), alpha=1.0 - self.ema_beta)
-                    consensus_map = self.ema
-                else:
-                    consensus_map = m_td.detach()
-
-                agreement = consensus_map.abs().clamp(0.0, 1.0)
-                direction = consensus_map.sign()
-                rho = (self.rho_max * agreement.clamp_min(0.0).pow(self.gamma)).clamp(0.0, self.rho_max)
-
-                view_shape = (1, agreement.shape[0], 1, agreement.shape[1])
-                consensus_grad = grad_float.abs() * direction.view(view_shape)
-                rho_view = rho.view(view_shape)
-                new_grad = (1.0 - rho_view) * grad_float + rho_view * consensus_grad
-
                 if self.log_stats:
                     agreement_cpu = agreement.detach().cpu()
                     rho_cpu = rho.detach().cpu()
+                    mag_var_mean = float(mag_var.detach().mean().cpu()) if mag_var is not None else 0.0
+                    mag_stability_mean = (
+                        float(mag_stability.detach().mean().cpu()) if mag_stability is not None else 0.0
+                    )
                     self.latest_stats = {
                         "grad_consensus/agree_mean": float(agreement_cpu.mean()),
                         "grad_consensus/agree_std": float(agreement_cpu.std(unbiased=False)),
@@ -690,8 +739,12 @@ class TimeChannelSoftGradientConsensus:
                         "grad_consensus/rho_max": float(rho_cpu.max()),
                         "grad_consensus/using_fallback_z_inv": float(using_fallback),
                         "grad_consensus/ema_agree_mean": (
-                            float(self.ema.detach().abs().mean().cpu()) if self.use_ema and self.ema is not None else 0.0
+                            float(self.ema.detach().abs().mean().cpu())
+                            if self.ema is not None and (self.use_ema or self.mode == "sand_tc")
+                            else 0.0
                         ),
+                        "grad_consensus/mag_var_mean": mag_var_mean,
+                        "grad_consensus/mag_stability_mean": mag_stability_mean,
                     }
                 return restore(new_grad.to(dtype=grad.dtype))
 

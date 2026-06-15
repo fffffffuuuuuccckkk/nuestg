@@ -273,6 +273,7 @@ CONFIG = {
             "ema_beta": 0.95,
             "warmup_epochs": 10,
             "eps": 1e-8,
+            "sand_alpha": 1.0,
             "use_ema": True,
             "loss_type": "mse",
             "log_stats": True,

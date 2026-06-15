@@ -63,6 +63,7 @@ GRAD_CONSENSUS_RHO_MAX="${GRAD_CONSENSUS_RHO_MAX:-0.1}"
 GRAD_CONSENSUS_GAMMA="${GRAD_CONSENSUS_GAMMA:-1.0}"
 GRAD_CONSENSUS_EMA_BETA="${GRAD_CONSENSUS_EMA_BETA:-0.95}"
 GRAD_CONSENSUS_WARMUP_EPOCHS="${GRAD_CONSENSUS_WARMUP_EPOCHS:-10}"
+GRAD_CONSENSUS_SAND_ALPHA="${GRAD_CONSENSUS_SAND_ALPHA:-1.0}"
 
 DROP_LAST_TRAIN="${DROP_LAST_TRAIN:-true}"
 DROP_LAST_VAL="${DROP_LAST_VAL:-true}"
@@ -117,6 +118,7 @@ ablation_settings() {
   grad_consensus_gamma="${GRAD_CONSENSUS_GAMMA}"
   grad_consensus_ema_beta="${GRAD_CONSENSUS_EMA_BETA}"
   grad_consensus_warmup_epochs="${GRAD_CONSENSUS_WARMUP_EPOCHS}"
+  grad_consensus_sand_alpha="${GRAD_CONSENSUS_SAND_ALPHA}"
 
   case "${ablation}" in
     weak_film|fpem_weak_film)
@@ -162,6 +164,11 @@ ablation_settings() {
       fusion_type="weak_film"
       grad_consensus_enabled="true"
       ;;
+    weak_film_sand_tc|sand_tc)
+      fusion_type="weak_film"
+      grad_consensus_enabled="true"
+      grad_consensus_mode="sand_tc"
+      ;;
     *)
       echo "[FPEM-WeakFusion-STExpertProtocol] unsupported ablation=${ablation}" >&2
       return 2
@@ -195,6 +202,8 @@ write_metadata() {
   LAMBDA_SWAP_VALUE="${lambda_swap}" \
   LAMBDA_MASK_SPARSE_VALUE="${lambda_mask_sparse}" \
   GRAD_CONSENSUS_ENABLED_VALUE="${grad_consensus_enabled}" \
+  GRAD_CONSENSUS_MODE_VALUE="${grad_consensus_mode}" \
+  GRAD_CONSENSUS_SAND_ALPHA_VALUE="${grad_consensus_sand_alpha}" \
   "${PYTHON}" - <<'PY'
 import json
 import os
@@ -234,7 +243,11 @@ metadata = {
         "lambda_swap": float(os.environ["LAMBDA_SWAP_VALUE"]),
         "lambda_mask_sparse": float(os.environ["LAMBDA_MASK_SPARSE_VALUE"]),
     },
-    "grad_consensus_enabled": as_bool(os.environ["GRAD_CONSENSUS_ENABLED_VALUE"]),
+    "grad_consensus": {
+        "enabled": as_bool(os.environ["GRAD_CONSENSUS_ENABLED_VALUE"]),
+        "mode": os.environ["GRAD_CONSENSUS_MODE_VALUE"],
+        "sand_alpha": float(os.environ["GRAD_CONSENSUS_SAND_ALPHA_VALUE"]),
+    },
     "seed": int(os.environ["SEED_VALUE"]),
     "exit_code": int(os.environ["EXIT_CODE"]),
 }
@@ -348,6 +361,7 @@ for ablation in ${ABLATIONS}; do
       --set "LOSS.grad_consensus.gamma=${grad_consensus_gamma}" \
       --set "LOSS.grad_consensus.ema_beta=${grad_consensus_ema_beta}" \
       --set "LOSS.grad_consensus.warmup_epochs=${grad_consensus_warmup_epochs}" \
+      --set "LOSS.grad_consensus.sand_alpha=${grad_consensus_sand_alpha}" \
       --set "METRICS.mape_threshold=${MAPE_THRESHOLD}" \
       --set "METRICS.mape_eps=${MAPE_EPS}" \
       --set "METRICS.mape_as_percent=${MAPE_AS_PERCENT}" \
