@@ -1,0 +1,14 @@
+{
+  "best_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_grad_debug/tcsgc_zinv_smoke/best_metrics.json",
+  "best_score": 114.69020462036133,
+  "best_select_metric": "mae",
+  "best_select_split": "val",
+  "best_test_metrics_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_grad_debug/tcsgc_zinv_smoke/best_test_metrics.json",
+  "best_val": 114.69020462036133,
+  "epoch": 1,
+  "global_step": 3,
+  "last_checkpoint_path": "/data/OuXiaoyu/mystg/nue_stg_project/checkpoints/pems08_ood_grad_debug/tcsgc_zinv_smoke/last.pt",
+  "status": "complete",
+  "stopped_early": false,
+  "target_epochs": 1
+}
