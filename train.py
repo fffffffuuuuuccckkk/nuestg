@@ -2838,6 +2838,8 @@ def make_checkpoint_payload(
         "best_val": best_val,
         "best_select_split": cfg["TRAIN"].get("best_select_split", "test"),
         "best_select_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
+        "early_stop_monitor_split": cfg["TRAIN"].get("best_select_split", "test"),
+        "early_stop_monitor_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
         "patience": patience,
     }
     if pseudo_env_cache is not None:
@@ -2868,6 +2870,8 @@ def save_run_complete_marker(
             "best_val": best_val,
             "best_select_split": cfg["TRAIN"].get("best_select_split", "test"),
             "best_select_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
+            "early_stop_monitor_split": cfg["TRAIN"].get("best_select_split", "test"),
+            "early_stop_monitor_metric": cfg["TRAIN"].get("best_select_metric", "mae"),
             "stopped_early": stopped_early,
             "best_metrics_path": str(ckpt_dir / "best_metrics.json"),
             "best_test_metrics_path": str(ckpt_dir / "best_test_metrics.json"),
@@ -3007,6 +3011,7 @@ def train_local(cfg: Dict) -> None:
     if best_select_metric != "mae":
         raise ValueError("TRAIN.best_select_metric currently supports only 'mae'")
     print(f"[best-select] split={best_select_split} metric={best_select_metric}")
+    print(f"[early-stop] monitor={best_select_split}/{best_select_metric}")
     best_val = read_best_score_from_metrics(ckpt_dir, train_cfg)
     patience = 0
     global_step = 0
@@ -3224,11 +3229,13 @@ def train_local(cfg: Dict) -> None:
                     f"test_select_wape={test_metrics.get('wape', float('nan')):.6f}"
                 )
 
-            select_metrics = test_metrics if best_select_split == "test" else val_metrics
-            select_score = select_metrics[best_select_metric]
-            improved = select_score < best_val
+            early_stop_metrics = test_metrics if best_select_split == "test" else val_metrics
+            early_stop_score = early_stop_metrics[best_select_metric]
+            select_metrics = early_stop_metrics
+            select_score = early_stop_score
+            improved = early_stop_score < best_val
             if improved:
-                best_val = select_score
+                best_val = early_stop_score
                 patience = 0
                 if train_cfg.get("save_best", True):
                     best_ckpt_path = ckpt_dir / "best.pt"
@@ -3331,7 +3338,9 @@ def train_local(cfg: Dict) -> None:
                 if early_stop_patience and patience >= early_stop_patience:
                     print(
                         f"early stopping at epoch={epoch}, "
-                        f"best_{best_select_split}_{best_select_metric}={best_val:.6f}"
+                        f"monitor={best_select_split}/{best_select_metric}, "
+                        f"current={early_stop_score:.6f}, "
+                        f"best={best_val:.6f}"
                     )
                     should_stop = True
                     stopped_early = True
