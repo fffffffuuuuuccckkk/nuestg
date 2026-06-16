@@ -45,17 +45,20 @@ class NUESTGLossConfig:
     use_env_routed_inv_heads: bool = False
     env_route_k: int = 3
     env_route_tau: float = 1.0
+    env_route_oracle_tau: float = 0.3
     env_route_mode: str = "confidence_mix"
     env_route_replace_final: bool = False
     env_route_lambda_final: float = 1.0
     env_route_lambda_global: float = 0.2
-    env_route_lambda_expert: float = 0.1
-    env_route_lambda_router_oracle: float = 0.1
+    env_route_lambda_route_soft: float = 0.5
+    env_route_lambda_expert: float = 0.2
+    env_route_lambda_router_oracle: float = 0.5
     env_route_lambda_balance: float = 0.01
     env_route_lambda_diverse: float = 0.001
     env_route_lambda_entropy: float = 0.0
     env_route_warmup_epochs: int = 5
     env_route_detach_q_for_expert: bool = True
+    env_route_use_oracle_weight_for_expert: bool = True
     env_route_alpha_detach: bool = False
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
@@ -658,6 +661,7 @@ class NUESTGLoss(nn.Module):
             logs.update({
                 "env_route/final_loss": zero,
                 "env_route/global_loss": zero,
+                "env_route/route_soft_loss": zero,
                 "env_route/expert_loss": zero,
                 "env_route/router_oracle_loss": zero,
                 "env_route/balance_loss": zero,
@@ -666,12 +670,16 @@ class NUESTGLoss(nn.Module):
                 "env_route/L_final": zero,
                 "env_route/L_route_final": zero,
                 "env_route/L_global": zero,
+                "env_route/L_route_soft": zero,
                 "env_route/L_expert": zero,
                 "env_route/L_router_oracle": zero,
                 "env_route/L_balance": zero,
                 "env_route/L_diverse": zero,
                 "env_route/L_entropy": zero,
+                "env_route/oracle_tau": zero,
                 "env_route/q_entropy": zero,
+                "env_route/q_oracle_entropy": zero,
+                "env_route/q_oracle_max_mean": zero,
                 "env_route/alpha_mean": zero,
                 "env_route/alpha_std": zero,
                 "env_route/q_max_mean": zero,
@@ -749,10 +757,17 @@ class NUESTGLoss(nn.Module):
         loss_head = self._env_route_head_losses(y_heads_loss_view, y_loss_view, targets_mask)
         global_loss = self._mae_loss(y_global_loss_view, y_loss_view, targets_mask)
         route_final_loss = self._mae_loss(y_route_final_loss_view, y_loss_view, targets_mask)
-        q_weight = q.detach() if bool(self.cfg.env_route_detach_q_for_expert) else q
-        expert_loss = (q_weight * loss_head).sum(dim=-1).mean()
-        tau = max(float(self.cfg.env_route_tau), 1e-6)
-        q_oracle = torch.softmax(-loss_head.detach() / tau, dim=1)
+        route_soft_loss = self._mae_loss(y_route_soft_loss_view, y_loss_view, targets_mask)
+        oracle_tau = max(float(self.cfg.env_route_oracle_tau), 1e-6)
+        q_oracle = torch.softmax(-loss_head.detach() / oracle_tau, dim=1)
+        if bool(self.cfg.env_route_use_oracle_weight_for_expert):
+            # Gradient-level assignment is still oracle-free at inference: the
+            # detached soft oracle only prevents near-uniform q from training
+            # all invariant heads toward the same average target.
+            expert_weight = q_oracle
+        else:
+            expert_weight = q.detach() if bool(self.cfg.env_route_detach_q_for_expert) else q
+        expert_loss = (expert_weight * loss_head).sum(dim=-1).mean()
         router_oracle_loss = (
             q_oracle * ((q_oracle + 1e-8).log() - (q + 1e-8).log())
         ).sum(dim=1).mean()
@@ -761,6 +776,8 @@ class NUESTGLoss(nn.Module):
         balance_loss = (q_mean - (1.0 / k)).pow(2).mean()
         entropy = -(q * (q + 1e-8).log()).sum(dim=-1).mean()
         q_max_mean = q.max(dim=-1).values.mean()
+        q_oracle_entropy = -(q_oracle * (q_oracle + 1e-8).log()).sum(dim=-1).mean()
+        q_oracle_max_mean = q_oracle.max(dim=-1).values.mean()
 
         flat_pred = y_heads_loss_view.permute(1, 0, 2, 3, 4).reshape(k, -1)
         flat_pred = F.normalize(flat_pred.float(), dim=-1, eps=1e-8)
@@ -785,6 +802,7 @@ class NUESTGLoss(nn.Module):
         total = (
             float(self.cfg.env_route_lambda_final) * route_final_loss
             + float(self.cfg.env_route_lambda_global) * global_loss
+            + float(self.cfg.env_route_lambda_route_soft) * route_soft_loss
             + float(self.cfg.env_route_lambda_expert) * expert_loss
             + float(self.cfg.env_route_lambda_router_oracle) * router_oracle_loss
             + float(self.cfg.env_route_lambda_balance) * balance_loss
@@ -794,6 +812,7 @@ class NUESTGLoss(nn.Module):
         logs.update({
             "env_route/final_loss": route_final_loss.detach(),
             "env_route/global_loss": global_loss.detach(),
+            "env_route/route_soft_loss": route_soft_loss.detach(),
             "env_route/expert_loss": expert_loss.detach(),
             "env_route/router_oracle_loss": router_oracle_loss.detach(),
             "env_route/balance_loss": balance_loss.detach(),
@@ -802,12 +821,16 @@ class NUESTGLoss(nn.Module):
             "env_route/L_final": route_final_loss.detach(),
             "env_route/L_route_final": route_final_loss.detach(),
             "env_route/L_global": global_loss.detach(),
+            "env_route/L_route_soft": route_soft_loss.detach(),
             "env_route/L_expert": expert_loss.detach(),
             "env_route/L_router_oracle": router_oracle_loss.detach(),
             "env_route/L_balance": balance_loss.detach(),
             "env_route/L_diverse": diverse_loss.detach(),
             "env_route/L_entropy": entropy.detach(),
+            "env_route/oracle_tau": prediction.new_tensor(oracle_tau).detach(),
             "env_route/q_entropy": entropy.detach(),
+            "env_route/q_oracle_entropy": q_oracle_entropy.detach(),
+            "env_route/q_oracle_max_mean": q_oracle_max_mean.detach(),
             "env_route/alpha_mean": route_alpha.detach().mean(),
             "env_route/alpha_std": route_alpha.detach().std(unbiased=False),
             "env_route/q_max_mean": q_max_mean.detach(),

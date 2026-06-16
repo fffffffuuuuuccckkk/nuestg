@@ -191,6 +191,7 @@ ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/enabled",
     "env_route/final_loss",
     "env_route/global_loss",
+    "env_route/route_soft_loss",
     "env_route/expert_loss",
     "env_route/router_oracle_loss",
     "env_route/balance_loss",
@@ -199,12 +200,16 @@ ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/L_final",
     "env_route/L_route_final",
     "env_route/L_global",
+    "env_route/L_route_soft",
     "env_route/L_expert",
     "env_route/L_router_oracle",
     "env_route/L_balance",
     "env_route/L_diverse",
     "env_route/L_entropy",
+    "env_route/oracle_tau",
     "env_route/q_entropy",
+    "env_route/q_oracle_entropy",
+    "env_route/q_oracle_max_mean",
     "env_route/alpha_mean",
     "env_route/alpha_std",
     "env_route/q_max_mean",
@@ -450,17 +455,20 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("use_env_routed_inv_heads", False)
     loss_cfg.setdefault("env_route_k", 3)
     loss_cfg.setdefault("env_route_tau", 1.0)
+    loss_cfg.setdefault("env_route_oracle_tau", 0.3)
     loss_cfg.setdefault("env_route_mode", "confidence_mix")
     loss_cfg.setdefault("env_route_replace_final", False)
     loss_cfg.setdefault("env_route_lambda_final", 1.0)
     loss_cfg.setdefault("env_route_lambda_global", 0.2)
-    loss_cfg.setdefault("env_route_lambda_expert", 0.1)
-    loss_cfg.setdefault("env_route_lambda_router_oracle", 0.1)
+    loss_cfg.setdefault("env_route_lambda_route_soft", 0.5)
+    loss_cfg.setdefault("env_route_lambda_expert", 0.2)
+    loss_cfg.setdefault("env_route_lambda_router_oracle", 0.5)
     loss_cfg.setdefault("env_route_lambda_balance", 0.01)
     loss_cfg.setdefault("env_route_lambda_diverse", 0.001)
     loss_cfg.setdefault("env_route_lambda_entropy", 0.0)
     loss_cfg.setdefault("env_route_warmup_epochs", 5)
     loss_cfg.setdefault("env_route_detach_q_for_expert", True)
+    loss_cfg.setdefault("env_route_use_oracle_weight_for_expert", True)
     loss_cfg.setdefault("env_route_alpha_detach", False)
     loss_cfg["env_route_k"] = int(loss_cfg.get("env_route_k", 3))
     if loss_cfg["env_route_k"] < 1:
@@ -2098,9 +2106,13 @@ def debug_batch(cfg: Dict) -> None:
             f"enabled=True "
             f"k={cfg['LOSS'].get('env_route_k', 3)} "
             f"tau={cfg['LOSS'].get('env_route_tau', 1.0)} "
+            f"oracle_tau={cfg['LOSS'].get('env_route_oracle_tau', 0.3)} "
             f"mode={cfg['LOSS'].get('env_route_mode', 'confidence_mix')} "
             f"replace_final={cfg['LOSS'].get('env_route_replace_final', False)} "
+            f"lambda_route_soft={cfg['LOSS'].get('env_route_lambda_route_soft', 0.5)} "
+            f"lambda_router_oracle={cfg['LOSS'].get('env_route_lambda_router_oracle', 0.5)} "
             f"detach_q_for_expert={cfg['LOSS'].get('env_route_detach_q_for_expert', True)} "
+            f"use_oracle_weight_for_expert={cfg['LOSS'].get('env_route_use_oracle_weight_for_expert', True)} "
             f"alpha_detach={cfg['LOSS'].get('env_route_alpha_detach', False)}"
         )
     print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
@@ -3417,6 +3429,7 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "use_env_routed_inv_heads": "use_env_routed_inv_heads",
         "env_route_replace_final": "env_route_replace_final",
         "env_route_detach_q_for_expert": "env_route_detach_q_for_expert",
+        "env_route_use_oracle_weight_for_expert": "env_route_use_oracle_weight_for_expert",
         "env_route_alpha_detach": "env_route_alpha_detach",
     }
     int_fields = {
@@ -3435,8 +3448,10 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "pseudo_env_lambda_entropy": "pseudo_env_lambda_entropy",
         "pseudo_env_lambda_diverse": "pseudo_env_lambda_diverse",
         "env_route_tau": "env_route_tau",
+        "env_route_oracle_tau": "env_route_oracle_tau",
         "env_route_lambda_final": "env_route_lambda_final",
         "env_route_lambda_global": "env_route_lambda_global",
+        "env_route_lambda_route_soft": "env_route_lambda_route_soft",
         "env_route_lambda_expert": "env_route_lambda_expert",
         "env_route_lambda_router_oracle": "env_route_lambda_router_oracle",
         "env_route_lambda_balance": "env_route_lambda_balance",
@@ -3492,10 +3507,12 @@ def main() -> None:
     parser.add_argument("--use_env_routed_inv_heads", nargs="?", const="True", default=None)
     parser.add_argument("--env_route_k", type=int, default=None)
     parser.add_argument("--env_route_tau", type=float, default=None)
+    parser.add_argument("--env_route_oracle_tau", type=float, default=None)
     parser.add_argument("--env_route_mode", default=None)
     parser.add_argument("--env_route_replace_final", nargs="?", const="True", default=None)
     parser.add_argument("--env_route_lambda_final", type=float, default=None)
     parser.add_argument("--env_route_lambda_global", type=float, default=None)
+    parser.add_argument("--env_route_lambda_route_soft", type=float, default=None)
     parser.add_argument("--env_route_lambda_expert", type=float, default=None)
     parser.add_argument("--env_route_lambda_router_oracle", type=float, default=None)
     parser.add_argument("--env_route_lambda_balance", type=float, default=None)
@@ -3503,6 +3520,7 @@ def main() -> None:
     parser.add_argument("--env_route_lambda_entropy", type=float, default=None)
     parser.add_argument("--env_route_warmup_epochs", type=int, default=None)
     parser.add_argument("--env_route_detach_q_for_expert", nargs="?", const="True", default=None)
+    parser.add_argument("--env_route_use_oracle_weight_for_expert", nargs="?", const="True", default=None)
     parser.add_argument("--env_route_alpha_detach", nargs="?", const="True", default=None)
     args = parser.parse_args()
 
