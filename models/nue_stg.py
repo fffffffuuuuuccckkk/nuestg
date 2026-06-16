@@ -127,6 +127,7 @@ class NUESTGConfig(BasicTSModelConfig):
     swap_detach_env: bool = False
     z_inv_bottleneck: Dict = field(default_factory=dict)
     pseudo_env: Dict = field(default_factory=dict)
+    env_routed_inv_heads: Dict = field(default_factory=dict)
 
 
 class LatentFusion(nn.Module):
@@ -267,6 +268,116 @@ class PseudoEnvHeads(nn.Module):
         return torch.stack(preds, dim=1)
 
 
+class EnvRoutedInvariantHeads(nn.Module):
+    """Invariant heads selected by an environment-only router.
+
+    Heads consume only H_inv/Fuse(Z, 0). The router consumes only E/env_plus and
+    produces mixture weights. No environment residual correction is generated.
+    """
+
+    def __init__(
+        self,
+        inv_dim: int,
+        env_dim: int,
+        output_len: int,
+        output_dim: int,
+        num_heads: int,
+        hidden_dim: int = 64,
+        dropout: float = 0.1,
+        tau: float = 1.0,
+        mode: str = "confidence_mix",
+    ) -> None:
+        super().__init__()
+        self.inv_dim = int(inv_dim)
+        self.env_dim = int(env_dim)
+        self.output_len = int(output_len)
+        self.output_dim = int(output_dim)
+        self.num_heads = int(num_heads)
+        self.tau = max(float(tau), 1e-6)
+        self.mode = str(mode or "confidence_mix").lower()
+        self.heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.inv_dim, int(hidden_dim)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden_dim), self.output_len * self.output_dim),
+            )
+            for _ in range(self.num_heads)
+        ])
+        self.router = nn.Sequential(
+            nn.Linear(self.env_dim, int(hidden_dim)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_dim), self.num_heads),
+        )
+
+    @staticmethod
+    def _pool_env(env: torch.Tensor) -> torch.Tensor:
+        if env.dim() == 2:
+            return env
+        if env.dim() < 2:
+            raise AssertionError(f"router env input must keep feature dim, got {tuple(env.shape)}")
+        reduce_dims = tuple(range(1, env.dim() - 1))
+        return env.mean(dim=reduce_dims) if reduce_dims else env
+
+    def _predict_heads(self, h_inv: torch.Tensor) -> torch.Tensor:
+        if h_inv.dim() != 3:
+            raise AssertionError(f"invariant head input must be [B,N,D], got {tuple(h_inv.shape)}")
+        batch_size, num_nodes, inv_dim = h_inv.shape
+        if inv_dim != self.inv_dim:
+            raise AssertionError(f"invariant head dim expected {self.inv_dim}, got {inv_dim}")
+        preds = []
+        for head in self.heads:
+            pred = head(h_inv)
+            pred = pred.view(batch_size, num_nodes, self.output_len, self.output_dim).permute(0, 2, 1, 3)
+            preds.append(pred)
+        return torch.stack(preds, dim=1)
+
+    def forward(self, h_inv: torch.Tensor, env: torch.Tensor, y_inv: torch.Tensor) -> Dict[str, torch.Tensor]:
+        y_heads = self._predict_heads(h_inv)
+        env_pooled = self._pool_env(env)
+        if env_pooled.dim() != 2 or env_pooled.shape[-1] != self.env_dim:
+            raise AssertionError(f"router env pooled input must be [B,{self.env_dim}], got {tuple(env_pooled.shape)}")
+        logits = self.router(env_pooled)
+        if self.mode == "uniform":
+            q = torch.full_like(logits, 1.0 / self.num_heads)
+        elif self.mode == "random":
+            random_index = torch.randint(self.num_heads, (logits.shape[0],), device=logits.device)
+            q = torch.nn.functional.one_hot(random_index, num_classes=self.num_heads).to(dtype=logits.dtype)
+        else:
+            q = torch.softmax(logits / self.tau, dim=-1)
+        y_soft = (q.view(q.shape[0], self.num_heads, 1, 1, 1) * y_heads).sum(dim=1)
+        hard_index = q.argmax(dim=-1)
+        batch_index = torch.arange(q.shape[0], device=q.device)
+        y_hard = y_heads[batch_index, hard_index]
+        confidence = q.max(dim=-1).values
+        if self.mode == "soft":
+            y_selected = y_soft
+            y_final = y_selected
+        elif self.mode == "hard":
+            y_selected = y_hard
+            y_final = y_selected
+        elif self.mode == "confidence_mix":
+            y_selected = y_soft
+            beta = confidence.view(-1, 1, 1, 1).to(dtype=y_inv.dtype)
+            y_final = (1.0 - beta) * y_inv + beta * y_selected
+        elif self.mode in {"uniform", "random"}:
+            y_selected = y_soft
+            y_final = y_selected
+        else:
+            raise ValueError("env_route_mode must be one of: soft, hard, confidence_mix, uniform, random")
+        return {
+            "y_route_heads": y_heads,
+            "env_route_logits": logits,
+            "env_route_q": q,
+            "y_route_soft": y_soft,
+            "y_route_hard": y_hard,
+            "y_route_selected": y_selected,
+            "y_route_final": y_final,
+            "route_confidence": confidence,
+        }
+
+
 class NUESTG(nn.Module):
     """NUE-STG: Node-wise Utility-aware Environment Learning.
 
@@ -360,6 +471,11 @@ class NUESTG(nn.Module):
         self.pseudo_env_cfg = dict(config.pseudo_env or {})
         self.pseudo_env_enabled = bool(self.pseudo_env_cfg.get("enabled", False))
         self.pseudo_env_k = int(self.pseudo_env_cfg.get("k", 3))
+        self.env_route_cfg = dict(config.env_routed_inv_heads or {})
+        self.env_route_enabled = bool(self.env_route_cfg.get("enabled", False))
+        self.env_route_k = int(self.env_route_cfg.get("k", 3))
+        self.env_route_mode = str(self.env_route_cfg.get("mode", "confidence_mix") or "confidence_mix").lower()
+        self.env_route_replace_final = bool(self.env_route_cfg.get("replace_final", False))
         if self.z_inv_ib_enabled:
             if self.z_inv_ib_apply_to != "z_inv":
                 raise ValueError("LOSS.z_inv_bottleneck.apply_to currently supports 'z_inv' only.")
@@ -367,6 +483,11 @@ class NUESTG(nn.Module):
                 raise ValueError("LOSS.z_inv_bottleneck.type must be one of: vib, gaussian_noise, l2_norm.")
         if self.pseudo_env_enabled and self.pseudo_env_k < 1:
             raise ValueError("LOSS.pseudo_env_k must be >= 1 when pseudo-env heads are enabled.")
+        if self.env_route_enabled:
+            if self.env_route_k < 1:
+                raise ValueError("LOSS.env_route_k must be >= 1 when env-routed invariant heads are enabled.")
+            if self.env_route_mode not in {"soft", "hard", "confidence_mix", "uniform", "random"}:
+                raise ValueError("LOSS.env_route_mode must be one of: soft, hard, confidence_mix, uniform, random.")
         self.time_encoder = TimestampEncoder(
             encoding_type=config.time_encoding_type if self.use_timestamp else "none",
             time_emb_dim=self.time_emb_dim,
@@ -531,6 +652,21 @@ class NUESTG(nn.Module):
                 dropout=float(self.pseudo_env_cfg.get("dropout", config.residual_dropout)),
             )
             if self.pseudo_env_enabled
+            else None
+        )
+        self.env_routed_inv_heads = (
+            EnvRoutedInvariantHeads(
+                inv_dim=self.representation_dim,
+                env_dim=config.env_dim,
+                output_len=config.output_len,
+                output_dim=config.output_dim,
+                num_heads=self.env_route_k,
+                hidden_dim=int(self.env_route_cfg.get("hidden_dim", config.residual_hidden_dim)),
+                dropout=float(self.env_route_cfg.get("dropout", config.residual_dropout)),
+                tau=float(self.env_route_cfg.get("tau", 1.0)),
+                mode=self.env_route_mode,
+            )
+            if self.env_route_enabled
             else None
         )
         gate_out_dim = config.output_len if config.gate_horizon_aware else 1
@@ -899,6 +1035,14 @@ class NUESTG(nn.Module):
         inv_out = self.fpem_predict_from_z_env(z_for_prediction, zero_env)
         y_inv = inv_out["prediction"]
         pseudo_env_head_pred = self.pseudo_env_heads(env_plus) if self.pseudo_env_heads is not None else None
+        env_route_out = (
+            self.env_routed_inv_heads(inv_out["hidden"], env_plus, y_inv)
+            if self.env_routed_inv_heads is not None
+            else None
+        )
+        prediction_base = prediction
+        if env_route_out is not None and self.env_route_replace_final:
+            prediction = env_route_out["y_route_final"]
 
         env_fut_tokens = None
         env_fut_mu_tokens = None
@@ -1004,6 +1148,24 @@ class NUESTG(nn.Module):
                 raise AssertionError(
                     f"pseudo_env_head_pred must be {expected_pseudo_shape}, got {tuple(pseudo_env_head_pred.shape)}"
                 )
+        if env_route_out is not None:
+            expected_route_heads_shape = (batch_size, self.env_route_k, self.output_len, num_nodes, self.output_dim)
+            expected_route_q_shape = (batch_size, self.env_route_k)
+            for name in ["y_route_heads"]:
+                if tuple(env_route_out[name].shape) != expected_route_heads_shape:
+                    raise AssertionError(
+                        f"{name} must be {expected_route_heads_shape}, got {tuple(env_route_out[name].shape)}"
+                    )
+            for name in ["env_route_logits", "env_route_q"]:
+                if tuple(env_route_out[name].shape) != expected_route_q_shape:
+                    raise AssertionError(f"{name} must be {expected_route_q_shape}, got {tuple(env_route_out[name].shape)}")
+            for name in ["y_route_soft", "y_route_hard", "y_route_selected", "y_route_final"]:
+                if tuple(env_route_out[name].shape) != expected_pred_shape:
+                    raise AssertionError(f"{name} must be {expected_pred_shape}, got {tuple(env_route_out[name].shape)}")
+            if tuple(env_route_out["route_confidence"].shape) != (batch_size,):
+                raise AssertionError(
+                    f"route_confidence must be {(batch_size,)}, got {tuple(env_route_out['route_confidence'].shape)}"
+                )
 
         rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)
         if tuple(rho.shape) != expected_gate_shape:
@@ -1080,6 +1242,10 @@ class NUESTG(nn.Module):
             output.update({key: value for key, value in z_inv_ib_out.items() if key != "z"})
         if pseudo_env_head_pred is not None:
             output["pseudo_env_head_pred"] = pseudo_env_head_pred
+        if env_route_out is not None:
+            output["prediction_fused"] = prediction_base
+            output["env_route_replace_final"] = self.env_route_replace_final
+            output.update(env_route_out)
         if apply_perturb:
             output["perturb_info"] = {"enabled": self.perturb_enabled, "applied": False}
         if apply_perturb and self.training and self.perturb_enabled:

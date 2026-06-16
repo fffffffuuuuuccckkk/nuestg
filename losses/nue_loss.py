@@ -42,6 +42,19 @@ class NUESTGLossConfig:
     pseudo_env_smooth_radius: int = 2
     pseudo_env_assignment_mode: str = "cached_soft"
     pseudo_env_level: str = "window"
+    use_env_routed_inv_heads: bool = False
+    env_route_k: int = 3
+    env_route_tau: float = 1.0
+    env_route_mode: str = "confidence_mix"
+    env_route_replace_final: bool = False
+    env_route_lambda_final: float = 1.0
+    env_route_lambda_expert: float = 0.1
+    env_route_lambda_router_oracle: float = 0.1
+    env_route_lambda_balance: float = 0.01
+    env_route_lambda_diverse: float = 0.001
+    env_route_lambda_entropy: float = 0.0
+    env_route_warmup_epochs: int = 5
+    env_route_detach_q_for_expert: bool = True
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
     aux_ramp_epochs: int = 0
@@ -569,6 +582,196 @@ class NUESTGLoss(nn.Module):
             logs[f"pseudo_env/count_head_{idx}"] = counts[idx].detach()
             logs[f"pseudo_env/per_head_mae_{idx}"] = per_head_mae[idx].detach()
             logs[f"pseudo_env/risk_head_{idx}"] = risk[idx].detach()
+        return total, logs
+
+    def _env_route_head_losses(
+        self,
+        head_pred: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if head_pred.dim() != 5:
+            raise AssertionError(f"y_route_heads must be [B,K,H,N,C], got {tuple(head_pred.shape)}")
+        targets = self._ensure_bhnc(targets, "env_route_targets")
+        horizon = head_pred.shape[2]
+        if targets.shape[1] != horizon:
+            targets = targets[:, :horizon]
+        expected = (head_pred.shape[0], horizon, head_pred.shape[3], head_pred.shape[4])
+        if tuple(targets.shape) != expected:
+            raise AssertionError(f"env route target shape must align to {expected}, got {tuple(targets.shape)}")
+        if targets_mask is None:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+        else:
+            mask = targets_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(-1)
+            if mask.shape[1] != horizon:
+                mask = mask[:, :horizon]
+            mask = mask.to(device=head_pred.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(targets.shape):
+                mask = mask.expand_as(targets)
+        abs_error = (head_pred - targets.unsqueeze(1)).abs()
+        mask_5d = mask.unsqueeze(1).expand_as(abs_error)
+        counts = mask_5d.to(abs_error.dtype).sum(dim=(2, 3, 4)).clamp_min(1.0)
+        return (abs_error * mask_5d.to(abs_error.dtype)).sum(dim=(2, 3, 4)) / counts
+
+    def _env_route_sample_losses(
+        self,
+        prediction: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        targets = self._ensure_bhnc(targets, "env_route_sample_targets")
+        if targets.shape[1] != prediction.shape[1]:
+            targets = targets[:, : prediction.shape[1]]
+        if targets_mask is None:
+            mask = torch.ones_like(targets, dtype=torch.bool)
+        else:
+            mask = targets_mask
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(-1)
+            if mask.shape[1] != prediction.shape[1]:
+                mask = mask[:, : prediction.shape[1]]
+            mask = mask.to(device=prediction.device, dtype=torch.bool)
+            if tuple(mask.shape) != tuple(targets.shape):
+                mask = mask.expand_as(targets)
+        abs_error = (prediction - targets).abs()
+        counts = mask.to(abs_error.dtype).sum(dim=(1, 2, 3)).clamp_min(1.0)
+        return (abs_error * mask.to(abs_error.dtype)).sum(dim=(1, 2, 3)) / counts
+
+    def _env_route_terms(
+        self,
+        output: Dict[str, torch.Tensor],
+        y_loss_view: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+        data_scaler=None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        prediction = output["prediction"]
+        zero = self._zero(prediction)
+        if not bool(self.cfg.use_env_routed_inv_heads):
+            return zero, {}
+        logs: Dict[str, torch.Tensor] = {"env_route/enabled": prediction.new_tensor(1.0)}
+        k = int(self.cfg.env_route_k)
+        if self.epoch < int(self.cfg.env_route_warmup_epochs):
+            logs.update({
+                "env_route/final_loss": zero,
+                "env_route/expert_loss": zero,
+                "env_route/router_oracle_loss": zero,
+                "env_route/balance_loss": zero,
+                "env_route/diverse_loss": zero,
+                "env_route/entropy": zero,
+                "env_route/L_route_final": zero,
+                "env_route/L_expert": zero,
+                "env_route/L_router_oracle": zero,
+                "env_route/L_balance": zero,
+                "env_route/L_diverse": zero,
+                "env_route/L_entropy": zero,
+                "env_route/q_entropy": zero,
+                "env_route/q_max_mean": zero,
+                "env_route/router_oracle_acc": zero,
+                "env_route/y_inv_mae": zero,
+                "env_route/y_route_soft_mae": zero,
+                "env_route/y_route_final_mae": zero,
+                "env_route/oracle_route_mae": zero,
+            })
+            for idx in range(k):
+                logs[f"env_route/count_head_{idx}"] = zero
+                logs[f"env_route/oracle_count_head_{idx}"] = zero
+                logs[f"env_route/per_head_mae_{idx}"] = zero
+            return zero, logs
+
+        required = ["y_route_heads", "env_route_logits", "env_route_q", "y_route_soft", "y_route_final", "y_inv"]
+        missing = [key for key in required if not isinstance(output.get(key), torch.Tensor)]
+        if missing:
+            raise RuntimeError(f"LOSS.use_env_routed_inv_heads=True requires model outputs: {missing}")
+
+        y_heads = output["y_route_heads"]
+        y_route_soft = output["y_route_soft"]
+        y_route_final = output["y_route_final"]
+        y_inv = output["y_inv"]
+        logits = output["env_route_logits"]
+        q = output["env_route_q"]
+        if tuple(q.shape) != (y_heads.shape[0], k):
+            raise AssertionError(f"env_route_q must be [B,K]={y_heads.shape[0], k}, got {tuple(q.shape)}")
+        q_row_sum_error = (q.sum(dim=-1) - 1.0).abs().max()
+        if torch.isfinite(q_row_sum_error) and float(q_row_sum_error.detach().cpu()) > 1e-4:
+            raise AssertionError(f"env_route_q rows must sum to 1, max error={float(q_row_sum_error.detach().cpu()):.6e}")
+
+        if str(self.cfg.train_loss_scale or "normalized").lower() == "original":
+            if data_scaler is None:
+                raise ValueError("Env route original-scale loss requires data_scaler.")
+            y_heads_loss_view = data_scaler.inverse_transform(y_heads)
+            y_route_soft_loss_view = data_scaler.inverse_transform(y_route_soft)
+            y_route_final_loss_view = data_scaler.inverse_transform(y_route_final)
+            y_inv_loss_view = data_scaler.inverse_transform(y_inv)
+        else:
+            y_heads_loss_view = y_heads
+            y_route_soft_loss_view = y_route_soft
+            y_route_final_loss_view = y_route_final
+            y_inv_loss_view = y_inv
+
+        loss_head = self._env_route_head_losses(y_heads_loss_view, y_loss_view, targets_mask)
+        route_final_loss = self._mae_loss(y_route_final_loss_view, y_loss_view, targets_mask)
+        q_weight = q.detach() if bool(self.cfg.env_route_detach_q_for_expert) else q
+        expert_loss = (q_weight * loss_head).sum(dim=-1).mean()
+        oracle = loss_head.detach().argmin(dim=1)
+        router_oracle_loss = F.cross_entropy(logits, oracle)
+        q_mean = q.mean(dim=0)
+        balance_loss = (q_mean - (1.0 / k)).pow(2).mean()
+        entropy = -(q * (q + 1e-8).log()).sum(dim=-1).mean()
+        q_max_mean = q.max(dim=-1).values.mean()
+
+        flat_pred = y_heads_loss_view.permute(1, 0, 2, 3, 4).reshape(k, -1)
+        flat_pred = F.normalize(flat_pred.float(), dim=-1, eps=1e-8)
+        if k > 1:
+            sim = flat_pred @ flat_pred.t()
+            diverse_loss = sim[~torch.eye(k, dtype=torch.bool, device=sim.device)].mean().to(prediction.dtype)
+        else:
+            diverse_loss = zero
+
+        hard = q.argmax(dim=-1)
+        counts = torch.bincount(hard, minlength=k).to(device=prediction.device, dtype=prediction.dtype)
+        oracle_counts = torch.bincount(oracle, minlength=k).to(device=prediction.device, dtype=prediction.dtype)
+        per_head_mae = loss_head.mean(dim=0)
+        router_oracle_acc = (hard == oracle).to(dtype=prediction.dtype).mean()
+        oracle_route_mae = loss_head.gather(1, oracle.view(-1, 1)).mean()
+        y_inv_mae = self._env_route_sample_losses(y_inv_loss_view, y_loss_view, targets_mask).mean()
+        y_route_soft_mae = self._env_route_sample_losses(y_route_soft_loss_view, y_loss_view, targets_mask).mean()
+        y_route_final_mae = self._env_route_sample_losses(y_route_final_loss_view, y_loss_view, targets_mask).mean()
+
+        total = (
+            float(self.cfg.env_route_lambda_final) * route_final_loss
+            + float(self.cfg.env_route_lambda_expert) * expert_loss
+            + float(self.cfg.env_route_lambda_router_oracle) * router_oracle_loss
+            + float(self.cfg.env_route_lambda_balance) * balance_loss
+            + float(self.cfg.env_route_lambda_diverse) * diverse_loss
+            + float(self.cfg.env_route_lambda_entropy) * entropy
+        )
+        logs.update({
+            "env_route/final_loss": route_final_loss.detach(),
+            "env_route/expert_loss": expert_loss.detach(),
+            "env_route/router_oracle_loss": router_oracle_loss.detach(),
+            "env_route/balance_loss": balance_loss.detach(),
+            "env_route/diverse_loss": diverse_loss.detach(),
+            "env_route/entropy": entropy.detach(),
+            "env_route/L_route_final": route_final_loss.detach(),
+            "env_route/L_expert": expert_loss.detach(),
+            "env_route/L_router_oracle": router_oracle_loss.detach(),
+            "env_route/L_balance": balance_loss.detach(),
+            "env_route/L_diverse": diverse_loss.detach(),
+            "env_route/L_entropy": entropy.detach(),
+            "env_route/q_entropy": entropy.detach(),
+            "env_route/q_max_mean": q_max_mean.detach(),
+            "env_route/router_oracle_acc": router_oracle_acc.detach(),
+            "env_route/y_inv_mae": y_inv_mae.detach(),
+            "env_route/y_route_soft_mae": y_route_soft_mae.detach(),
+            "env_route/y_route_final_mae": y_route_final_mae.detach(),
+            "env_route/oracle_route_mae": oracle_route_mae.detach(),
+        })
+        for idx in range(k):
+            logs[f"env_route/count_head_{idx}"] = counts[idx].detach()
+            logs[f"env_route/oracle_count_head_{idx}"] = oracle_counts[idx].detach()
+            logs[f"env_route/per_head_mae_{idx}"] = per_head_mae[idx].detach()
         return total, logs
 
     @staticmethod
@@ -1194,6 +1397,12 @@ class NUESTGLoss(nn.Module):
             targets_mask,
             data_scaler=data_scaler,
         )
+        env_route_loss, env_route_logs = self._env_route_terms(
+            output,
+            y_loss_view,
+            targets_mask,
+            data_scaler=data_scaler,
+        )
 
         total_loss = (
             self.cfg.lambda_pred * pred_loss
@@ -1210,6 +1419,7 @@ class NUESTGLoss(nn.Module):
             + effective_lambda_y_cons * y_cons_loss
             + loss_z_inv_ib
             + pseudo_env_loss
+            + env_route_loss
         )
 
         rho = output.get("rho")
@@ -1305,6 +1515,7 @@ class NUESTGLoss(nn.Module):
         logs.update({key: value.detach() for key, value in backbone_aux_logs.items()})
         logs.update({key: value.detach() for key, value in z_inv_ib_logs.items()})
         logs.update({key: value.detach() for key, value in pseudo_env_logs.items()})
+        logs.update({key: value.detach() for key, value in env_route_logs.items()})
         logs.update(self._separation_logs(output, prediction))
         logs["__loss_terms__"] = {
             "pred": self.cfg.lambda_pred * pred_loss,
@@ -1316,6 +1527,7 @@ class NUESTGLoss(nn.Module):
             "sparse": effective_lambda_mask_sparse * sparse_loss,
             "z_inv_ib": loss_z_inv_ib,
             "pseudo_env": pseudo_env_loss,
+            "env_route": env_route_loss,
         }
         self.latest_log_dict = {
             key: float(value.cpu())
