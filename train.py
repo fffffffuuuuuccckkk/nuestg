@@ -271,7 +271,9 @@ def env_route_log_keys(cfg: Dict) -> list[str]:
     for idx in range(k):
         keys.extend([
             f"env_route/count_head_{idx}",
+            f"env_route/counts_per_head_{idx}",
             f"env_route/oracle_count_head_{idx}",
+            f"env_route/oracle_counts_per_head_{idx}",
             f"env_route/per_head_mae_{idx}",
         ])
     return keys

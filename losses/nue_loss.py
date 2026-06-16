@@ -676,7 +676,9 @@ class NUESTGLoss(nn.Module):
             })
             for idx in range(k):
                 logs[f"env_route/count_head_{idx}"] = zero
+                logs[f"env_route/counts_per_head_{idx}"] = zero
                 logs[f"env_route/oracle_count_head_{idx}"] = zero
+                logs[f"env_route/oracle_counts_per_head_{idx}"] = zero
                 logs[f"env_route/per_head_mae_{idx}"] = zero
             return zero, logs
 
@@ -770,7 +772,9 @@ class NUESTGLoss(nn.Module):
         })
         for idx in range(k):
             logs[f"env_route/count_head_{idx}"] = counts[idx].detach()
+            logs[f"env_route/counts_per_head_{idx}"] = counts[idx].detach()
             logs[f"env_route/oracle_count_head_{idx}"] = oracle_counts[idx].detach()
+            logs[f"env_route/oracle_counts_per_head_{idx}"] = oracle_counts[idx].detach()
             logs[f"env_route/per_head_mae_{idx}"] = per_head_mae[idx].detach()
         return total, logs
 
