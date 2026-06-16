@@ -130,6 +130,21 @@ class NUESTGConfig(BasicTSModelConfig):
     env_routed_inv_heads: Dict = field(default_factory=dict)
 
 
+class GradientReversalFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return -ctx.lambd * grad_output, None
+
+
+def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
+    return GradientReversalFn.apply(x, float(lambd))
+
+
 class LatentFusion(nn.Module):
     """Fuse invariant Z and selected environment in latent space."""
 
@@ -491,6 +506,8 @@ class NUESTG(nn.Module):
         self.env_route_mode = str(self.env_route_cfg.get("mode", "confidence_mix") or "confidence_mix").lower()
         self.env_route_replace_final = bool(self.env_route_cfg.get("replace_final", False))
         self.env_route_alpha_detach = bool(self.env_route_cfg.get("alpha_detach", False))
+        self.env_route_use_z_env_adv = bool(self.env_route_cfg.get("use_z_env_adv", False))
+        self.env_route_adv_grl_lambda = float(self.env_route_cfg.get("adv_grl_lambda", 1.0))
         if self.z_inv_ib_enabled:
             if self.z_inv_ib_apply_to != "z_inv":
                 raise ValueError("LOSS.z_inv_bottleneck.apply_to currently supports 'z_inv' only.")
@@ -683,6 +700,16 @@ class NUESTG(nn.Module):
                 alpha_detach=self.env_route_alpha_detach,
             )
             if self.env_route_enabled
+            else None
+        )
+        self.z_env_adv_classifier = (
+            nn.Sequential(
+                nn.Linear(self.representation_dim, int(self.env_route_cfg.get("hidden_dim", config.residual_hidden_dim))),
+                nn.GELU(),
+                nn.Dropout(float(self.env_route_cfg.get("dropout", config.residual_dropout))),
+                nn.Linear(int(self.env_route_cfg.get("hidden_dim", config.residual_hidden_dim)), self.env_route_k),
+            )
+            if self.env_route_enabled and self.env_route_use_z_env_adv
             else None
         )
         gate_out_dim = config.output_len if config.gate_horizon_aware else 1
@@ -1056,6 +1083,15 @@ class NUESTG(nn.Module):
             if self.env_routed_inv_heads is not None
             else None
         )
+        z_env_adv_logits = None
+        if self.z_env_adv_classifier is not None:
+            # The adversary only reads pooled invariant Z. It never consumes E;
+            # GRL reverses the classifier signal before it reaches Z_inv.
+            z_adv_feat = z_for_prediction
+            while z_adv_feat.dim() > 2:
+                z_adv_feat = z_adv_feat.mean(dim=1)
+            z_adv_feat = grad_reverse(z_adv_feat, self.env_route_adv_grl_lambda)
+            z_env_adv_logits = self.z_env_adv_classifier(z_adv_feat)
         prediction_base = prediction
         if env_route_out is not None and self.env_route_replace_final:
             prediction = env_route_out["y_route_final"]
@@ -1185,6 +1221,10 @@ class NUESTG(nn.Module):
                 raise AssertionError(
                     "env_route_alpha must stay in [0, 1]"
                 )
+            if z_env_adv_logits is not None and tuple(z_env_adv_logits.shape) != expected_route_q_shape:
+                raise AssertionError(
+                    f"z_env_adv_logits must be {expected_route_q_shape}, got {tuple(z_env_adv_logits.shape)}"
+                )
 
         rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)
         if tuple(rho.shape) != expected_gate_shape:
@@ -1242,6 +1282,7 @@ class NUESTG(nn.Module):
             "persist_score": persist_score,
             "persistence_enabled": self.persistence_enabled,
             "prediction_swap": prediction_swap,
+            "z_env_adv_logits": z_env_adv_logits,
             "rho_swap": None,
             "env_perm": env_perm,
             "env_perm_index": env_perm_index,

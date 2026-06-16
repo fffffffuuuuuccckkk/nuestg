@@ -194,6 +194,8 @@ ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/route_soft_loss",
     "env_route/expert_loss",
     "env_route/router_oracle_loss",
+    "env_route/inv_rex_loss",
+    "env_route/z_env_adv_loss",
     "env_route/balance_loss",
     "env_route/diverse_loss",
     "env_route/entropy",
@@ -203,6 +205,8 @@ ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/L_route_soft",
     "env_route/L_expert",
     "env_route/L_router_oracle",
+    "env_route/L_inv_rex",
+    "env_route/L_z_env_adv",
     "env_route/L_balance",
     "env_route/L_diverse",
     "env_route/L_entropy",
@@ -213,6 +217,8 @@ ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/alpha_mean",
     "env_route/alpha_std",
     "env_route/q_max_mean",
+    "env_route/z_env_adv_acc",
+    "env_route/z_env_adv_entropy",
     "env_route/router_oracle_acc",
     "env_route/y_inv_mae",
     "env_route/y_global_mae",
@@ -287,6 +293,7 @@ def env_route_log_keys(cfg: Dict) -> list[str]:
             f"env_route/oracle_count_head_{idx}",
             f"env_route/oracle_counts_per_head_{idx}",
             f"env_route/per_head_mae_{idx}",
+            f"env_route/inv_risk_head_{idx}",
         ])
     return keys
 
@@ -463,6 +470,12 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("env_route_lambda_route_soft", 0.5)
     loss_cfg.setdefault("env_route_lambda_expert", 0.2)
     loss_cfg.setdefault("env_route_lambda_router_oracle", 0.5)
+    loss_cfg.setdefault("env_route_lambda_inv_rex", 0.05)
+    loss_cfg.setdefault("env_route_inv_rex_use_oracle", True)
+    loss_cfg.setdefault("env_route_use_z_env_adv", False)
+    loss_cfg.setdefault("env_route_lambda_z_env_adv", 0.01)
+    loss_cfg.setdefault("env_route_adv_grl_lambda", 1.0)
+    loss_cfg.setdefault("env_route_adv_warmup_epochs", 10)
     loss_cfg.setdefault("env_route_lambda_balance", 0.01)
     loss_cfg.setdefault("env_route_lambda_diverse", 0.001)
     loss_cfg.setdefault("env_route_lambda_entropy", 0.0)
@@ -489,6 +502,8 @@ def finalize_config(cfg: Dict) -> Dict:
         "mode": str(loss_cfg.get("env_route_mode", "confidence_mix")),
         "replace_final": bool(loss_cfg.get("env_route_replace_final", False)),
         "alpha_detach": bool(loss_cfg.get("env_route_alpha_detach", False)),
+        "use_z_env_adv": bool(loss_cfg.get("env_route_use_z_env_adv", False)),
+        "adv_grl_lambda": float(loss_cfg.get("env_route_adv_grl_lambda", 1.0)),
         "hidden_dim": int(loss_cfg.get("env_route_hidden_dim", model_cfg.get("residual_hidden_dim", 64))),
         "dropout": float(loss_cfg.get("env_route_dropout", model_cfg.get("residual_dropout", 0.1))),
     }
@@ -1775,6 +1790,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             "y_route_final",
             "route_confidence",
             "prediction_fused",
+            "z_env_adv_logits",
         ]:
             value = output.get(key)
             if value is None:
@@ -1800,6 +1816,12 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
                 value = output.get(key)
                 if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
                     raise AssertionError(f"{key} expected {expected_q}, got {None if value is None else tuple(value.shape)}")
+            if bool(cfg["LOSS"].get("env_route_use_z_env_adv", False)):
+                value = output.get("z_env_adv_logits")
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
+                    raise AssertionError(
+                        f"z_env_adv_logits expected {expected_q}, got {None if value is None else tuple(value.shape)}"
+                    )
             for key in ["y_route_soft", "y_route", "y_global", "y_route_final"]:
                 value = output.get(key)
                 if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pred:
@@ -1855,6 +1877,7 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         "y_route_final",
         "route_confidence",
         "prediction_fused",
+        "z_env_adv_logits",
     ]:
         value = output.get(key)
         if value is None:
@@ -1880,6 +1903,12 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             value = output.get(key)
             if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
                 raise AssertionError(f"{key} expected {expected_q}, got {None if value is None else tuple(value.shape)}")
+        if bool(cfg["LOSS"].get("env_route_use_z_env_adv", False)):
+            value = output.get("z_env_adv_logits")
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
+                raise AssertionError(
+                    f"z_env_adv_logits expected {expected_q}, got {None if value is None else tuple(value.shape)}"
+                )
         for key in ["y_route_soft", "y_route", "y_global", "y_route_final"]:
             value = output.get(key)
             if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pred:
@@ -2111,6 +2140,11 @@ def debug_batch(cfg: Dict) -> None:
             f"replace_final={cfg['LOSS'].get('env_route_replace_final', False)} "
             f"lambda_route_soft={cfg['LOSS'].get('env_route_lambda_route_soft', 0.5)} "
             f"lambda_router_oracle={cfg['LOSS'].get('env_route_lambda_router_oracle', 0.5)} "
+            f"lambda_inv_rex={cfg['LOSS'].get('env_route_lambda_inv_rex', 0.05)} "
+            f"use_z_env_adv={cfg['LOSS'].get('env_route_use_z_env_adv', False)} "
+            f"lambda_z_env_adv={cfg['LOSS'].get('env_route_lambda_z_env_adv', 0.01)} "
+            f"adv_grl_lambda={cfg['LOSS'].get('env_route_adv_grl_lambda', 1.0)} "
+            f"adv_warmup={cfg['LOSS'].get('env_route_adv_warmup_epochs', 10)} "
             f"detach_q_for_expert={cfg['LOSS'].get('env_route_detach_q_for_expert', True)} "
             f"use_oracle_weight_for_expert={cfg['LOSS'].get('env_route_use_oracle_weight_for_expert', True)} "
             f"alpha_detach={cfg['LOSS'].get('env_route_alpha_detach', False)}"
@@ -3439,6 +3473,8 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "env_route_replace_final": "env_route_replace_final",
         "env_route_detach_q_for_expert": "env_route_detach_q_for_expert",
         "env_route_use_oracle_weight_for_expert": "env_route_use_oracle_weight_for_expert",
+        "env_route_inv_rex_use_oracle": "env_route_inv_rex_use_oracle",
+        "env_route_use_z_env_adv": "env_route_use_z_env_adv",
         "env_route_alpha_detach": "env_route_alpha_detach",
     }
     int_fields = {
@@ -3448,6 +3484,7 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "pseudo_env_smooth_radius": "pseudo_env_smooth_radius",
         "env_route_k": "env_route_k",
         "env_route_warmup_epochs": "env_route_warmup_epochs",
+        "env_route_adv_warmup_epochs": "env_route_adv_warmup_epochs",
     }
     float_fields = {
         "pseudo_env_tau": "pseudo_env_tau",
@@ -3463,6 +3500,9 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "env_route_lambda_route_soft": "env_route_lambda_route_soft",
         "env_route_lambda_expert": "env_route_lambda_expert",
         "env_route_lambda_router_oracle": "env_route_lambda_router_oracle",
+        "env_route_lambda_inv_rex": "env_route_lambda_inv_rex",
+        "env_route_lambda_z_env_adv": "env_route_lambda_z_env_adv",
+        "env_route_adv_grl_lambda": "env_route_adv_grl_lambda",
         "env_route_lambda_balance": "env_route_lambda_balance",
         "env_route_lambda_diverse": "env_route_lambda_diverse",
         "env_route_lambda_entropy": "env_route_lambda_entropy",
@@ -3524,6 +3564,12 @@ def main() -> None:
     parser.add_argument("--env_route_lambda_route_soft", type=float, default=None)
     parser.add_argument("--env_route_lambda_expert", type=float, default=None)
     parser.add_argument("--env_route_lambda_router_oracle", type=float, default=None)
+    parser.add_argument("--env_route_lambda_inv_rex", type=float, default=None)
+    parser.add_argument("--env_route_inv_rex_use_oracle", nargs="?", const="True", default=None)
+    parser.add_argument("--env_route_use_z_env_adv", nargs="?", const="True", default=None)
+    parser.add_argument("--env_route_lambda_z_env_adv", type=float, default=None)
+    parser.add_argument("--env_route_adv_grl_lambda", type=float, default=None)
+    parser.add_argument("--env_route_adv_warmup_epochs", type=int, default=None)
     parser.add_argument("--env_route_lambda_balance", type=float, default=None)
     parser.add_argument("--env_route_lambda_diverse", type=float, default=None)
     parser.add_argument("--env_route_lambda_entropy", type=float, default=None)
