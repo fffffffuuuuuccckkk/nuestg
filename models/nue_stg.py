@@ -286,6 +286,7 @@ class EnvRoutedInvariantHeads(nn.Module):
         dropout: float = 0.1,
         tau: float = 1.0,
         mode: str = "confidence_mix",
+        alpha_detach: bool = False,
     ) -> None:
         super().__init__()
         self.inv_dim = int(inv_dim)
@@ -295,6 +296,7 @@ class EnvRoutedInvariantHeads(nn.Module):
         self.num_heads = int(num_heads)
         self.tau = max(float(tau), 1e-6)
         self.mode = str(mode or "confidence_mix").lower()
+        self.alpha_detach = bool(alpha_detach)
         self.heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.inv_dim, int(hidden_dim)),
@@ -335,6 +337,7 @@ class EnvRoutedInvariantHeads(nn.Module):
 
     def forward(self, h_inv: torch.Tensor, env: torch.Tensor, y_inv: torch.Tensor) -> Dict[str, torch.Tensor]:
         y_heads = self._predict_heads(h_inv)
+        y_global = y_inv
         env_pooled = self._pool_env(env)
         if env_pooled.dim() != 2 or env_pooled.shape[-1] != self.env_dim:
             raise AssertionError(f"router env pooled input must be [B,{self.env_dim}], got {tuple(env_pooled.shape)}")
@@ -346,33 +349,44 @@ class EnvRoutedInvariantHeads(nn.Module):
             q = torch.nn.functional.one_hot(random_index, num_classes=self.num_heads).to(dtype=logits.dtype)
         else:
             q = torch.softmax(logits / self.tau, dim=-1)
+        entropy = -(q * (q + 1e-8).log()).sum(dim=-1)
+        if self.num_heads > 1:
+            entropy_norm = entropy / q.new_tensor(float(self.num_heads)).log()
+        else:
+            entropy_norm = torch.zeros_like(entropy)
+        alpha = (1.0 - entropy_norm).clamp(0.0, 1.0)
+        alpha_for_mix = alpha.detach() if self.alpha_detach else alpha
         y_soft = (q.view(q.shape[0], self.num_heads, 1, 1, 1) * y_heads).sum(dim=1)
         hard_index = q.argmax(dim=-1)
         batch_index = torch.arange(q.shape[0], device=q.device)
         y_hard = y_heads[batch_index, hard_index]
         confidence = q.max(dim=-1).values
         if self.mode == "soft":
-            y_selected = y_soft
-            y_final = y_selected
+            y_route = y_soft
+            y_final = y_route
         elif self.mode == "hard":
-            y_selected = y_hard
-            y_final = y_selected
+            y_route = y_hard
+            y_final = y_route
         elif self.mode == "confidence_mix":
-            y_selected = y_soft
-            beta = confidence.view(-1, 1, 1, 1).to(dtype=y_inv.dtype)
-            y_final = (1.0 - beta) * y_inv + beta * y_selected
+            y_route = y_soft
+            alpha_view = alpha_for_mix.view(-1, 1, 1, 1).to(dtype=y_global.dtype)
+            y_final = (1.0 - alpha_view) * y_global + alpha_view * y_route
         elif self.mode in {"uniform", "random"}:
-            y_selected = y_soft
-            y_final = y_selected
+            y_route = y_soft
+            y_final = y_route
         else:
             raise ValueError("env_route_mode must be one of: soft, hard, confidence_mix, uniform, random")
         return {
             "y_route_heads": y_heads,
             "env_route_logits": logits,
             "env_route_q": q,
+            "env_route_entropy": entropy,
+            "env_route_alpha": alpha,
             "y_route_soft": y_soft,
             "y_route_hard": y_hard,
-            "y_route_selected": y_selected,
+            "y_route": y_route,
+            "y_route_selected": y_route,
+            "y_global": y_global,
             "y_route_final": y_final,
             "route_confidence": confidence,
         }
@@ -476,6 +490,7 @@ class NUESTG(nn.Module):
         self.env_route_k = int(self.env_route_cfg.get("k", 3))
         self.env_route_mode = str(self.env_route_cfg.get("mode", "confidence_mix") or "confidence_mix").lower()
         self.env_route_replace_final = bool(self.env_route_cfg.get("replace_final", False))
+        self.env_route_alpha_detach = bool(self.env_route_cfg.get("alpha_detach", False))
         if self.z_inv_ib_enabled:
             if self.z_inv_ib_apply_to != "z_inv":
                 raise ValueError("LOSS.z_inv_bottleneck.apply_to currently supports 'z_inv' only.")
@@ -665,6 +680,7 @@ class NUESTG(nn.Module):
                 dropout=float(self.env_route_cfg.get("dropout", config.residual_dropout)),
                 tau=float(self.env_route_cfg.get("tau", 1.0)),
                 mode=self.env_route_mode,
+                alpha_detach=self.env_route_alpha_detach,
             )
             if self.env_route_enabled
             else None
@@ -1159,12 +1175,15 @@ class NUESTG(nn.Module):
             for name in ["env_route_logits", "env_route_q"]:
                 if tuple(env_route_out[name].shape) != expected_route_q_shape:
                     raise AssertionError(f"{name} must be {expected_route_q_shape}, got {tuple(env_route_out[name].shape)}")
-            for name in ["y_route_soft", "y_route_hard", "y_route_selected", "y_route_final"]:
+            for name in ["y_route_soft", "y_route_hard", "y_route", "y_route_selected", "y_global", "y_route_final"]:
                 if tuple(env_route_out[name].shape) != expected_pred_shape:
                     raise AssertionError(f"{name} must be {expected_pred_shape}, got {tuple(env_route_out[name].shape)}")
-            if tuple(env_route_out["route_confidence"].shape) != (batch_size,):
+            for name in ["route_confidence", "env_route_entropy", "env_route_alpha"]:
+                if tuple(env_route_out[name].shape) != (batch_size,):
+                    raise AssertionError(f"{name} must be {(batch_size,)}, got {tuple(env_route_out[name].shape)}")
+            if (env_route_out["env_route_alpha"].detach() < 0).any() or (env_route_out["env_route_alpha"].detach() > 1).any():
                 raise AssertionError(
-                    f"route_confidence must be {(batch_size,)}, got {tuple(env_route_out['route_confidence'].shape)}"
+                    "env_route_alpha must stay in [0, 1]"
                 )
 
         rho = mask.mean(dim=1).unsqueeze(1).expand(-1, self.output_len, -1, -1)

@@ -48,6 +48,7 @@ class NUESTGLossConfig:
     env_route_mode: str = "confidence_mix"
     env_route_replace_final: bool = False
     env_route_lambda_final: float = 1.0
+    env_route_lambda_global: float = 0.2
     env_route_lambda_expert: float = 0.1
     env_route_lambda_router_oracle: float = 0.1
     env_route_lambda_balance: float = 0.01
@@ -55,6 +56,7 @@ class NUESTGLossConfig:
     env_route_lambda_entropy: float = 0.0
     env_route_warmup_epochs: int = 5
     env_route_detach_q_for_expert: bool = True
+    env_route_alpha_detach: bool = False
     train_loss_scale: str = "normalized"
     warmup_epochs: int = 0
     aux_ramp_epochs: int = 0
@@ -655,21 +657,28 @@ class NUESTGLoss(nn.Module):
         if self.epoch < int(self.cfg.env_route_warmup_epochs):
             logs.update({
                 "env_route/final_loss": zero,
+                "env_route/global_loss": zero,
                 "env_route/expert_loss": zero,
                 "env_route/router_oracle_loss": zero,
                 "env_route/balance_loss": zero,
                 "env_route/diverse_loss": zero,
                 "env_route/entropy": zero,
+                "env_route/L_final": zero,
                 "env_route/L_route_final": zero,
+                "env_route/L_global": zero,
                 "env_route/L_expert": zero,
                 "env_route/L_router_oracle": zero,
                 "env_route/L_balance": zero,
                 "env_route/L_diverse": zero,
                 "env_route/L_entropy": zero,
                 "env_route/q_entropy": zero,
+                "env_route/alpha_mean": zero,
+                "env_route/alpha_std": zero,
                 "env_route/q_max_mean": zero,
                 "env_route/router_oracle_acc": zero,
                 "env_route/y_inv_mae": zero,
+                "env_route/y_global_mae": zero,
+                "env_route/y_route_mae": zero,
                 "env_route/y_route_soft_mae": zero,
                 "env_route/y_route_final_mae": zero,
                 "env_route/oracle_route_mae": zero,
@@ -682,42 +691,72 @@ class NUESTGLoss(nn.Module):
                 logs[f"env_route/per_head_mae_{idx}"] = zero
             return zero, logs
 
-        required = ["y_route_heads", "env_route_logits", "env_route_q", "y_route_soft", "y_route_final", "y_inv"]
+        required = [
+            "y_route_heads",
+            "env_route_logits",
+            "env_route_q",
+            "env_route_entropy",
+            "env_route_alpha",
+            "y_route_soft",
+            "y_route",
+            "y_global",
+            "y_route_final",
+            "y_inv",
+        ]
         missing = [key for key in required if not isinstance(output.get(key), torch.Tensor)]
         if missing:
             raise RuntimeError(f"LOSS.use_env_routed_inv_heads=True requires model outputs: {missing}")
 
         y_heads = output["y_route_heads"]
         y_route_soft = output["y_route_soft"]
+        y_route = output["y_route"]
+        y_global = output["y_global"]
         y_route_final = output["y_route_final"]
         y_inv = output["y_inv"]
         logits = output["env_route_logits"]
         q = output["env_route_q"]
+        route_entropy = output["env_route_entropy"]
+        route_alpha = output["env_route_alpha"]
         if tuple(q.shape) != (y_heads.shape[0], k):
             raise AssertionError(f"env_route_q must be [B,K]={y_heads.shape[0], k}, got {tuple(q.shape)}")
         q_row_sum_error = (q.sum(dim=-1) - 1.0).abs().max()
         if torch.isfinite(q_row_sum_error) and float(q_row_sum_error.detach().cpu()) > 1e-4:
             raise AssertionError(f"env_route_q rows must sum to 1, max error={float(q_row_sum_error.detach().cpu()):.6e}")
+        if tuple(route_alpha.shape) != (y_heads.shape[0],):
+            raise AssertionError(f"env_route_alpha must be [B]={y_heads.shape[0]}, got {tuple(route_alpha.shape)}")
+        if tuple(route_entropy.shape) != (y_heads.shape[0],):
+            raise AssertionError(f"env_route_entropy must be [B]={y_heads.shape[0]}, got {tuple(route_entropy.shape)}")
+        if (route_alpha.detach() < 0).any() or (route_alpha.detach() > 1).any():
+            raise AssertionError("env_route_alpha must stay in [0, 1]")
 
         if str(self.cfg.train_loss_scale or "normalized").lower() == "original":
             if data_scaler is None:
                 raise ValueError("Env route original-scale loss requires data_scaler.")
             y_heads_loss_view = data_scaler.inverse_transform(y_heads)
+            y_global_loss_view = data_scaler.inverse_transform(y_global)
+            y_route_loss_view = data_scaler.inverse_transform(y_route)
             y_route_soft_loss_view = data_scaler.inverse_transform(y_route_soft)
             y_route_final_loss_view = data_scaler.inverse_transform(y_route_final)
             y_inv_loss_view = data_scaler.inverse_transform(y_inv)
         else:
             y_heads_loss_view = y_heads
+            y_global_loss_view = y_global
+            y_route_loss_view = y_route
             y_route_soft_loss_view = y_route_soft
             y_route_final_loss_view = y_route_final
             y_inv_loss_view = y_inv
 
         loss_head = self._env_route_head_losses(y_heads_loss_view, y_loss_view, targets_mask)
+        global_loss = self._mae_loss(y_global_loss_view, y_loss_view, targets_mask)
         route_final_loss = self._mae_loss(y_route_final_loss_view, y_loss_view, targets_mask)
         q_weight = q.detach() if bool(self.cfg.env_route_detach_q_for_expert) else q
         expert_loss = (q_weight * loss_head).sum(dim=-1).mean()
+        tau = max(float(self.cfg.env_route_tau), 1e-6)
+        q_oracle = torch.softmax(-loss_head.detach() / tau, dim=1)
+        router_oracle_loss = (
+            q_oracle * ((q_oracle + 1e-8).log() - (q + 1e-8).log())
+        ).sum(dim=1).mean()
         oracle = loss_head.detach().argmin(dim=1)
-        router_oracle_loss = F.cross_entropy(logits, oracle)
         q_mean = q.mean(dim=0)
         balance_loss = (q_mean - (1.0 / k)).pow(2).mean()
         entropy = -(q * (q + 1e-8).log()).sum(dim=-1).mean()
@@ -738,11 +777,14 @@ class NUESTGLoss(nn.Module):
         router_oracle_acc = (hard == oracle).to(dtype=prediction.dtype).mean()
         oracle_route_mae = loss_head.gather(1, oracle.view(-1, 1)).mean()
         y_inv_mae = self._env_route_sample_losses(y_inv_loss_view, y_loss_view, targets_mask).mean()
+        y_global_mae = self._env_route_sample_losses(y_global_loss_view, y_loss_view, targets_mask).mean()
+        y_route_mae = self._env_route_sample_losses(y_route_loss_view, y_loss_view, targets_mask).mean()
         y_route_soft_mae = self._env_route_sample_losses(y_route_soft_loss_view, y_loss_view, targets_mask).mean()
         y_route_final_mae = self._env_route_sample_losses(y_route_final_loss_view, y_loss_view, targets_mask).mean()
 
         total = (
             float(self.cfg.env_route_lambda_final) * route_final_loss
+            + float(self.cfg.env_route_lambda_global) * global_loss
             + float(self.cfg.env_route_lambda_expert) * expert_loss
             + float(self.cfg.env_route_lambda_router_oracle) * router_oracle_loss
             + float(self.cfg.env_route_lambda_balance) * balance_loss
@@ -751,21 +793,28 @@ class NUESTGLoss(nn.Module):
         )
         logs.update({
             "env_route/final_loss": route_final_loss.detach(),
+            "env_route/global_loss": global_loss.detach(),
             "env_route/expert_loss": expert_loss.detach(),
             "env_route/router_oracle_loss": router_oracle_loss.detach(),
             "env_route/balance_loss": balance_loss.detach(),
             "env_route/diverse_loss": diverse_loss.detach(),
             "env_route/entropy": entropy.detach(),
+            "env_route/L_final": route_final_loss.detach(),
             "env_route/L_route_final": route_final_loss.detach(),
+            "env_route/L_global": global_loss.detach(),
             "env_route/L_expert": expert_loss.detach(),
             "env_route/L_router_oracle": router_oracle_loss.detach(),
             "env_route/L_balance": balance_loss.detach(),
             "env_route/L_diverse": diverse_loss.detach(),
             "env_route/L_entropy": entropy.detach(),
             "env_route/q_entropy": entropy.detach(),
+            "env_route/alpha_mean": route_alpha.detach().mean(),
+            "env_route/alpha_std": route_alpha.detach().std(unbiased=False),
             "env_route/q_max_mean": q_max_mean.detach(),
             "env_route/router_oracle_acc": router_oracle_acc.detach(),
             "env_route/y_inv_mae": y_inv_mae.detach(),
+            "env_route/y_global_mae": y_global_mae.detach(),
+            "env_route/y_route_mae": y_route_mae.detach(),
             "env_route/y_route_soft_mae": y_route_soft_mae.detach(),
             "env_route/y_route_final_mae": y_route_final_mae.detach(),
             "env_route/oracle_route_mae": oracle_route_mae.detach(),

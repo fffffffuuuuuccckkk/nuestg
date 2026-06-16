@@ -190,21 +190,28 @@ PSEUDO_ENV_BASE_LOG_KEYS = [
 ENV_ROUTE_BASE_LOG_KEYS = [
     "env_route/enabled",
     "env_route/final_loss",
+    "env_route/global_loss",
     "env_route/expert_loss",
     "env_route/router_oracle_loss",
     "env_route/balance_loss",
     "env_route/diverse_loss",
     "env_route/entropy",
+    "env_route/L_final",
     "env_route/L_route_final",
+    "env_route/L_global",
     "env_route/L_expert",
     "env_route/L_router_oracle",
     "env_route/L_balance",
     "env_route/L_diverse",
     "env_route/L_entropy",
     "env_route/q_entropy",
+    "env_route/alpha_mean",
+    "env_route/alpha_std",
     "env_route/q_max_mean",
     "env_route/router_oracle_acc",
     "env_route/y_inv_mae",
+    "env_route/y_global_mae",
+    "env_route/y_route_mae",
     "env_route/y_route_soft_mae",
     "env_route/y_route_final_mae",
     "env_route/oracle_route_mae",
@@ -446,6 +453,7 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("env_route_mode", "confidence_mix")
     loss_cfg.setdefault("env_route_replace_final", False)
     loss_cfg.setdefault("env_route_lambda_final", 1.0)
+    loss_cfg.setdefault("env_route_lambda_global", 0.2)
     loss_cfg.setdefault("env_route_lambda_expert", 0.1)
     loss_cfg.setdefault("env_route_lambda_router_oracle", 0.1)
     loss_cfg.setdefault("env_route_lambda_balance", 0.01)
@@ -453,6 +461,7 @@ def finalize_config(cfg: Dict) -> Dict:
     loss_cfg.setdefault("env_route_lambda_entropy", 0.0)
     loss_cfg.setdefault("env_route_warmup_epochs", 5)
     loss_cfg.setdefault("env_route_detach_q_for_expert", True)
+    loss_cfg.setdefault("env_route_alpha_detach", False)
     loss_cfg["env_route_k"] = int(loss_cfg.get("env_route_k", 3))
     if loss_cfg["env_route_k"] < 1:
         raise ValueError("LOSS.env_route_k must be >= 1")
@@ -471,6 +480,7 @@ def finalize_config(cfg: Dict) -> Dict:
         "tau": float(loss_cfg.get("env_route_tau", 1.0)),
         "mode": str(loss_cfg.get("env_route_mode", "confidence_mix")),
         "replace_final": bool(loss_cfg.get("env_route_replace_final", False)),
+        "alpha_detach": bool(loss_cfg.get("env_route_alpha_detach", False)),
         "hidden_dim": int(loss_cfg.get("env_route_hidden_dim", model_cfg.get("residual_hidden_dim", 64))),
         "dropout": float(loss_cfg.get("env_route_dropout", model_cfg.get("residual_dropout", 0.1))),
     }
@@ -1631,7 +1641,9 @@ def slice_for_train_horizon(
         "pseudo_env_head_pred",
         "y_route_soft",
         "y_route_hard",
+        "y_route",
         "y_route_selected",
+        "y_global",
         "y_route_final",
         "prediction_fused",
     }
@@ -1745,9 +1757,13 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             "y_route_heads",
             "env_route_logits",
             "env_route_q",
+            "env_route_entropy",
+            "env_route_alpha",
             "y_route_soft",
             "y_route_hard",
+            "y_route",
             "y_route_selected",
+            "y_global",
             "y_route_final",
             "route_confidence",
             "prediction_fused",
@@ -1776,10 +1792,17 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
                 value = output.get(key)
                 if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
                     raise AssertionError(f"{key} expected {expected_q}, got {None if value is None else tuple(value.shape)}")
-            for key in ["y_route_soft", "y_route_final"]:
+            for key in ["y_route_soft", "y_route", "y_global", "y_route_final"]:
                 value = output.get(key)
                 if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pred:
                     raise AssertionError(f"{key} expected {expected_pred}, got {None if value is None else tuple(value.shape)}")
+            for key in ["env_route_entropy", "env_route_alpha", "route_confidence"]:
+                value = output.get(key)
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != (batch_size,):
+                    raise AssertionError(f"{key} expected {(batch_size,)}, got {None if value is None else tuple(value.shape)}")
+            alpha = output["env_route_alpha"].detach()
+            if bool((alpha < 0).any()) or bool((alpha > 1).any()):
+                raise AssertionError("env_route_alpha must stay in [0,1]")
         aligned = align_target(targets, output["prediction"])
         print(f"aligned_targets: {tuple(aligned.shape)}")
         return
@@ -1814,9 +1837,13 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
         "y_route_heads",
         "env_route_logits",
         "env_route_q",
+        "env_route_entropy",
+        "env_route_alpha",
         "y_route_soft",
         "y_route_hard",
+        "y_route",
         "y_route_selected",
+        "y_global",
         "y_route_final",
         "route_confidence",
         "prediction_fused",
@@ -1845,10 +1872,17 @@ def check_output_shapes(output: Dict[str, torch.Tensor], targets: torch.Tensor, 
             value = output.get(key)
             if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_q:
                 raise AssertionError(f"{key} expected {expected_q}, got {None if value is None else tuple(value.shape)}")
-        for key in ["y_route_soft", "y_route_final"]:
+        for key in ["y_route_soft", "y_route", "y_global", "y_route_final"]:
             value = output.get(key)
             if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_pred:
                 raise AssertionError(f"{key} expected {expected_pred}, got {None if value is None else tuple(value.shape)}")
+        for key in ["env_route_entropy", "env_route_alpha", "route_confidence"]:
+            value = output.get(key)
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != (batch_size,):
+                raise AssertionError(f"{key} expected {(batch_size,)}, got {None if value is None else tuple(value.shape)}")
+        alpha = output["env_route_alpha"].detach()
+        if bool((alpha < 0).any()) or bool((alpha > 1).any()):
+            raise AssertionError("env_route_alpha must stay in [0,1]")
     for key in ["env_fut", "persist_q", "persist_k", "persist_score"]:
         value = output.get(key)
         if value is None:
@@ -2066,7 +2100,8 @@ def debug_batch(cfg: Dict) -> None:
             f"tau={cfg['LOSS'].get('env_route_tau', 1.0)} "
             f"mode={cfg['LOSS'].get('env_route_mode', 'confidence_mix')} "
             f"replace_final={cfg['LOSS'].get('env_route_replace_final', False)} "
-            f"detach_q_for_expert={cfg['LOSS'].get('env_route_detach_q_for_expert', True)}"
+            f"detach_q_for_expert={cfg['LOSS'].get('env_route_detach_q_for_expert', True)} "
+            f"alpha_detach={cfg['LOSS'].get('env_route_alpha_detach', False)}"
         )
     print(f"{input_key}_raw: {tuple(raw_batch[input_key].shape)}")
     print(f"{target_key}_raw: {tuple(raw_batch[target_key].shape)}")
@@ -2169,6 +2204,13 @@ def debug_batch(cfg: Dict) -> None:
         q_row_sum_error = (q.sum(dim=-1) - 1.0).abs().max().item()
         if q_row_sum_error > 1e-5:
             raise AssertionError(f"env_route_q rows do not sum to 1 (max_error={q_row_sum_error:.6e})")
+        alpha = loss_output.get("env_route_alpha")
+        if not isinstance(alpha, torch.Tensor):
+            raise AssertionError("env_routed_inv_heads enabled but env_route_alpha is missing.")
+        alpha_min = float(alpha.detach().min().cpu())
+        alpha_max = float(alpha.detach().max().cpu())
+        if alpha_min < -1e-6 or alpha_max > 1.0 + 1e-6:
+            raise AssertionError(f"env_route_alpha must stay in [0,1], got min={alpha_min:.6e} max={alpha_max:.6e}")
         if not bool(loss_cfg.get("env_route_replace_final", False)):
             fused = output.get("prediction_fused")
             if not isinstance(fused, torch.Tensor):
@@ -2182,6 +2224,9 @@ def debug_batch(cfg: Dict) -> None:
             f"loss_head_shape={tuple(loss_head.shape)} "
             f"q_shape={tuple(q.shape)} "
             f"q_row_sum_max_error={q_row_sum_error:.6e} "
+            f"alpha_mean={float(alpha.detach().mean().cpu()):.6f} "
+            f"alpha_min={alpha_min:.6f} "
+            f"alpha_max={alpha_max:.6f} "
             f"replace_final={bool(loss_cfg.get('env_route_replace_final', False))}"
         )
     loss_terms = logs.pop("__loss_terms__", None)
@@ -3372,6 +3417,7 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "use_env_routed_inv_heads": "use_env_routed_inv_heads",
         "env_route_replace_final": "env_route_replace_final",
         "env_route_detach_q_for_expert": "env_route_detach_q_for_expert",
+        "env_route_alpha_detach": "env_route_alpha_detach",
     }
     int_fields = {
         "pseudo_env_k": "pseudo_env_k",
@@ -3390,6 +3436,7 @@ def apply_pseudo_env_cli_args(cfg: Dict, args: argparse.Namespace) -> None:
         "pseudo_env_lambda_diverse": "pseudo_env_lambda_diverse",
         "env_route_tau": "env_route_tau",
         "env_route_lambda_final": "env_route_lambda_final",
+        "env_route_lambda_global": "env_route_lambda_global",
         "env_route_lambda_expert": "env_route_lambda_expert",
         "env_route_lambda_router_oracle": "env_route_lambda_router_oracle",
         "env_route_lambda_balance": "env_route_lambda_balance",
@@ -3448,6 +3495,7 @@ def main() -> None:
     parser.add_argument("--env_route_mode", default=None)
     parser.add_argument("--env_route_replace_final", nargs="?", const="True", default=None)
     parser.add_argument("--env_route_lambda_final", type=float, default=None)
+    parser.add_argument("--env_route_lambda_global", type=float, default=None)
     parser.add_argument("--env_route_lambda_expert", type=float, default=None)
     parser.add_argument("--env_route_lambda_router_oracle", type=float, default=None)
     parser.add_argument("--env_route_lambda_balance", type=float, default=None)
@@ -3455,6 +3503,7 @@ def main() -> None:
     parser.add_argument("--env_route_lambda_entropy", type=float, default=None)
     parser.add_argument("--env_route_warmup_epochs", type=int, default=None)
     parser.add_argument("--env_route_detach_q_for_expert", nargs="?", const="True", default=None)
+    parser.add_argument("--env_route_alpha_detach", nargs="?", const="True", default=None)
     args = parser.parse_args()
 
     cfg = resolve_cli_config(args.config, args.ablation, args.dotlist)
